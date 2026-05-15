@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.agent_app/
+.test_tmp/
+.coverage
+.coverage.*
+htmlcov/

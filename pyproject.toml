@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-study"
+version = "0.1.0"
+description = "Single-agent CLI harness for coding workflows."
+requires-python = ">=3.13"
+dependencies = ["jsonschema>=4.23,<5"]
+
+[project.optional-dependencies]
+dev = ["coverage[toml]"]
+
+[project.scripts]
+agent-app = "agent_app.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.coverage.run]
+branch = true
+include = [
+    "src/agent_app/config.py",
+    "src/agent_app/types.py",
+    "src/agent_app/model/*.py",
+    "src/agent_app/orchestrator/*.py",
+    "src/agent_app/state/*.py",
+    "src/agent_app/tools/*.py",
+    "src/agent_app/agent/definition.py",
+]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+omit = [
+    "src/agent_app/__init__.py",
+    "src/agent_app/cli.py",
+    "src/agent_app/agent/prompts.py",
+    "src/agent_app/*/__init__.py",
+]
