@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -13,7 +14,7 @@ from agent_app.state.session_service import SessionService
 from agent_app.tools.approval import approve_tool_call
 from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.registry import ToolRegistry
-from agent_app.types import Message, ModelResponse, SessionContext, StoredMessage, TodoItem, ToolCall, ToolResult, TurnResult
+from agent_app.types import Message, ModelResponse, SessionContext, StoredMessage, TodoItem, ToolAction, ToolCall, ToolResult, TurnResult
 
 ConfirmationHandler = Callable[[ToolCall, ToolExecutionContext], bool]
 
@@ -56,6 +57,23 @@ class AgentLoop:
 
     def run_turn(self, *, user_input: str, session_id: str | None = None) -> TurnResult:
         resolved_session_id = self._session_service.get_or_create_session(session_id)
+        recovery_blockers = self._recover_pending_tool_actions(resolved_session_id)
+        if recovery_blockers:
+            action_names = ", ".join(
+                f"{result.tool_name} ({result.tool_call_id})"
+                for result in recovery_blockers
+            )
+            return TurnResult(
+                session_id=resolved_session_id,
+                final_text=(
+                    "A previous tool action has an uncertain side-effect state and was not retried. "
+                    f"Inspect the workspace before continuing: {action_names}."
+                ),
+                stop_reason="uncertain_tool_action",
+                tool_runs=recovery_blockers,
+                success=False,
+            )
+
         self._session_service.append_message(
             resolved_session_id,
             Message(role="user", content=user_input),
@@ -219,9 +237,40 @@ class AgentLoop:
                         success=True,
                     )
 
-                tool_result = self._execute_tool_call(tool_call)
+                try:
+                    tool_result = self._execute_tool_call(tool_call)
+                except Exception:
+                    return self._finalize_turn(
+                        session_id=resolved_session_id,
+                        user_input=user_input,
+                        context_message_count=base_context_message_count,
+                        context_token_estimate=base_context_token_estimate,
+                        used_summary=used_summary,
+                        used_todo=used_todo,
+                        used_evidence=used_evidence,
+                        final_text=None,
+                        stop_reason="tool_execution_error",
+                        tool_runs=tool_runs,
+                        success=False,
+                    )
                 tool_runs.append(tool_result)
-                self._session_service.append_tool_run(resolved_session_id, tool_result)
+                if self._session_service.list_uncertain_tool_actions(resolved_session_id):
+                    return self._finalize_turn(
+                        session_id=resolved_session_id,
+                        user_input=user_input,
+                        context_message_count=base_context_message_count,
+                        context_token_estimate=base_context_token_estimate,
+                        used_summary=used_summary,
+                        used_todo=used_todo,
+                        used_evidence=used_evidence,
+                        final_text=(
+                            "A tool action may have produced a side effect. "
+                            "Automatic retry is blocked until the workspace is inspected."
+                        ),
+                        stop_reason="uncertain_tool_action",
+                        tool_runs=tool_runs,
+                        success=False,
+                    )
                 provider_messages.append(
                     {
                         "role": "tool",
@@ -279,54 +328,54 @@ class AgentLoop:
 
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         if tool_call.name not in self._agent.allowed_tools:
-            return ToolResult(
+            return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 success=False,
                 content="",
                 error=f"Tool '{tool_call.name}' is not allowed for this agent.",
-            )
+            ))
 
         tool = self._tool_registry.get(tool_call.name)
         if tool is None:
-            return ToolResult(
+            return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 success=False,
                 content="",
                 error=f"Tool '{tool_call.name}' is not registered.",
-            )
+            ))
 
         validation_error = tool.validate_arguments(tool_call.arguments)
         if validation_error is not None:
-            return ToolResult(
+            return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 success=False,
                 content="",
                 error=validation_error,
-            )
+            ))
 
         approval = approve_tool_call(tool_call.name, tool_call.arguments)
         if approval.decision == "deny":
-            return ToolResult(
+            return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 success=False,
                 content="",
                 error=approval.reason,
-            )
+            ))
 
         if approval.decision == "confirm":
             inspection, error = tool.inspect(arguments=tool_call.arguments, context=self._tool_context)
             if inspection is None:
-                return ToolResult(
+                return self._record_untracked_tool_result(ToolResult(
                     tool_call_id=tool_call.id,
                     tool_name=tool_call.name,
                     success=False,
                     content="",
                     error=error or "Unable to inspect edit.",
-                )
+                ))
 
             self._tool_context.prepared_edits[tool_call.id] = inspection
             confirmed = False
@@ -334,18 +383,187 @@ class AgentLoop:
                 confirmed = self._confirmation_handler(tool_call, self._tool_context)
             if not confirmed:
                 self._tool_context.prepared_edits.pop(tool_call.id, None)
-                return ToolResult(
+                return self._record_untracked_tool_result(ToolResult(
                     tool_call_id=tool_call.id,
                     tool_name=tool_call.name,
                     success=False,
                     content="",
                     error="Tool use denied by user.",
-                )
+                ))
 
-        return tool.execute(
+        session_id = self._tool_context.session_id
+        if session_id is None:
+            raise RuntimeError("Tool execution requires an active session.")
+        recovery_metadata = tool.recovery_metadata(
             tool_call_id=tool_call.id,
             arguments=tool_call.arguments,
             context=self._tool_context,
+        )
+        action = self._session_service.prepare_tool_action(
+            session_id,
+            agent_id=self._agent.id,
+            tool_call=tool_call,
+            recovery_metadata=recovery_metadata,
+        )
+        if action.status in {"succeeded", "failed", "uncertain"} and action.result is not None:
+            return action.result
+        if action.status == "executing":
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                success=False,
+                content="",
+                error="Tool action is already executing and was not run again.",
+            )
+
+        action = self._session_service.mark_tool_action_executing(action.id)
+        try:
+            tool_result = tool.execute(
+                tool_call_id=tool_call.id,
+                arguments=tool_call.arguments,
+                context=self._tool_context,
+            )
+        except Exception:
+            status, recovered_result = self._classify_tool_action_recovery(action)
+            completed = self._session_service.complete_tool_action(
+                action.id,
+                status=status,
+                tool_result=recovered_result,
+            )
+            assert completed.result is not None
+            return completed.result
+
+        completed = self._session_service.complete_tool_action(
+            action.id,
+            status="succeeded" if tool_result.success else "failed",
+            tool_result=tool_result,
+        )
+        assert completed.result is not None
+        return completed.result
+
+    def _record_untracked_tool_result(self, tool_result: ToolResult) -> ToolResult:
+        session_id = self._tool_context.session_id
+        if session_id is None:
+            raise RuntimeError("Tool execution requires an active session.")
+        self._session_service.append_tool_run(session_id, tool_result)
+        return tool_result
+
+    def _recover_pending_tool_actions(self, session_id: str) -> list[ToolResult]:
+        for action in self._session_service.list_recoverable_tool_actions(session_id):
+            status, tool_result = self._classify_tool_action_recovery(action)
+            self._session_service.complete_tool_action(
+                action.id,
+                status=status,
+                tool_result=tool_result,
+            )
+
+        blockers: list[ToolResult] = []
+        for action in self._session_service.list_uncertain_tool_actions(session_id):
+            blockers.append(
+                action.result
+                or ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=False,
+                    content="",
+                    error="Tool action side effect is uncertain.",
+                )
+            )
+        return blockers
+
+    def _classify_tool_action_recovery(self, action: ToolAction) -> tuple[str, ToolResult]:
+        if action.status == "prepared":
+            return (
+                "failed",
+                ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=False,
+                    content="",
+                    error="Tool action was interrupted before execution started.",
+                ),
+            )
+
+        metadata = action.recovery_metadata
+        if metadata.get("recovery_kind") == "text_file_hash":
+            return self._classify_text_file_recovery(action)
+        if not metadata.get("side_effect", False):
+            return (
+                "failed",
+                ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=False,
+                    content="",
+                    error="Read-only tool action was interrupted before its result was persisted.",
+                ),
+            )
+        return (
+            "uncertain",
+            ToolResult(
+                tool_call_id=action.tool_call_id,
+                tool_name=action.tool_name,
+                success=False,
+                content="",
+                error="Tool action may have produced a side effect; automatic retry is blocked.",
+            ),
+        )
+
+    def _classify_text_file_recovery(self, action: ToolAction) -> tuple[str, ToolResult]:
+        metadata = action.recovery_metadata
+        raw_relative_path = metadata.get("relative_path")
+        if not isinstance(raw_relative_path, str):
+            return _uncertain_file_recovery_result(action, "Recovery metadata does not contain a valid file path.")
+
+        workspace_root = self._tool_context.workspace_root.resolve()
+        path = (workspace_root / raw_relative_path).resolve()
+        try:
+            path.relative_to(workspace_root)
+        except ValueError:
+            return _uncertain_file_recovery_result(action, "Recovery file path escapes the workspace.")
+
+        current_path_exists = path.exists()
+        current_exists = path.is_file()
+        current_hash = None
+        if current_exists:
+            try:
+                current_hash = hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+            except (OSError, UnicodeDecodeError):
+                return _uncertain_file_recovery_result(action, "Recovery could not read the target as UTF-8 text.")
+
+        if current_exists and current_hash == metadata.get("after_sha256"):
+            return (
+                "succeeded",
+                ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=True,
+                    content=str(metadata.get("success_content") or "Recovered completed file action."),
+                    error=None,
+                ),
+            )
+
+        before_exists = bool(metadata.get("before_exists"))
+        before_matches = (
+            current_exists and current_hash == metadata.get("before_sha256")
+            if before_exists
+            else not current_path_exists
+        )
+        if before_matches:
+            return (
+                "failed",
+                ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=False,
+                    content="",
+                    error="File action was interrupted before the intended content was installed.",
+                ),
+            )
+
+        return _uncertain_file_recovery_result(
+            action,
+            "Target file matches neither the recorded before state nor the expected after state.",
         )
 
     def _maybe_update_summary(
@@ -712,3 +930,16 @@ def _extract_file_read_excerpt(tool_runs: list[ToolResult]) -> str | None:
         if tool_run.tool_name == "file_read" and tool_run.success and tool_run.content:
             return "\n".join(tool_run.content.splitlines()[:8])
     return None
+
+
+def _uncertain_file_recovery_result(action: ToolAction, detail: str) -> tuple[str, ToolResult]:
+    return (
+        "uncertain",
+        ToolResult(
+            tool_call_id=action.tool_call_id,
+            tool_name=action.tool_name,
+            success=False,
+            content="",
+            error=f"File action side effect is uncertain. {detail}",
+        ),
+    )

@@ -14,6 +14,7 @@ class DelegateTaskTool(Tool):
         "the subtask boundary is clear and the isolation is worth the extra "
         "round trip."
     )
+    has_side_effect = True
     parameters_schema = {
         "type": "object",
         "properties": {

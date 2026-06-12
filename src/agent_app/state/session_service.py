@@ -7,7 +7,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from agent_app.types import Message, SessionContext, StoredMessage, SubagentRun, TodoItem, ToolCallTrace, ToolResult, TurnTrace
+from agent_app.types import (
+    Message,
+    SessionContext,
+    StoredMessage,
+    SubagentRun,
+    TodoItem,
+    ToolAction,
+    ToolActionStatus,
+    ToolCall,
+    ToolCallTrace,
+    ToolResult,
+    TurnTrace,
+)
 
 
 def _utc_now() -> str:
@@ -87,26 +99,162 @@ class SessionService:
     def append_tool_run(self, session_id: str, tool_result: ToolResult) -> None:
         timestamp = _utc_now()
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO tool_runs (
-                    session_id, tool_call_id, tool_name, success, content, error, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    tool_result.tool_call_id,
-                    tool_result.tool_name,
-                    1 if tool_result.success else 0,
-                    tool_result.content,
-                    tool_result.error,
-                    timestamp,
-                ),
-            )
+            _insert_tool_run(connection, session_id=session_id, tool_result=tool_result, timestamp=timestamp)
             connection.execute(
                 "UPDATE sessions SET updated_at = ? WHERE id = ?",
                 (timestamp, session_id),
             )
+
+    def prepare_tool_action(
+        self,
+        session_id: str,
+        *,
+        agent_id: str,
+        tool_call: ToolCall,
+        recovery_metadata: dict,
+    ) -> ToolAction:
+        timestamp = _utc_now()
+        idempotency_key = f"{session_id}:{agent_id}:{tool_call.id}"
+        action_id = str(uuid4())
+        arguments_json = json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        recovery_json = json.dumps(recovery_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO tool_actions (
+                    id, session_id, agent_id, tool_call_id, tool_name,
+                    arguments_json, idempotency_key, status, recovery_json,
+                    prepared_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    session_id,
+                    agent_id,
+                    tool_call.id,
+                    tool_call.name,
+                    arguments_json,
+                    idempotency_key,
+                    recovery_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE idempotency_key = ? LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+        assert row is not None
+        return _tool_action_from_row(row)
+
+    def mark_tool_action_executing(self, action_id: str) -> ToolAction:
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE tool_actions
+                SET status = 'executing', started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE id = ? AND status = 'prepared'
+                """,
+                (timestamp, timestamp, action_id),
+            )
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(action_id)
+        return _tool_action_from_row(row)
+
+    def complete_tool_action(
+        self,
+        action_id: str,
+        *,
+        status: ToolActionStatus,
+        tool_result: ToolResult,
+    ) -> ToolAction:
+        if status not in {"succeeded", "failed", "uncertain"}:
+            raise ValueError("Tool action can only complete as succeeded, failed, or uncertain.")
+
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(action_id)
+            existing = _tool_action_from_row(row)
+            if existing.status in {"succeeded", "failed", "uncertain"}:
+                return existing
+
+            connection.execute(
+                """
+                UPDATE tool_actions
+                SET status = ?, result_success = ?, result_content = ?, result_error = ?,
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    1 if tool_result.success else 0,
+                    tool_result.content,
+                    tool_result.error,
+                    timestamp,
+                    timestamp,
+                    action_id,
+                ),
+            )
+            _insert_tool_run(
+                connection,
+                session_id=existing.session_id,
+                tool_result=tool_result,
+                timestamp=timestamp,
+                action_id=action_id,
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, existing.session_id),
+            )
+            completed_row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+        assert completed_row is not None
+        return _tool_action_from_row(completed_row)
+
+    def get_tool_action_by_idempotency_key(self, idempotency_key: str) -> ToolAction | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE idempotency_key = ? LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+        return None if row is None else _tool_action_from_row(row)
+
+    def list_tool_actions(self, session_id: str) -> list[ToolAction]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE session_id = ? ORDER BY prepared_at ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [_tool_action_from_row(row) for row in rows]
+
+    def list_recoverable_tool_actions(self, session_id: str) -> list[ToolAction]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _TOOL_ACTION_SELECT
+                + " WHERE session_id = ? AND status IN ('prepared', 'executing') ORDER BY prepared_at ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [_tool_action_from_row(row) for row in rows]
+
+    def list_uncertain_tool_actions(self, session_id: str) -> list[ToolAction]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE session_id = ? AND status = 'uncertain' ORDER BY prepared_at ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [_tool_action_from_row(row) for row in rows]
 
     def append_subagent_run(
         self,
@@ -421,3 +569,66 @@ class SessionService:
             )
             for row in rows
         ]
+
+
+_TOOL_ACTION_SELECT = """
+SELECT id, session_id, agent_id, tool_call_id, tool_name, arguments_json,
+       idempotency_key, status, recovery_json, result_success, result_content,
+       result_error, prepared_at, started_at, completed_at, updated_at
+FROM tool_actions
+"""
+
+
+def _tool_action_from_row(row) -> ToolAction:
+    result = None
+    if row[9] is not None:
+        result = ToolResult(
+            tool_call_id=row[3],
+            tool_name=row[4],
+            success=bool(row[9]),
+            content=row[10] or "",
+            error=row[11],
+        )
+    return ToolAction(
+        id=row[0],
+        session_id=row[1],
+        agent_id=row[2],
+        tool_call_id=row[3],
+        tool_name=row[4],
+        arguments=json.loads(row[5]),
+        idempotency_key=row[6],
+        status=row[7],
+        recovery_metadata=json.loads(row[8]),
+        result=result,
+        prepared_at=row[12],
+        started_at=row[13],
+        completed_at=row[14],
+        updated_at=row[15],
+    )
+
+
+def _insert_tool_run(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    tool_result: ToolResult,
+    timestamp: str,
+    action_id: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO tool_runs (
+            session_id, action_id, tool_call_id, tool_name, success, content, error, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            action_id,
+            tool_result.tool_call_id,
+            tool_result.tool_name,
+            1 if tool_result.success else 0,
+            tool_result.content,
+            tool_result.error,
+            timestamp,
+        ),
+    )

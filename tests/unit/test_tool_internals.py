@@ -13,6 +13,7 @@ from agent_app.tools.file_write import (
     FILE_WRITE_CHANGED_ERROR,
     FileWriteInspection,
     FileWriteTool,
+    _atomic_write_text,
     _line_count as file_write_line_count,
     inspect_file_write_request,
 )
@@ -157,6 +158,16 @@ class ToolInternalTests(unittest.TestCase):
 
         self.assertIsNone(inspection)
         self.assertIn("Unable to read existing file: boom", error)
+
+    def test_atomic_write_failure_preserves_original_file(self) -> None:
+        target = self.workspace_root / "src" / "sample.py"
+
+        with patch("agent_app.tools.file_write.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                _atomic_write_text(target, "print('beta')\n")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "print('alpha')\n")
+        self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
 
     def test_replace_in_file_internal_edges(self) -> None:
         target = self.workspace_root / "src" / "sample.py"

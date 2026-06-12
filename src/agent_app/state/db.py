@@ -28,12 +28,34 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS tool_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
+        action_id TEXT,
         tool_call_id TEXT NOT NULL,
         tool_name TEXT NOT NULL,
         success INTEGER NOT NULL,
         content TEXT NOT NULL,
         error TEXT,
         created_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tool_actions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        arguments_json TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        recovery_json TEXT NOT NULL,
+        result_success INTEGER,
+        result_content TEXT,
+        result_error TEXT,
+        prepared_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
     """,
@@ -102,6 +124,29 @@ def initialize_database(db_path: str | Path) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        _ensure_tool_runs_action_id(connection)
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_runs_action_id
+            ON tool_runs(action_id)
+            WHERE action_id IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tool_actions_session_status
+            ON tool_actions(session_id, status)
+            """
+        )
         connection.commit()
     finally:
         connection.close()
+
+
+def _ensure_tool_runs_action_id(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(tool_runs)").fetchall()
+    }
+    if "action_id" not in columns:
+        connection.execute("ALTER TABLE tool_runs ADD COLUMN action_id TEXT")

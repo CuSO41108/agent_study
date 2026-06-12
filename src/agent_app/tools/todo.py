@@ -43,6 +43,7 @@ class TodoReadTool(Tool):
 class TodoWriteTool(Tool):
     name = "todo_write"
     description = "Replace the current session todo list."
+    has_side_effect = True
     parameters_schema = {
         "type": "object",
         "properties": {

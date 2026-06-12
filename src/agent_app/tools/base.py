@@ -30,6 +30,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters_schema: dict[str, Any]
+    has_side_effect: bool = False
 
     def spec(self) -> dict[str, Any]:
         return {
@@ -51,6 +52,15 @@ class Tool(ABC):
         context: ToolExecutionContext,
     ) -> tuple[Any | None, str | None]:
         return None, "Tool does not support edit inspection."
+
+    def recovery_metadata(
+        self,
+        *,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        return {"side_effect": self.has_side_effect}
 
     @abstractmethod
     def execute(
