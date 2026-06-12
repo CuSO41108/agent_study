@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(slots=True)
@@ -26,6 +26,27 @@ class ToolResult:
     success: bool
     content: str
     error: str | None = None
+
+
+ToolActionStatus = Literal["prepared", "executing", "succeeded", "failed", "uncertain"]
+
+
+@dataclass(slots=True, frozen=True)
+class ToolAction:
+    id: str
+    session_id: str
+    agent_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    idempotency_key: str
+    status: ToolActionStatus
+    recovery_metadata: dict[str, Any]
+    result: ToolResult | None
+    prepared_at: str
+    started_at: str | None
+    completed_at: str | None
+    updated_at: str
 
 
 @dataclass(slots=True, frozen=True)

@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_app.tools._path_utils import PathSafetyError, resolve_workspace_path
 from agent_app.tools.base import Tool, ToolExecutionContext, validate_arguments
-from agent_app.tools.file_write import _validate_target_path
+from agent_app.tools.file_write import _atomic_write_text, _file_recovery_metadata, _validate_target_path
 from agent_app.types import ToolResult
 
 MAX_TEXT_EDIT_BYTES = 262144
@@ -34,6 +34,7 @@ class ReplaceInFileInspection:
 class ReplaceInFileTool(Tool):
     name = "replace_in_file"
     description = "Safely replace exact text in a single existing UTF-8 text file."
+    has_side_effect = True
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -95,7 +96,7 @@ class ReplaceInFileTool(Tool):
                 error=FILE_CHANGED_ERROR,
             )
 
-        inspection.path.write_text(inspection._updated_content, encoding="utf-8")
+        _atomic_write_text(inspection.path, inspection._updated_content)
         return ToolResult(
             tool_call_id=tool_call_id,
             tool_name=self.name,
@@ -114,6 +115,29 @@ class ReplaceInFileTool(Tool):
         context: ToolExecutionContext,
     ) -> tuple[ReplaceInFileInspection | None, str | None]:
         return inspect_replace_in_file_request(arguments=arguments, context=context)
+
+    def recovery_metadata(
+        self,
+        *,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        inspection = context.prepared_edits.get(tool_call_id)
+        if not isinstance(inspection, ReplaceInFileInspection):
+            inspection, error = inspect_replace_in_file_request(arguments=arguments, context=context)
+            if inspection is None:
+                raise ValueError(error or "Unable to build replace recovery metadata.")
+        return _file_recovery_metadata(
+            relative_path=inspection.relative_path,
+            before_exists=True,
+            before_content=inspection._expected_original_content,
+            after_content=inspection._updated_content,
+            success_content=(
+                f"Replaced {inspection.replacement_count} occurrence(s) in "
+                f"{inspection.relative_path} ({inspection.byte_count} bytes, {inspection.line_count} lines)."
+            ),
+        )
 
 
 def inspect_replace_in_file_request(

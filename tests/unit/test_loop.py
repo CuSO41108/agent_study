@@ -13,6 +13,7 @@ from agent_app.orchestrator.loop import AgentLoop
 from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
+from agent_app.tools.file_write import FileWriteTool, inspect_file_write_request
 from agent_app.tools.registry import build_default_registry, build_root_registry
 from agent_app.types import ModelResponse, ToolCall
 
@@ -354,6 +355,110 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(result.tool_runs[1].success)
         self.assertEqual(result.final_text, "The change was written, but validation did not pass.")
 
+    def test_recovery_marks_file_action_succeeded_when_expected_content_exists(self) -> None:
+        session_id, action_id, target = self._prepare_executing_file_action()
+        target.write_text("print('new')\n", encoding="utf-8")
+        model = _FakeModelClient([_text_response("continued")])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="continue", session_id=session_id)
+
+        self.assertTrue(result.success)
+        action = self.sessions.list_tool_actions(session_id)[0]
+        self.assertEqual(action.id, action_id)
+        self.assertEqual(action.status, "succeeded")
+        self.assertTrue(action.result.success)
+        self.assertEqual(len(self.sessions.list_tool_runs(session_id)), 1)
+        self.assertEqual(len(model.calls), 1)
+
+    def test_recovery_marks_file_action_failed_when_original_content_remains(self) -> None:
+        session_id, _, _target = self._prepare_executing_file_action()
+        model = _FakeModelClient([_text_response("continued")])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="continue", session_id=session_id)
+
+        self.assertTrue(result.success)
+        action = self.sessions.list_tool_actions(session_id)[0]
+        self.assertEqual(action.status, "failed")
+        self.assertIn("before the intended content was installed", action.result.error)
+        self.assertEqual(len(model.calls), 1)
+
+    def test_recovery_blocks_turn_when_file_state_is_uncertain(self) -> None:
+        session_id, _, target = self._prepare_executing_file_action()
+        target.write_text("print('third-party')\n", encoding="utf-8")
+        model = _FakeModelClient([])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="continue", session_id=session_id)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "uncertain_tool_action")
+        self.assertEqual(self.sessions.list_tool_actions(session_id)[0].status, "uncertain")
+        self.assertEqual(len(model.calls), 0)
+
+    def test_recovery_marks_interrupted_read_only_action_failed(self) -> None:
+        session_id = self.sessions.create_session()
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id=SINGLE_MAIN_AGENT.id,
+            tool_call=ToolCall(id="read-call", name="file_read", arguments={"path": "README.md"}),
+            recovery_metadata={"side_effect": False},
+        )
+        self.sessions.mark_tool_action_executing(action.id)
+        model = _FakeModelClient([_text_response("continued")])
+
+        result = self._build_loop(model).run_turn(user_input="continue", session_id=session_id)
+
+        self.assertTrue(result.success)
+        recovered = self.sessions.list_tool_actions(session_id)[0]
+        self.assertEqual(recovered.status, "failed")
+        self.assertIn("Read-only tool action was interrupted", recovered.result.error)
+
+    def test_recovery_blocks_unverifiable_side_effect_action(self) -> None:
+        session_id = self.sessions.create_session()
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id=SINGLE_MAIN_AGENT.id,
+            tool_call=ToolCall(id="todo-call", name="todo_write", arguments={"items": []}),
+            recovery_metadata={"side_effect": True},
+        )
+        self.sessions.mark_tool_action_executing(action.id)
+        model = _FakeModelClient([])
+
+        result = self._build_loop(model).run_turn(user_input="continue", session_id=session_id)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "uncertain_tool_action")
+        self.assertEqual(self.sessions.list_tool_actions(session_id)[0].status, "uncertain")
+        self.assertEqual(len(model.calls), 0)
+
+    def test_duplicate_tool_action_id_reuses_persisted_result_without_reexecution(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response(
+                [
+                    ToolCall(id="same-call", name="file_read", arguments={"path": "README.md"}),
+                    ToolCall(id="same-call", name="file_read", arguments={"path": "README.md"}),
+                ]
+            ),
+            _text_response("done"),
+        ])
+        tool = self.registry.get_required("file_read")
+        original_execute = tool.execute
+        execute_count = 0
+
+        def _counting_execute(*, tool_call_id, arguments, context):
+            nonlocal execute_count
+            execute_count += 1
+            return original_execute(tool_call_id=tool_call_id, arguments=arguments, context=context)
+
+        with patch.object(tool, "execute", side_effect=_counting_execute):
+            result = self._build_loop(model).run_turn(user_input="read twice")
+
+        self.assertTrue(result.success)
+        self.assertEqual(execute_count, 1)
+        self.assertEqual(len(self.sessions.list_tool_runs(result.session_id)), 1)
+
     def test_max_tool_rounds_stops_before_ninth_round(self) -> None:
         model = _FakeModelClient([_tool_call_response([ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"})])] * 9)
         loop = self._build_loop(model)
@@ -635,6 +740,35 @@ class AgentLoopTests(unittest.TestCase):
             workspace_root=self.workspace_root,
             confirmation_handler=confirmation_handler,
         )
+
+    def _prepare_executing_file_action(self):
+        session_id = self.sessions.create_session()
+        tool_call = ToolCall(
+            id="crashed-call",
+            name="file_write",
+            arguments={"path": "src/module.py", "content": "print('new')\n"},
+        )
+        context = __import__(
+            "agent_app.tools.base",
+            fromlist=["ToolExecutionContext"],
+        ).ToolExecutionContext(workspace_root=self.workspace_root)
+        inspection, error = inspect_file_write_request(arguments=tool_call.arguments, context=context)
+        self.assertIsNone(error)
+        assert inspection is not None
+        context.prepared_edits[tool_call.id] = inspection
+        metadata = FileWriteTool().recovery_metadata(
+            tool_call_id=tool_call.id,
+            arguments=tool_call.arguments,
+            context=context,
+        )
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id=SINGLE_MAIN_AGENT.id,
+            tool_call=tool_call,
+            recovery_metadata=metadata,
+        )
+        self.sessions.mark_tool_action_executing(action.id)
+        return session_id, action.id, self.workspace_root / "src" / "module.py"
 
     def _build_delegate_loop(self, model, confirmation_handler=None) -> AgentLoop:
         runner = SubagentRunner(
