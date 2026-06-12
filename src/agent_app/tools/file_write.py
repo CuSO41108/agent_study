@@ -1,6 +1,9 @@
 ﻿from __future__ import annotations
 
 import difflib
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -96,6 +99,7 @@ class FileWriteInspection:
 class FileWriteTool(Tool):
     name = "file_write"
     description = "Safely write a small text file inside the workspace."
+    has_side_effect = True
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -137,7 +141,7 @@ class FileWriteTool(Tool):
                 error=changed_error,
             )
 
-        inspection.path.write_text(inspection.content, encoding="utf-8")
+        _atomic_write_text(inspection.path, inspection.content)
         return ToolResult(
             tool_call_id=tool_call_id,
             tool_name=self.name,
@@ -156,6 +160,29 @@ class FileWriteTool(Tool):
         context: ToolExecutionContext,
     ) -> tuple[FileWriteInspection | None, str | None]:
         return inspect_file_write_request(arguments=arguments, context=context)
+
+    def recovery_metadata(
+        self,
+        *,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        inspection = context.prepared_edits.get(tool_call_id)
+        if not isinstance(inspection, FileWriteInspection):
+            inspection, error = inspect_file_write_request(arguments=arguments, context=context)
+            if inspection is None:
+                raise ValueError(error or "Unable to build file-write recovery metadata.")
+        return _file_recovery_metadata(
+            relative_path=inspection.relative_path,
+            before_exists=inspection.existing_content is not None,
+            before_content=inspection.existing_content,
+            after_content=inspection.content,
+            success_content=(
+                f"{inspection.operation.title()}d {inspection.relative_path} "
+                f"({inspection.byte_count} bytes, {inspection.line_count} lines)."
+            ),
+        )
 
 
 
@@ -284,3 +311,47 @@ def _line_count(content: str) -> int:
     if not content:
         return 0
     return content.count("\n") + 1
+
+
+def _file_recovery_metadata(
+    *,
+    relative_path: str,
+    before_exists: bool,
+    before_content: str | None,
+    after_content: str,
+    success_content: str,
+) -> dict[str, Any]:
+    return {
+        "side_effect": True,
+        "recovery_kind": "text_file_hash",
+        "relative_path": relative_path,
+        "before_exists": before_exists,
+        "before_sha256": _text_sha256(before_content) if before_exists else None,
+        "after_sha256": _text_sha256(after_content),
+        "success_content": success_content,
+    }
+
+
+def _text_sha256(content: str | None) -> str:
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()

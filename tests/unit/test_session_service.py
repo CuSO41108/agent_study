@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import unittest
 from pathlib import Path
 from uuid import uuid4
 
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
-from agent_app.types import Message, ToolResult
+from agent_app.types import Message, ToolCall, ToolResult
 
 
 class SessionServiceTests(unittest.TestCase):
@@ -65,6 +66,81 @@ class SessionServiceTests(unittest.TestCase):
         tool_runs = self.sessions.list_tool_runs(session_id)
 
         self.assertEqual(tool_runs, [tool_result])
+
+    def test_tool_action_lifecycle_is_idempotent_and_persists_result_once(self) -> None:
+        session_id = self.sessions.create_session("session-actions")
+        tool_call = ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"})
+
+        first = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="agent-1",
+            tool_call=tool_call,
+            recovery_metadata={"side_effect": False},
+        )
+        duplicate = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="agent-1",
+            tool_call=tool_call,
+            recovery_metadata={"side_effect": False},
+        )
+        executing = self.sessions.mark_tool_action_executing(first.id)
+        result = ToolResult(
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            success=True,
+            content="README",
+            error=None,
+        )
+        completed = self.sessions.complete_tool_action(first.id, status="succeeded", tool_result=result)
+        completed_again = self.sessions.complete_tool_action(first.id, status="succeeded", tool_result=result)
+
+        self.assertEqual(first.id, duplicate.id)
+        self.assertEqual(executing.status, "executing")
+        self.assertEqual(completed.status, "succeeded")
+        self.assertEqual(completed.result, result)
+        self.assertEqual(completed_again.result, result)
+        self.assertEqual(self.sessions.list_tool_runs(session_id), [result])
+
+    def test_tool_action_completion_and_tool_run_insert_share_a_transaction(self) -> None:
+        session_id = self.sessions.create_session("session-transaction")
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="agent-1",
+            tool_call=ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"}),
+            recovery_metadata={"side_effect": False},
+        )
+        self.sessions.mark_tool_action_executing(action.id)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_tool_run BEFORE INSERT ON tool_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'reject tool run');
+                END
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.sessions.complete_tool_action(
+                action.id,
+                status="succeeded",
+                tool_result=ToolResult(
+                    tool_call_id="call-1",
+                    tool_name="file_read",
+                    success=True,
+                    content="README",
+                    error=None,
+                ),
+            )
+
+        stored = self.sessions.list_tool_actions(session_id)[0]
+        self.assertEqual(stored.status, "executing")
+        self.assertIsNone(stored.result)
+        self.assertEqual(self.sessions.list_tool_runs(session_id), [])
 
     def test_append_subagent_run_and_list_subagent_runs(self) -> None:
         parent_session_id = self.sessions.create_session("parent-session")
