@@ -1,4 +1,8 @@
-# Agent Harness 现状评估与改造计划
+# Agent Harness 历史评估与改造计划
+
+> 本文保留为改造前的历史评估，其中部分“当前缺口”和路线图已经完成。
+> 现行 TaskState、Event、Observe、预算、恢复和 Trace 架构请以
+> [`TASK_STATE_MACHINE.md`](TASK_STATE_MACHINE.md) 为准。
 
 ## 一、文档目的
 

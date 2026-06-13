@@ -19,13 +19,17 @@ Agent Study 是一个面向本地仓库工作流的 CLI-first coding agent harne
 
 - CLI 单轮执行：每次命令处理一个用户请求并返回 JSON 结果。
 - 交互式 REPL：同一进程内持续对话，支持自然语言确认与 `:new` 新建 session。
-- Session persistence：消息、tool runs、summary、todo、subagent runs 和 traces 会写入 `.agent_app/agent.db`。
-- 工作记忆：通过 rolling summary、session todo 和 recent tool evidence replay 复用当前 session 的上下文。
+- Task persistence：每个用户目标都有独立 `TaskState`，生命周期、计划、工作记忆、预算、PendingAction、Observation 和终止原因写入 SQLite。
+- Unified Event：用户输入、批准、拒绝、暂停、恢复、取消和过期都归一化为 append-only `AgentEvent`，使用任务内 sequence 与 version 防止重复或过期迁移。
+- 工作记忆：通过 rolling summary、Task Plan 和 recent tool evidence replay 复用当前 session 的上下文；旧 session todo 会在首次建 Task 时导入。
 - 安全工具层：提供 `file_read`、`code_search`、`replace_in_file`、`file_write`、`shell`、`todo_read`、`todo_write` 和 `delegate_task`。
 - 局部编辑：现有文件优先通过 `replace_in_file` 修改，`file_write` 主要用于小文件创建或显式覆盖。
 - 受限 shell：shell 命令经过白名单与参数检查，并通过共享 `ShellRuntime` 执行。
 - Bounded delegation：root coordinator 可以把边界清晰的子任务委派给 worker agent。
-- Trace：turn 级和 tool 级记录写入 `turn_traces` / `tool_call_traces`，便于复盘和测试。
+- ReAct Observe：工具结果、校验失败、拒绝、超时、冲突和执行异常统一转换为语义化 `Observation`；只读或幂等瞬时失败最多自动重试两次。
+- 可恢复审批：文件编辑先持久化 PendingAction 并进入 `waiting_user`，可在新进程中批准或拒绝，批准前会复核文件版本。
+- 任务预算：限制模型调用、工具调用、token、活跃时间、重复决策、重试和 Reflection 重规划次数。
+- 完整 Trace：模型、决策、审批、工具尝试、Observation、预算和状态迁移即时关联到 `task_id`；兼容的 turn/tool 摘要仍写入 `turn_traces` 和 `tool_call_traces`。
 
 ## 快速开始
 
@@ -103,6 +107,17 @@ python -m agent_app.cli --interactive --workspace-root .
 agent-app --interactive --workspace-root .
 ```
 
+查询和控制持久化任务：
+
+```powershell
+python -m agent_app.cli --workspace-root . --task-status TASK_ID
+python -m agent_app.cli --workspace-root . --pause-task TASK_ID
+python -m agent_app.cli --workspace-root . --resume-task TASK_ID
+python -m agent_app.cli --workspace-root . --cancel-task TASK_ID
+python -m agent_app.cli --workspace-root . --approve-task TASK_ID
+python -m agent_app.cli --workspace-root . --reject-task TASK_ID
+```
+
 交互模式会让同一个进程持续运行，便于继续回答模型的自然语言追问。输入 `:new` 可以开始新 session，输入 `exit` 或 `quit` 退出。
 
 `--workspace-root` 应指向真实存在的工作区根目录。CLI 会把 `.agent_app/agent.db` 和 `.agent_app/current_session.txt` 存在该目录下，也会从同一路径加载 `.agent_app/.env.local`。
@@ -111,17 +126,19 @@ agent-app --interactive --workspace-root .
 
 - `src/agent_app/cli.py`：CLI 入口、session 解析与交互循环。
 - `src/agent_app/agent/`：agent 定义、目标、规则和工具访问策略。
-- `src/agent_app/orchestrator/`：主循环、context builder 和 subagent runner。
+- `src/agent_app/orchestrator/`：ReAct 主循环、Event 入口、Executor、context builder 和 subagent runner。
 - `src/agent_app/tools/`：文件、代码搜索、shell、todo、delegate 与编辑工具。
-- `src/agent_app/state/`：基于 SQLite 的 session 存储、summary、subagent run 和 traces。
-- `src/agent_app/runtime/`：共享 `ShellRuntime`，统一 shell 执行与验证路径。
+- `src/agent_app/state/`：SQLite session、Task 快照、append-only Event、ToolAction 和 Trace 持久化。
+- `src/agent_app/runtime/`：`TaskRuntime` 状态机与共享 `ShellRuntime`。
 - `tests/`：单元、集成和回归测试，其中包含 `tests/regression/`。
 
 ## 设计边界
 
 - 当前形态是本地 CLI harness；服务化、Web UI 和托管运行不是主线。
 - 编排层由项目内 tool-call loop 实现，没有引入 LangChain / LangGraph 等外部编排框架。
-- 复杂任务主要依靠 todo、工具证据和 bounded delegation 管理；是否引入更明确的 planner / reviewer 取决于后续评测需要。
+- Planner、Critic、Reflection 仅按条件轻量触发，不构建独立常驻决策流水线。
+- `waiting_tool` 只保留状态和迁移契约，本期工具仍为同步执行。
+- Governance 目前只保留工具副作用、幂等性和风险元数据，不包含 RBAC、租户、告警或外部指标平台。
 - 当前上下文策略以 summary、todo 和 recent tool evidence replay 为主；更重的上下文检索机制先不放入 `main`。
 - `replace_in_file` 不是通用 patch 系统，不支持模糊匹配、正则匹配或多文件编辑。
 - 当前 shell 体验以 PowerShell 为中心。
@@ -148,6 +165,7 @@ python -m unittest discover -s tests -v
 ```powershell
 python -m coverage run -m unittest discover -s tests -v
 python -m coverage report --fail-under=90
+python -m coverage report --precision=2 --fail-under=90
 ```
 
 快速 smoke test：
@@ -176,5 +194,6 @@ python -m agent_app.cli --workspace-root . "还记得我刚才说最喜欢的数
 
 ## 延伸文档
 
-- 架构与演进说明：[`docs/AGENT_CONTEXT_ENGINEERING.md`](docs/AGENT_CONTEXT_ENGINEERING.md)
+- TaskState 状态机架构：[`docs/TASK_STATE_MACHINE.md`](docs/TASK_STATE_MACHINE.md)
+- 历史架构评估：[`docs/AGENT_CONTEXT_ENGINEERING.md`](docs/AGENT_CONTEXT_ENGINEERING.md)
 - 兼容启动器：`run_local.ps1` 仍然是 `agent-app` 的薄包装，不注入 `PYTHONPATH` 或模型密钥。
