@@ -44,6 +44,7 @@ class TodoWriteTool(Tool):
     name = "todo_write"
     description = "Replace the current session todo list."
     has_side_effect = True
+    is_idempotent = True
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -95,6 +96,16 @@ class TodoWriteTool(Tool):
         )
         assert context.session_service is not None
         assert context.session_id is not None
+        if context.task_id is not None:
+            from agent_app.runtime.task_runtime import TaskRuntime
+
+            TaskRuntime(context.session_service).update_plan(
+                context.task_id,
+                todo_items,
+                reason="todo_write",
+            )
+            content = _format_todo_items(todo_items) if todo_items else "No active todo items."
+            return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=True, content=content, error=None)
         context.session_service.upsert_session_context(
             context.session_id,
             summary_text=session_context.summary_text,
@@ -108,6 +119,19 @@ class TodoWriteTool(Tool):
 def _get_required_session_context(context: ToolExecutionContext) -> tuple[SessionContext | None, str | None]:
     if context.session_service is None or context.session_id is None:
         return None, "Session-backed todo tools require an active session."
+    if context.task_id is not None:
+        task = context.session_service.get_task(context.task_id)
+        if task is None:
+            return None, f"Task '{context.task_id}' was not found."
+        session_context = context.session_service.get_session_context(context.session_id)
+        return (
+            SessionContext(
+                summary_text=session_context.summary_text,
+                summary_message_id=session_context.summary_message_id,
+                todo_items=task.plan,
+            ),
+            None,
+        )
     return context.session_service.get_session_context(context.session_id), None
 
 

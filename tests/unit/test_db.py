@@ -33,7 +33,10 @@ class DatabaseTests(unittest.TestCase):
                           'session_context',
                           'turn_traces',
                           'tool_call_traces',
-                          'subagent_runs'
+                          'subagent_runs',
+                          'tasks',
+                          'task_events',
+                          'task_traces'
                       )
                     ORDER BY name
                     """
@@ -50,6 +53,9 @@ class DatabaseTests(unittest.TestCase):
                 "session_context",
                 "sessions",
                 "subagent_runs",
+                "task_events",
+                "task_traces",
+                "tasks",
                 "tool_actions",
                 "tool_call_traces",
                 "tool_runs",

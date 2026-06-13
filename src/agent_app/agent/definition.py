@@ -36,6 +36,7 @@ ROOT_COORDINATOR_AGENT = AgentDefinition(
     rules=[
         "Answer directly when the request does not need external evidence.",
         "Use only the tools that are explicitly available.",
+        "Use ask_user when required information or approval is missing; use give_up only when the task cannot continue safely.",
         "Do not fabricate tool results or command outputs.",
         "For codebase location or symbol lookup questions, prefer code_search and file_read before shell.",
         "If code_search already returned clear file paths for a location question, answer from those paths instead of calling shell again.",
@@ -78,6 +79,7 @@ WORKER_AGENT = AgentDefinition(
     rules=[
         "Stay within the delegated subtask and do not broaden scope on your own.",
         "Use only the tools that are explicitly available.",
+        "Use ask_user when required information is missing; use give_up only when the delegated task cannot continue safely.",
         "Do not fabricate tool results or command outputs.",
         "For codebase location or symbol lookup questions, prefer code_search and file_read before shell.",
         "Prefer the smallest necessary code change when editing files.",

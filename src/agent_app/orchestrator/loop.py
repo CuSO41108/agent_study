@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -10,13 +11,35 @@ from typing import Any, Callable
 from agent_app.agent.definition import AgentDefinition
 from agent_app.agent.prompts import render_system_prompt
 from agent_app.orchestrator.context_builder import build_context_messages, build_evidence_message, estimate_messages_tokens
-from agent_app.state.session_service import SessionService
+from agent_app.runtime.task_runtime import InvalidTaskTransition, TaskRuntime
+from agent_app.state.session_service import (
+    SessionService,
+    TaskVersionConflict,
+    TracePersistenceError,
+)
 from agent_app.tools.approval import approve_tool_call
-from agent_app.tools.base import ToolExecutionContext
+from agent_app.tools.base import ToolExecutionContext, observation_from_tool_result
 from agent_app.tools.registry import ToolRegistry
-from agent_app.types import Message, ModelResponse, SessionContext, StoredMessage, TodoItem, ToolAction, ToolCall, ToolResult, TurnResult
+from agent_app.types import (
+    AgentEvent,
+    Message,
+    ModelResponse,
+    Observation,
+    PendingAction,
+    SessionContext,
+    StoredMessage,
+    TodoItem,
+    ToolAction,
+    ToolCall,
+    ToolResult,
+    TurnResult,
+)
 
 ConfirmationHandler = Callable[[ToolCall, ToolExecutionContext], bool]
+
+
+class InvalidTaskEvent(RuntimeError):
+    pass
 
 
 class AgentLoop:
@@ -54,15 +77,87 @@ class AgentLoop:
             delegation_depth=delegation_depth,
         )
         self._confirmation_handler = confirmation_handler
+        self._tasks = TaskRuntime(session_service)
+        self._active_task_id: str | None = None
+        self._turn_started_at: float | None = None
 
-    def run_turn(self, *, user_input: str, session_id: str | None = None) -> TurnResult:
+    def run_turn(
+        self,
+        *,
+        user_input: str,
+        session_id: str | None = None,
+        _task_id: str | None = None,
+        _append_user_message: bool = True,
+    ) -> TurnResult:
+        self._active_task_id = None
+        self._turn_started_at = None
+        try:
+            return self._run_turn_impl(
+                user_input=user_input,
+                session_id=session_id,
+                _task_id=_task_id,
+                _append_user_message=_append_user_message,
+            )
+        except TracePersistenceError:
+            return self._runtime_failure_result(
+                session_id=session_id,
+                stop_reason="trace_persistence_error",
+            )
+        except Exception:
+            if self._active_task_id is None:
+                raise
+            return self._runtime_failure_result(
+                session_id=session_id,
+                stop_reason="internal_exception",
+            )
+
+    def _run_turn_impl(
+        self,
+        *,
+        user_input: str,
+        session_id: str | None = None,
+        _task_id: str | None = None,
+        _append_user_message: bool = True,
+    ) -> TurnResult:
         resolved_session_id = self._session_service.get_or_create_session(session_id)
+        if _task_id is None:
+            latest = self._session_service.get_latest_task(resolved_session_id)
+            if (
+                latest is not None
+                and latest.status == "waiting_user"
+                and latest.pending_action is not None
+                and latest.pending_action.kind == "tool_approval"
+            ):
+                return self._task_result(
+                    latest,
+                    final_text=latest.pending_action.prompt,
+                    stop_reason="waiting_user",
+                    success=False,
+                )
+            task = self._tasks.start_for_user_message(
+                session_id=resolved_session_id,
+                user_input=user_input,
+            )
+        else:
+            task = self._tasks.require_task(_task_id)
+            if task.session_id != resolved_session_id:
+                raise ValueError("Task does not belong to the requested session.")
+            if task.status != "running":
+                return self._task_result(
+                    task,
+                    final_text=None,
+                    stop_reason=task.stop_reason or f"task_{task.status}",
+                    success=task.status == "completed",
+                )
+        self._active_task_id = task.id
+        self._turn_started_at = time.monotonic()
         recovery_blockers = self._recover_pending_tool_actions(resolved_session_id)
         if recovery_blockers:
             action_names = ", ".join(
                 f"{result.tool_name} ({result.tool_call_id})"
                 for result in recovery_blockers
             )
+            task = self._tasks.fail(task.id, reason="uncertain_tool_action")
             return TurnResult(
                 session_id=resolved_session_id,
                 final_text=(
@@ -72,20 +167,31 @@ class AgentLoop:
                 stop_reason="uncertain_tool_action",
                 tool_runs=recovery_blockers,
                 success=False,
+                task_id=task.id,
+                task_status=task.status,
             )
 
-        self._session_service.append_message(
-            resolved_session_id,
-            Message(role="user", content=user_input),
-        )
+        if _append_user_message:
+            self._session_service.append_message(
+                resolved_session_id,
+                Message(role="user", content=user_input),
+            )
 
         self._tool_context = replace(
             self._tool_context,
             prepared_edits={},
             turn_state={},
             session_id=resolved_session_id,
+            task_id=task.id,
             session_service=self._session_service,
         )
+        if len(task.plan) > 1 and not task.working_memory.get("planner_initialized"):
+            self._session_service.append_task_trace(
+                task.id,
+                "planner",
+                {"trigger": "new_multi_step_task", "items": [item.content for item in task.plan]},
+            )
+            task = self._tasks.update_working_memory(task.id, {"planner_initialized": True})
 
         messages = self._session_service.list_messages(resolved_session_id)
         session_context = self._session_service.get_session_context(resolved_session_id)
@@ -94,6 +200,12 @@ class AgentLoop:
             messages=messages,
             session_context=session_context,
         )
+        if task.plan:
+            session_context = SessionContext(
+                summary_text=session_context.summary_text,
+                summary_message_id=session_context.summary_message_id,
+                todo_items=task.plan,
+            )
         tool_runs_history = self._session_service.list_tool_runs(resolved_session_id)
         evidence_message = build_evidence_message(tool_runs_history)
         provider_messages = build_context_messages(
@@ -117,11 +229,63 @@ class AgentLoop:
         consecutive_failure_count = 0
 
         while True:
+            task = self._tasks.require_task(task.id)
+            budget_reason = self._tasks.budget_stop_reason(task)
+            if budget_reason is not None:
+                return self._finalize_turn(
+                    session_id=resolved_session_id,
+                    user_input=user_input,
+                    context_message_count=base_context_message_count,
+                    context_token_estimate=base_context_token_estimate,
+                    used_summary=used_summary,
+                    used_todo=used_todo,
+                    used_evidence=used_evidence,
+                    final_text=None,
+                    stop_reason=budget_reason,
+                    tool_runs=tool_runs,
+                    success=False,
+                )
+            model_started = time.monotonic()
             response = self._model_client.generate(
                 system_prompt=system_prompt,
                 messages=provider_messages,
-                tools=self._tool_registry.get_specs(self._agent.allowed_tools),
+                tools=self._available_tool_specs(),
             )
+            model_duration_ms = int((time.monotonic() - model_started) * 1000)
+            response_tokens = response.total_tokens or _estimate_response_tokens(provider_messages, response)
+            task = self._tasks.consume_model_call(task.id, tokens=response_tokens)
+            decision_payload = _decision_payload(response)
+            self._session_service.append_task_trace(
+                task.id,
+                "model_call",
+                {
+                    "phase": "policy",
+                    "model": response.model_name or getattr(self._model_client, "model", self._agent.default_model),
+                    "duration_ms": model_duration_ms,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "total_tokens": response_tokens,
+                    "usage_source": response.usage_source,
+                    "error_type": response.error_type,
+                },
+            )
+            self._session_service.append_task_trace(task.id, "decision", decision_payload)
+            repeated_reason = self._record_decision_repetition(task.id, decision_payload)
+            if repeated_reason is not None:
+                self._tasks.reflect(task.id, repeated_reason)
+                return self._finalize_turn(
+                    session_id=resolved_session_id,
+                    user_input=user_input,
+                    context_message_count=base_context_message_count,
+                    context_token_estimate=base_context_token_estimate,
+                    used_summary=used_summary,
+                    used_todo=used_todo,
+                    used_evidence=used_evidence,
+                    final_text=None,
+                    stop_reason="repeated_decision",
+                    tool_runs=tool_runs,
+                    success=False,
+                )
 
             if response.error_type:
                 return self._finalize_turn(
@@ -140,6 +304,15 @@ class AgentLoop:
 
             if not response.tool_calls:
                 if response.assistant_text:
+                    self._session_service.append_task_trace(
+                        task.id,
+                        "critic",
+                        {
+                            "trigger": "final_answer",
+                            "allowed": True,
+                            "evidence_count": len([item for item in tool_runs if item.success]),
+                        },
+                    )
                     self._session_service.append_message(
                         resolved_session_id,
                         Message(role="assistant", content=response.assistant_text),
@@ -237,9 +410,9 @@ class AgentLoop:
                         success=True,
                     )
 
-                try:
-                    tool_result = self._execute_tool_call(tool_call)
-                except Exception:
+                current_task = self._tasks.require_task(task.id)
+                budget_reason = self._tasks.budget_stop_reason(current_task)
+                if budget_reason is not None:
                     return self._finalize_turn(
                         session_id=resolved_session_id,
                         user_input=user_input,
@@ -249,11 +422,41 @@ class AgentLoop:
                         used_todo=used_todo,
                         used_evidence=used_evidence,
                         final_text=None,
-                        stop_reason="tool_execution_error",
+                        stop_reason=budget_reason,
                         tool_runs=tool_runs,
                         success=False,
                     )
+                tool_result = self._execute_tool_call(tool_call)
                 tool_runs.append(tool_result)
+                current_task = self._tasks.require_task(task.id)
+                if current_task.status == "waiting_user":
+                    return self._finalize_turn(
+                        session_id=resolved_session_id,
+                        user_input=user_input,
+                        context_message_count=base_context_message_count,
+                        context_token_estimate=base_context_token_estimate,
+                        used_summary=used_summary,
+                        used_todo=used_todo,
+                        used_evidence=used_evidence,
+                        final_text=current_task.pending_action.prompt if current_task.pending_action else None,
+                        stop_reason="waiting_user",
+                        tool_runs=tool_runs,
+                        success=False,
+                    )
+                if current_task.status in {"failed", "cancelled", "expired"}:
+                    return self._finalize_turn(
+                        session_id=resolved_session_id,
+                        user_input=user_input,
+                        context_message_count=base_context_message_count,
+                        context_token_estimate=base_context_token_estimate,
+                        used_summary=used_summary,
+                        used_todo=used_todo,
+                        used_evidence=used_evidence,
+                        final_text=None,
+                        stop_reason=current_task.stop_reason or f"task_{current_task.status}",
+                        tool_runs=tool_runs,
+                        success=False,
+                    )
                 if self._session_service.list_uncertain_tool_actions(resolved_session_id):
                     return self._finalize_turn(
                         session_id=resolved_session_id,
@@ -289,6 +492,10 @@ class AgentLoop:
                         consecutive_failure_tool = tool_result.tool_name
                         consecutive_failure_count = 1
                     if consecutive_failure_count >= 2:
+                        self._tasks.reflect(
+                            task.id,
+                            f"Tool '{tool_result.tool_name}' failed repeatedly: {tool_result.error or 'unknown error'}",
+                        )
                         evidence_answer = self._build_evidence_answer(
                             user_input=user_input,
                             tool_runs=tool_runs,
@@ -326,7 +533,264 @@ class AgentLoop:
                             success=False,
                         )
 
+    def handle_event(self, event: AgentEvent) -> TurnResult:
+        self._active_task_id = event.task_id
+        try:
+            return self._handle_event_impl(event)
+        except (InvalidTaskEvent, InvalidTaskTransition, TaskVersionConflict, KeyError, ValueError):
+            raise
+        except TracePersistenceError:
+            return self._runtime_failure_result(
+                session_id=event.session_id,
+                stop_reason="trace_persistence_error",
+            )
+        except Exception:
+            return self._runtime_failure_result(
+                session_id=event.session_id,
+                stop_reason="internal_exception",
+            )
+
+    def _handle_event_impl(self, event: AgentEvent) -> TurnResult:
+        if event.type == "user_message":
+            content = str(event.payload.get("content", ""))
+            if event.task_id is None:
+                resolved_session_id = self._session_service.get_or_create_session(event.session_id)
+                task = self._tasks.start_for_user_message(
+                    session_id=resolved_session_id,
+                    user_input=content,
+                    event=event,
+                )
+                return self.run_turn(
+                    user_input=content,
+                    session_id=resolved_session_id,
+                    _task_id=task.id,
+                    _append_user_message=True,
+                )
+            task = self._tasks.require_task(event.task_id)
+            if task.status == "waiting_user":
+                task = self._tasks.resume_with_user_message(task.id, content, event=event)
+            else:
+                task = self._tasks.record_user_message(task.id, content, event=event)
+            return self.run_turn(
+                user_input=content,
+                session_id=event.session_id,
+                _task_id=task.id,
+                _append_user_message=True,
+            )
+
+        if event.task_id is None:
+            raise ValueError(f"Event '{event.type}' requires task_id.")
+        task = self._tasks.expire_if_needed(self._tasks.require_task(event.task_id))
+        if task.status == "expired":
+            return self._task_result(task, final_text=None, stop_reason=task.stop_reason, success=False)
+
+        if event.type == "pause_requested":
+            return self._task_result(self._tasks.pause(task.id, event=event), final_text=None, stop_reason="paused", success=False)
+        if event.type == "resume_requested":
+            task = self._tasks.resume(task.id, event=event)
+            return self.run_turn(
+                user_input="",
+                session_id=task.session_id,
+                _task_id=task.id,
+                _append_user_message=False,
+            )
+        if event.type == "cancel_requested":
+            return self._task_result(self._tasks.cancel(task.id, event=event), final_text=None, stop_reason="cancelled", success=False)
+        if event.type == "task_expired":
+            return self._task_result(self._tasks.expire(task.id, event=event), final_text=None, stop_reason="waiting_user_expired", success=False)
+        if event.type not in {"user_approved", "user_rejected"}:
+            raise ValueError(f"Unsupported event type '{event.type}'.")
+        if task.status != "waiting_user" or task.pending_action is None:
+            raise InvalidTaskEvent(f"Task '{task.id}' is not waiting for user input.")
+
+        pending = task.pending_action
+        if event.type == "user_approved":
+            task = self._tasks.approve(task.id, event=event)
+        else:
+            task = self._tasks.reject(task.id, event=event)
+
+        if pending.kind != "tool_approval" or pending.decision is None:
+            return self.run_turn(
+                user_input=str(event.payload.get("content", "")),
+                session_id=task.session_id,
+                _task_id=task.id,
+                _append_user_message=bool(event.payload.get("content")),
+            )
+
+        tool_call = ToolCall(
+            id=str(pending.decision["tool_call_id"]),
+            name=str(pending.decision["tool_name"]),
+            arguments=dict(pending.decision.get("arguments", {})),
+        )
+        self._active_task_id = task.id
+        self._turn_started_at = time.monotonic()
+        self._tool_context = replace(
+            self._tool_context,
+            prepared_edits={},
+            turn_state={
+                "approved_tool_calls": {tool_call.id},
+                "approved_action_metadata": {
+                    tool_call.id: dict(pending.decision.get("approval_metadata", {}))
+                },
+            },
+            session_id=task.session_id,
+            task_id=task.id,
+            session_service=self._session_service,
+        )
+        if event.type == "user_approved":
+            tool_result = self._execute_tool_call(tool_call)
+            self._session_service.append_task_trace(
+                task.id,
+                "approval",
+                {"tool": tool_call.name, "decision": "approve", "tool_call_id": tool_call.id, "resumed": True},
+            )
+        else:
+            tool_result = self._record_untracked_tool_result(
+                ToolResult(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    success=False,
+                    content="",
+                    error="Tool use denied by user.",
+                ),
+                side_effect=True,
+                approval_decision="reject",
+            )
+            self._session_service.append_task_trace(
+                task.id,
+                "approval",
+                {"tool": tool_call.name, "decision": "reject", "tool_call_id": tool_call.id, "resumed": True},
+            )
+        result = self.run_turn(
+            user_input="",
+            session_id=task.session_id,
+            _task_id=task.id,
+            _append_user_message=False,
+        )
+        result.tool_runs.insert(0, tool_result)
+        return result
+
+    def get_task(self, task_id: str):
+        return self._tasks.require_task(task_id)
+
+    def _record_decision_repetition(self, task_id: str, decision: dict[str, Any]) -> str | None:
+        task = self._tasks.require_task(task_id)
+        decision_hash = hashlib.sha256(
+            json.dumps(decision, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        previous_hash = task.working_memory.get("last_decision_hash")
+        repeat_count = int(task.working_memory.get("repeat_decision_count", 0))
+        made_progress = task.last_observation is not None and task.last_observation.status == "succeeded"
+        repeat_count = repeat_count + 1 if previous_hash == decision_hash and not made_progress else 1
+        self._tasks.update_working_memory(
+            task_id,
+            {
+                "last_decision_hash": decision_hash,
+                "repeat_decision_count": repeat_count,
+            },
+        )
+        if repeat_count >= task.budget.repeat_decision_limit:
+            return f"The same decision repeated {repeat_count} times without progress."
+        return None
+
+    def _require_active_task_id(self) -> str:
+        if self._active_task_id is None:
+            raise RuntimeError("Task-aware execution requires an active task.")
+        return self._active_task_id
+
+    def _task_result(
+        self,
+        task,
+        *,
+        final_text: str | None,
+        stop_reason: str | None,
+        success: bool,
+        tool_runs: list[ToolResult] | None = None,
+    ) -> TurnResult:
+        return TurnResult(
+            session_id=task.session_id,
+            final_text=final_text,
+            stop_reason=stop_reason,
+            tool_runs=tool_runs or [],
+            success=success,
+            task_id=task.id,
+            task_status=task.status,
+            pending_action=task.pending_action,
+        )
+
+    def _runtime_failure_result(
+        self,
+        *,
+        session_id: str | None,
+        stop_reason: str,
+    ) -> TurnResult:
+        task = None
+        if self._active_task_id is not None:
+            try:
+                task = self._tasks.fail(self._active_task_id, reason=stop_reason)
+            except Exception:
+                task = self._session_service.get_task(self._active_task_id)
+        resolved_session_id = (
+            task.session_id
+            if task is not None
+            else session_id or ""
+        )
+        return TurnResult(
+            session_id=resolved_session_id,
+            final_text=None,
+            stop_reason=stop_reason,
+            tool_runs=[],
+            success=False,
+            task_id=None if task is None else task.id,
+            task_status=None if task is None else task.status,
+            pending_action=None if task is None else task.pending_action,
+        )
+
     def _execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
+        if tool_call.name == "ask_user":
+            question = tool_call.arguments.get("question")
+            if not isinstance(question, str) or not question.strip():
+                return self._record_untracked_tool_result(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error="Invalid arguments: question is required.",
+                    ),
+                    approval_decision="not_requested",
+                )
+            task_id = self._require_active_task_id()
+            self._tasks.wait_for_user(
+                task_id,
+                PendingAction(
+                    kind="ask_user",
+                    prompt=question.strip(),
+                    decision={"type": "ask_user", "question": question.strip()},
+                ),
+            )
+            self._session_service.append_task_trace(
+                task_id,
+                "approval",
+                {"decision": "pending", "kind": "ask_user", "question": question.strip()},
+            )
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                success=False,
+                content="",
+                error="Waiting for user response.",
+            )
+        if tool_call.name == "give_up":
+            reason = str(tool_call.arguments.get("reason") or "Agent gave up.")
+            self._tasks.fail(self._require_active_task_id(), reason="give_up")
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                success=False,
+                content="",
+                error=reason,
+            )
         if tool_call.name not in self._agent.allowed_tools:
             return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
@@ -334,7 +798,7 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=f"Tool '{tool_call.name}' is not allowed for this agent.",
-            ))
+            ), approval_decision="deny")
 
         tool = self._tool_registry.get(tool_call.name)
         if tool is None:
@@ -344,7 +808,7 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=f"Tool '{tool_call.name}' is not registered.",
-            ))
+            ), approval_decision="deny")
 
         validation_error = tool.validate_arguments(tool_call.arguments)
         if validation_error is not None:
@@ -354,7 +818,7 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=validation_error,
-            ))
+            ), side_effect=tool.has_side_effect, approval_decision="not_requested")
 
         approval = approve_tool_call(tool_call.name, tool_call.arguments)
         if approval.decision == "deny":
@@ -364,89 +828,356 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=approval.reason,
-            ))
+            ), side_effect=tool.has_side_effect, approval_decision="deny")
 
         if approval.decision == "confirm":
-            inspection, error = tool.inspect(arguments=tool_call.arguments, context=self._tool_context)
-            if inspection is None:
-                return self._record_untracked_tool_result(ToolResult(
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    success=False,
-                    content="",
-                    error=error or "Unable to inspect edit.",
-                ))
+            approved_ids = self._tool_context.turn_state.setdefault("approved_tool_calls", set())
+            if tool_call.id not in approved_ids:
+                inspection, error = tool.inspect(arguments=tool_call.arguments, context=self._tool_context)
+                if inspection is None:
+                    return self._record_untracked_tool_result(ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error=error or "Unable to inspect edit.",
+                    ), side_effect=tool.has_side_effect, approval_decision="inspection_failed")
 
-            self._tool_context.prepared_edits[tool_call.id] = inspection
-            confirmed = False
-            if self._confirmation_handler is not None:
+                self._tool_context.prepared_edits[tool_call.id] = inspection
+                task_id = self._require_active_task_id()
+                pending = PendingAction(
+                    kind="tool_approval",
+                    prompt=f"Approve tool '{tool_call.name}' for task {task_id}?",
+                    decision={
+                        "type": "tool_call",
+                        "tool_call_id": tool_call.id,
+                        "tool_name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                        "approval_metadata": tool.recovery_metadata(
+                            tool_call_id=tool_call.id,
+                            arguments=tool_call.arguments,
+                            context=self._tool_context,
+                        ),
+                    },
+                )
+                self._tasks.wait_for_user(task_id, pending)
+                self._session_service.append_task_trace(
+                    task_id,
+                    "critic",
+                    {
+                        "trigger": "side_effect_action",
+                        "allowed": False,
+                        "reason": "user_approval_required",
+                        "tool": tool_call.name,
+                        "risk_level": tool.risk_level,
+                    },
+                )
+                if self._confirmation_handler is None:
+                    self._session_service.append_task_trace(
+                        task_id,
+                        "approval",
+                        {"tool": tool_call.name, "decision": "pending", "tool_call_id": tool_call.id},
+                    )
+                    return ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error="Waiting for user approval.",
+                    )
+
                 confirmed = self._confirmation_handler(tool_call, self._tool_context)
-            if not confirmed:
-                self._tool_context.prepared_edits.pop(tool_call.id, None)
-                return self._record_untracked_tool_result(ToolResult(
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    success=False,
-                    content="",
-                    error="Tool use denied by user.",
-                ))
+                if confirmed:
+                    self._tasks.approve(task_id)
+                    approved_ids.add(tool_call.id)
+                    self._session_service.append_task_trace(
+                        task_id,
+                        "approval",
+                        {"tool": tool_call.name, "decision": "approve", "tool_call_id": tool_call.id},
+                    )
+                else:
+                    self._tasks.reject(task_id)
+                    self._tool_context.prepared_edits.pop(tool_call.id, None)
+                    self._session_service.append_task_trace(
+                        task_id,
+                        "approval",
+                        {"tool": tool_call.name, "decision": "reject", "tool_call_id": tool_call.id},
+                    )
+                    return self._record_untracked_tool_result(ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error="Tool use denied by user.",
+                    ), side_effect=tool.has_side_effect, approval_decision="reject")
 
         session_id = self._tool_context.session_id
         if session_id is None:
             raise RuntimeError("Tool execution requires an active session.")
-        recovery_metadata = tool.recovery_metadata(
-            tool_call_id=tool_call.id,
-            arguments=tool_call.arguments,
-            context=self._tool_context,
-        )
-        action = self._session_service.prepare_tool_action(
-            session_id,
-            agent_id=self._agent.id,
-            tool_call=tool_call,
-            recovery_metadata=recovery_metadata,
-        )
-        if action.status in {"succeeded", "failed", "uncertain"} and action.result is not None:
-            return action.result
-        if action.status == "executing":
-            return ToolResult(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-                success=False,
-                content="",
-                error="Tool action is already executing and was not run again.",
+        task_id = self._require_active_task_id()
+        task = self._tasks.require_task(task_id)
+        approved_metadata = self._tool_context.turn_state.get("approved_action_metadata", {}).get(tool_call.id)
+        if approved_metadata:
+            inspection, inspection_error = tool.inspect(
+                arguments=tool_call.arguments,
+                context=self._tool_context,
             )
-
-        action = self._session_service.mark_tool_action_executing(action.id)
-        try:
-            tool_result = tool.execute(
+            if inspection is None:
+                return self._record_untracked_tool_result(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error=inspection_error or "Unable to revalidate approved action.",
+                    ),
+                    side_effect=tool.has_side_effect,
+                    approval_decision="approve_revalidation_failed",
+                )
+            self._tool_context.prepared_edits[tool_call.id] = inspection
+            current_metadata = tool.recovery_metadata(
                 tool_call_id=tool_call.id,
                 arguments=tool_call.arguments,
                 context=self._tool_context,
             )
-        except Exception:
-            status, recovered_result = self._classify_tool_action_recovery(action)
-            completed = self._session_service.complete_tool_action(
-                action.id,
-                status=status,
-                tool_result=recovered_result,
+            approval_keys = ("relative_path", "before_exists", "before_sha256", "after_sha256")
+            if any(current_metadata.get(key) != approved_metadata.get(key) for key in approval_keys):
+                self._tool_context.prepared_edits.pop(tool_call.id, None)
+                return self._record_untracked_tool_result(
+                    ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        success=False,
+                        content="",
+                        error="Approved action changed since inspection. Please review it again.",
+                    ),
+                    side_effect=tool.has_side_effect,
+                    approval_decision="approve_conflict",
+                )
+        retry_of: str | None = None
+        for attempt in range(1, task.budget.max_retries + 2):
+            task = self._tasks.require_task(task_id)
+            if task.budget.used_tool_calls >= task.budget.max_tool_calls:
+                tool_result = ToolResult(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    success=False,
+                    content="",
+                    error="Tool call budget exhausted.",
+                )
+                observation = observation_from_tool_result(
+                    tool_result,
+                    side_effect=tool.has_side_effect,
+                    attempt=attempt,
+                    duration_ms=0,
+                )
+                tool_result.observation = observation
+                self._tasks.record_observation(task_id, observation)
+                self._session_service.append_task_trace(
+                    task_id,
+                    "tool_attempt",
+                    {
+                        "tool_call_id": tool_call.id,
+                        "tool": tool_call.name,
+                        "arguments": tool_call.arguments,
+                        "approval": approval.decision,
+                        "attempt": attempt,
+                        "duration_ms": 0,
+                        "success": False,
+                        "error_type": observation.error_type,
+                        "retryable": False,
+                        "side_effect": tool.has_side_effect,
+                        "budget_blocked": True,
+                    },
+                )
+                return tool_result
+            task = self._tasks.consume_tool_call(task_id)
+            recovery_metadata = tool.recovery_metadata(
+                tool_call_id=tool_call.id,
+                arguments=tool_call.arguments,
+                context=self._tool_context,
             )
-            assert completed.result is not None
-            return completed.result
+            action = self._session_service.prepare_tool_action(
+                session_id,
+                agent_id=self._agent.id,
+                tool_call=tool_call,
+                recovery_metadata=recovery_metadata,
+                task_id=task_id,
+                attempt=attempt,
+                retry_of=retry_of,
+            )
+            if action.status in {"succeeded", "failed", "uncertain"} and action.result is not None:
+                tool_result = action.result
+                duration_ms = 0
+            elif action.status == "executing":
+                tool_result = ToolResult(
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    success=False,
+                    content="",
+                    error="Tool action is already executing and was not run again.",
+                )
+                duration_ms = 0
+            else:
+                action = self._session_service.mark_tool_action_executing(action.id)
+                started = time.monotonic()
+                try:
+                    tool_result = tool.execute(
+                        tool_call_id=tool_call.id,
+                        arguments=tool_call.arguments,
+                        context=self._tool_context,
+                    )
+                    status = "succeeded" if tool_result.success else "failed"
+                except Exception as exc:
+                    if tool.has_side_effect:
+                        status, tool_result = self._classify_tool_action_recovery(action)
+                    else:
+                        status = "failed"
+                        tool_result = ToolResult(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            success=False,
+                            content="",
+                            error=f"Tool execution raised {type(exc).__name__}: {exc}",
+                        )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                completed = self._session_service.complete_tool_action(
+                    action.id,
+                    status=status,
+                    tool_result=tool_result,
+                )
+                assert completed.result is not None
+                tool_result = completed.result
 
-        completed = self._session_service.complete_tool_action(
-            action.id,
-            status="succeeded" if tool_result.success else "failed",
-            tool_result=tool_result,
-        )
-        assert completed.result is not None
-        return completed.result
+            observation = observation_from_tool_result(
+                tool_result,
+                side_effect=tool.has_side_effect,
+                attempt=attempt,
+                duration_ms=duration_ms,
+            )
+            tool_result.observation = observation
+            self._tasks.record_observation(task_id, observation)
+            self._session_service.append_task_trace(
+                task_id,
+                "tool_attempt",
+                {
+                    "tool_call_id": tool_call.id,
+                    "tool": tool_call.name,
+                    "arguments": tool_call.arguments,
+                    "arguments_hash": hashlib.sha256(
+                        json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                    "approval": approval.decision,
+                    "attempt": attempt,
+                    "retry_of": retry_of,
+                    "duration_ms": duration_ms,
+                    "success": tool_result.success,
+                    "error_type": observation.error_type,
+                    "retryable": observation.retryable,
+                    "side_effect": observation.side_effect,
+                    "risk_level": tool.risk_level,
+                },
+            )
+            self._session_service.append_task_trace(
+                task_id,
+                "observation",
+                {
+                    "tool_call_id": tool_call.id,
+                    "status": observation.status,
+                    "error_type": observation.error_type,
+                    "message": observation.message,
+                    "retryable": observation.retryable,
+                    "side_effect": observation.side_effect,
+                    "attempt": attempt,
+                    "duration_ms": duration_ms,
+                },
+            )
+            if tool_result.success or not tool.can_retry(observation) or attempt > task.budget.max_retries:
+                return tool_result
+            retry_of = action.id
+            self._session_service.append_task_trace(
+                task_id,
+                "retry",
+                {
+                    "tool_call_id": tool_call.id,
+                    "attempt": attempt + 1,
+                    "retry_of": retry_of,
+                    "backoff_ms": 10 * (2 ** (attempt - 1)),
+                },
+            )
+            time.sleep(0.01 * (2 ** (attempt - 1)))
 
-    def _record_untracked_tool_result(self, tool_result: ToolResult) -> ToolResult:
+        raise AssertionError("Tool retry loop exhausted without a result.")
+
+    def _record_untracked_tool_result(
+        self,
+        tool_result: ToolResult,
+        *,
+        side_effect: bool = False,
+        approval_decision: str,
+    ) -> ToolResult:
         session_id = self._tool_context.session_id
         if session_id is None:
             raise RuntimeError("Tool execution requires an active session.")
+        task_id = self._require_active_task_id()
+        self._tasks.consume_tool_call(task_id)
+        observation = observation_from_tool_result(
+            tool_result,
+            side_effect=side_effect,
+            attempt=1,
+            duration_ms=0,
+        )
+        tool_result.observation = observation
         self._session_service.append_tool_run(session_id, tool_result)
+        self._tasks.record_observation(task_id, observation)
+        self._session_service.append_task_trace(
+            task_id,
+            "tool_attempt",
+            {
+                "tool_call_id": tool_result.tool_call_id,
+                "tool": tool_result.tool_name,
+                "arguments": {},
+                "approval": approval_decision,
+                "attempt": 1,
+                "duration_ms": 0,
+                "success": False,
+                "error_type": observation.error_type,
+                "retryable": observation.retryable,
+                "side_effect": side_effect,
+            },
+        )
         return tool_result
+
+    def _available_tool_specs(self) -> list[dict[str, Any]]:
+        return [
+            *self._tool_registry.get_specs(self._agent.allowed_tools),
+            {
+                "type": "function",
+                "function": {
+                    "name": "ask_user",
+                    "description": "Pause the task and ask the user for missing information.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"question": {"type": "string", "minLength": 1}},
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "give_up",
+                    "description": "Stop the task when it cannot be completed safely.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"reason": {"type": "string", "minLength": 1}},
+                        "required": ["reason"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
 
     def _recover_pending_tool_actions(self, session_id: str) -> list[ToolResult]:
         for action in self._session_service.list_recoverable_tool_actions(session_id):
@@ -624,6 +1355,7 @@ class AgentLoop:
         for message in messages:
             transcript_lines.append(f"{message.role.upper()}: {message.content or ''}")
 
+        started = time.monotonic()
         response = self._model_client.generate(
             system_prompt=(
                 "Summarize the prior conversation for future task continuation. "
@@ -633,6 +1365,27 @@ class AgentLoop:
             messages=[{"role": "user", "content": "\n".join(transcript_lines)}],
             tools=[],
         )
+        if self._active_task_id is not None:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            tokens = response.total_tokens or _estimate_response_tokens(
+                [{"role": "user", "content": "\n".join(transcript_lines)}],
+                response,
+            )
+            self._tasks.consume_model_call(self._active_task_id, tokens=tokens)
+            self._session_service.append_task_trace(
+                self._active_task_id,
+                "model_call",
+                {
+                    "phase": "summary",
+                    "model": response.model_name or getattr(self._model_client, "model", self._agent.default_model),
+                    "duration_ms": duration_ms,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "total_tokens": tokens,
+                    "usage_source": response.usage_source,
+                    "error_type": response.error_type,
+                },
+            )
         if response.error_type or response.tool_calls or not response.assistant_text:
             return None
         return response.assistant_text.strip() or None
@@ -652,6 +1405,9 @@ class AgentLoop:
         tool_runs: list[ToolResult],
         success: bool,
     ) -> TurnResult:
+        task = self._tasks.require_task(self._require_active_task_id())
+        if self._turn_started_at is not None and task.status not in {"completed", "failed", "cancelled", "expired"}:
+            task = self._tasks.add_active_time(task.id, time.monotonic() - self._turn_started_at)
         try:
             self._session_service.append_turn_trace(
                 session_id,
@@ -666,8 +1422,42 @@ class AgentLoop:
                 success=success,
                 tool_traces=tool_runs,
             )
-        except Exception:
-            pass
+            self._session_service.append_task_trace(
+                task.id,
+                "turn",
+                {
+                    "user_input": user_input,
+                    "context_message_count": context_message_count,
+                    "context_token_estimate": context_token_estimate,
+                    "used_summary": used_summary,
+                    "used_todo": used_todo,
+                    "used_evidence": used_evidence,
+                    "final_text": final_text,
+                    "stop_reason": stop_reason,
+                    "success": success,
+                },
+            )
+        except Exception as exc:
+            task = self._tasks.require_task(task.id)
+            if task.status not in {"completed", "failed", "cancelled", "expired"}:
+                task = self._tasks.fail(task.id, reason="trace_persistence_error")
+            return TurnResult(
+                session_id=session_id,
+                final_text=None,
+                stop_reason="trace_persistence_error",
+                tool_runs=tool_runs,
+                success=False,
+                task_id=task.id,
+                task_status=task.status,
+                pending_action=task.pending_action,
+            )
+
+        if task.status != "waiting_user" and task.status not in {"completed", "failed", "cancelled", "expired"}:
+            task = (
+                self._tasks.complete(task.id, reason=stop_reason or "completed")
+                if success
+                else self._tasks.fail(task.id, reason=stop_reason or "failed")
+            )
 
         return TurnResult(
             session_id=session_id,
@@ -675,6 +1465,9 @@ class AgentLoop:
             stop_reason=stop_reason,
             tool_runs=tool_runs,
             success=success,
+            task_id=task.id,
+            task_status=task.status,
+            pending_action=task.pending_action,
         )
 
     def _answer_from_existing_evidence(
@@ -932,6 +1725,31 @@ def _extract_file_read_excerpt(tool_runs: list[ToolResult]) -> str | None:
     return None
 
 
+def _decision_payload(response: ModelResponse) -> dict[str, Any]:
+    if response.tool_calls:
+        return {
+            "type": "tool_calls",
+            "actions": [
+                {
+                    "id": tool_call.id,
+                    "tool": tool_call.name,
+                    "arguments": tool_call.arguments,
+                }
+                for tool_call in response.tool_calls
+            ],
+        }
+    if response.assistant_text:
+        return {"type": "final_answer", "content": response.assistant_text}
+    return {"type": "invalid", "error_type": response.error_type}
+
+
+def _estimate_response_tokens(messages: list[dict[str, Any]], response: ModelResponse) -> int:
+    payload = json.dumps(messages, ensure_ascii=False) + (response.assistant_text or "")
+    if response.tool_calls:
+        payload += json.dumps(_decision_payload(response), ensure_ascii=False)
+    return max(1, (len(payload.encode("utf-8")) + 3) // 4)
+
+
 def _uncertain_file_recovery_result(action: ToolAction, detail: str) -> tuple[str, ToolResult]:
     return (
         "uncertain",
@@ -943,3 +1761,7 @@ def _uncertain_file_recovery_result(action: ToolAction, detail: str) -> tuple[st
             error=f"File action side effect is uncertain. {detail}",
         ),
     )
+
+
+class AgentRuntime(AgentLoop):
+    """Task-aware runtime entry point; AgentLoop remains the compatibility name."""

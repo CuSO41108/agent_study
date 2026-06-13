@@ -32,6 +32,7 @@ class ProjectMetadataTests(unittest.TestCase):
         self.assertIn("src/agent_app/config.py", include)
         self.assertIn("src/agent_app/tools/*.py", include)
         self.assertIn("src/agent_app/orchestrator/*.py", include)
+        self.assertIn("src/agent_app/runtime/*.py", include)
         self.assertIn("src/agent_app/cli.py", omit)
         self.assertIn("src/agent_app/agent/prompts.py", omit)
 

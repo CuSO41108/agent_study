@@ -15,7 +15,7 @@ from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.file_write import FileWriteTool, inspect_file_write_request
 from agent_app.tools.registry import build_default_registry, build_root_registry
-from agent_app.types import ModelResponse, ToolCall
+from agent_app.types import ModelResponse, ToolCall, ToolResult
 
 
 class _FakeModelClient:
@@ -197,7 +197,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.tool_runs[0].tool_name, "file_write")
         self.assertTrue(result.tool_runs[0].success)
 
-    def test_missing_confirmation_handler_denies_file_write_but_turn_can_continue(self) -> None:
+    def test_missing_confirmation_handler_persists_waiting_user(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_write", arguments={"path": "src/module.py", "content": "print('new')\n"})]),
             _text_response("write denied"),
@@ -206,9 +206,12 @@ class AgentLoopTests(unittest.TestCase):
 
         result = loop.run_turn(user_input="update the module")
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.final_text, "write denied")
-        self.assertEqual(result.tool_runs[0].error, "Tool use denied by user.")
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "waiting_user")
+        self.assertEqual(result.task_status, "waiting_user")
+        self.assertEqual(result.pending_action.kind, "tool_approval")
+        self.assertEqual(result.tool_runs[0].error, "Waiting for user approval.")
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('old')\n")
 
     def test_invalid_file_write_arguments_do_not_trigger_confirmation_handler(self) -> None:
         model = _FakeModelClient([
@@ -730,6 +733,99 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(second_result.success)
         self.assertTrue(any("Recent successful tool evidence:" in (message["content"] or "") for message in model.calls[3]["messages"]))
         self.assertTrue(any("child_session_id=" in (message["content"] or "") for message in model.calls[3]["messages"]))
+
+    def test_read_only_transient_failure_retries_twice(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="call-retry", name="file_read", arguments={"path": "README.md"})]),
+            _text_response("recovered"),
+        ])
+        tool = self.registry.get_required("file_read")
+        outcomes = [
+            ToolResult(
+                tool_call_id="call-retry",
+                tool_name="file_read",
+                success=False,
+                content="",
+                error="Temporarily unavailable.",
+            ),
+            ToolResult(
+                tool_call_id="call-retry",
+                tool_name="file_read",
+                success=False,
+                content="",
+                error="Connection temporarily unavailable.",
+            ),
+            ToolResult(
+                tool_call_id="call-retry",
+                tool_name="file_read",
+                success=True,
+                content="README",
+                error=None,
+            ),
+        ]
+        loop = self._build_loop(model)
+
+        with patch.object(tool, "execute", side_effect=outcomes) as execute:
+            result = loop.run_turn(user_input="read with retries")
+
+        self.assertTrue(result.success)
+        self.assertEqual(execute.call_count, 3)
+        actions = self.sessions.list_tool_actions(result.session_id)
+        self.assertEqual([action.attempt for action in actions], [1, 2, 3])
+        self.assertIsNone(actions[0].retry_of)
+        self.assertEqual(actions[1].retry_of, actions[0].id)
+        self.assertEqual(actions[2].retry_of, actions[1].id)
+        self.assertEqual(self.sessions.get_task(result.task_id).budget.used_tool_calls, 3)
+
+    def test_side_effect_failure_is_not_automatically_retried(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([
+                ToolCall(
+                    id="call-write",
+                    name="file_write",
+                    arguments={"path": "src/module.py", "content": "print('new')\n"},
+                )
+            ]),
+            _text_response("write failed safely"),
+        ])
+        tool = self.registry.get_required("file_write")
+        loop = self._build_loop(model, confirmation_handler=lambda tool_call, context: True)
+
+        with patch.object(
+            tool,
+            "execute",
+            return_value=ToolResult(
+                tool_call_id="call-write",
+                tool_name="file_write",
+                success=False,
+                content="",
+                error="Connection temporarily unavailable.",
+            ),
+        ) as execute:
+            result = loop.run_turn(user_input="write once")
+
+        self.assertTrue(result.success)
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(len(self.sessions.list_tool_actions(result.session_id)), 1)
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('old')\n")
+
+    def test_unexpected_tool_exception_becomes_runtime_observation(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="call-error", name="file_read", arguments={"path": "README.md"})]),
+            _text_response("reported failure"),
+        ])
+        tool = self.registry.get_required("file_read")
+        loop = self._build_loop(model)
+
+        with patch.object(tool, "execute", side_effect=ValueError("boom")):
+            result = loop.run_turn(user_input="handle exception")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.tool_runs[0].observation.error_type, "runtime_error")
+        self.assertIn("ValueError: boom", result.tool_runs[0].error)
+        traces = self.sessions.list_task_traces(result.task_id)
+        observation = [trace for trace in traces if trace.trace_type == "observation"][0]
+        self.assertEqual(observation.payload["error_type"], "runtime_error")
 
     def _build_loop(self, model, confirmation_handler=None) -> AgentLoop:
         return AgentLoop(

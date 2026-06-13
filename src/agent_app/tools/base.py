@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 
-from agent_app.types import ToolResult
+from agent_app.types import Observation, ToolResult
 
 if TYPE_CHECKING:
     from agent_app.state.session_service import SessionService
@@ -21,6 +21,7 @@ class ToolExecutionContext:
     prepared_edits: dict[str, Any] = field(default_factory=dict)
     turn_state: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
+    task_id: str | None = None
     session_service: "SessionService | None" = None
     agent_id: str | None = None
     delegation_depth: int = 0
@@ -31,6 +32,8 @@ class Tool(ABC):
     description: str
     parameters_schema: dict[str, Any]
     has_side_effect: bool = False
+    is_idempotent: bool = True
+    risk_level: str = "low"
 
     def spec(self) -> dict[str, Any]:
         return {
@@ -61,6 +64,12 @@ class Tool(ABC):
         context: ToolExecutionContext,
     ) -> dict[str, Any]:
         return {"side_effect": self.has_side_effect}
+
+    def can_retry(self, observation: Observation) -> bool:
+        return (
+            observation.retryable
+            and (not self.has_side_effect or self.is_idempotent)
+        )
 
     @abstractmethod
     def execute(
@@ -123,3 +132,69 @@ def _error_field_name(error: Any) -> str | None:
     if error.absolute_path:
         return ".".join(str(part) for part in error.absolute_path)
     return None
+
+
+def observation_from_tool_result(
+    result: ToolResult,
+    *,
+    side_effect: bool,
+    attempt: int,
+    duration_ms: int,
+) -> Observation:
+    if result.success:
+        return Observation(
+            status="succeeded",
+            error_type=None,
+            message=result.content,
+            retryable=False,
+            side_effect=side_effect,
+            raw_data=result.content,
+            evidence_ref=result.tool_call_id,
+            attempt=attempt,
+            duration_ms=duration_ms,
+        )
+
+    error = result.error or "Tool execution failed."
+    lowered = error.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        error_type = "timeout"
+        retryable = True
+    elif "not found" in lowered or "no match" in lowered:
+        error_type = "not_found"
+        retryable = False
+    elif "invalid arguments" in lowered or "must be" in lowered or "required" in lowered:
+        error_type = "invalid_arguments"
+        retryable = False
+    elif "denied by user" in lowered:
+        error_type = "user_denied"
+        retryable = False
+    elif "not allowed" in lowered or "whitelist" in lowered or "unsafe" in lowered:
+        error_type = "unsafe_action"
+        retryable = False
+    elif "permission" in lowered or "access denied" in lowered:
+        error_type = "permission_denied"
+        retryable = False
+    elif "changed since inspection" in lowered or "ambiguous" in lowered or "already" in lowered:
+        error_type = "conflict"
+        retryable = False
+    elif "uncertain" in lowered:
+        error_type = "uncertain_side_effect"
+        retryable = False
+    elif "503" in lowered or "temporar" in lowered or "connection" in lowered:
+        error_type = "transient"
+        retryable = True
+    else:
+        error_type = "runtime_error"
+        retryable = False
+
+    return Observation(
+        status="failed",
+        error_type=error_type,
+        message=error,
+        retryable=retryable,
+        side_effect=side_effect,
+        raw_data=result.content,
+        evidence_ref=result.tool_call_id,
+        attempt=attempt,
+        duration_ms=duration_ms,
+    )

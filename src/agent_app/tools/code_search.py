@@ -97,14 +97,23 @@ class CodeSearchTool(Tool):
             str(search_root),
         ]
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
         except subprocess.TimeoutExpired as exc:
             content = _join_process_output(exc.stdout, exc.stderr)
             return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=False, content=content, error="Code search timed out.")
         if completed.returncode not in (0, 1):
-            return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=False, content=completed.stdout.strip(), error=completed.stderr.strip() or "ripgrep failed")
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=False, content=stdout.strip(), error=stderr.strip() or "ripgrep failed")
 
-        lines = [line for line in completed.stdout.splitlines() if line][:max_results]
+        lines = [line for line in (completed.stdout or "").splitlines() if line][:max_results]
         return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=True, content="\n".join(lines) or "No matches found.", error=None)
 
     def _run_python_fallback(
