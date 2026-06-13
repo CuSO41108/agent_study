@@ -439,6 +439,28 @@ class ToolLayerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error, "Code search timed out.")
 
+    @patch("agent_app.tools.code_search.subprocess.run")
+    @patch("agent_app.tools.code_search.shutil.which", return_value="rg")
+    def test_code_search_rg_uses_utf8_decoding_with_replacement(self, _mock_which, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["rg"],
+            returncode=0,
+            stdout="src/app.py:1:中文输出\n",
+            stderr="",
+        )
+        tool = CodeSearchTool()
+
+        result = tool.execute(
+            tool_call_id="call-1",
+            arguments={"pattern": "中文", "path": ".", "max_results": 5},
+            context=self.context,
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("中文输出", result.content)
+        self.assertEqual(mock_run.call_args.kwargs.get("encoding"), "utf-8")
+        self.assertEqual(mock_run.call_args.kwargs.get("errors"), "replace")
+
     @patch("agent_app.tools.code_search._deadline_exceeded", return_value=True)
     @patch("agent_app.tools.code_search.shutil.which", return_value=None)
     def test_code_search_fallback_timeout_returns_failure_result(self, _mock_which, _mock_deadline) -> None:

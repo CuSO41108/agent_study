@@ -6,6 +6,7 @@ import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.config import load_config
@@ -18,7 +19,7 @@ from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_replace_in_file_request
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry
-from agent_app.types import ToolCall
+from agent_app.types import AgentEvent, ToolCall
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,16 +47,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start an interactive REPL instead of handling a single prompt.",
     )
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
+    controls.add_argument("--pause-task", metavar="TASK_ID", help="Pause a running task.")
+    controls.add_argument("--resume-task", metavar="TASK_ID", help="Resume a paused task.")
+    controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
+    controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
+    controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
     return parser
 
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    control = _selected_task_control(args)
     if args.interactive and args.prompt is not None:
         print("Argument error: prompt cannot be used with --interactive.", file=sys.stderr)
         return 2
-    if not args.interactive and args.prompt is None:
+    if control is not None and (args.interactive or args.prompt is not None):
+        print("Argument error: task controls cannot be combined with a prompt or --interactive.", file=sys.stderr)
+        return 2
+    if not args.interactive and args.prompt is None and control is None:
         print("Argument error: provide a prompt or use --interactive.", file=sys.stderr)
         return 2
 
@@ -93,6 +105,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_trigger_tokens=config.summary_trigger_tokens,
         confirmation_handler=prompt_for_tool_confirmation,
     )
+    if control is not None:
+        action, task_id = control
+        try:
+            task = loop.get_task(task_id)
+        except KeyError:
+            print(f"Task error: task '{task_id}' was not found.", file=sys.stderr)
+            return 1
+        if action == "status":
+            print(json.dumps(task, default=_serialize, ensure_ascii=False))
+            return 0
+        event_type = {
+            "pause": "pause_requested",
+            "resume": "resume_requested",
+            "cancel": "cancel_requested",
+            "approve": "user_approved",
+            "reject": "user_rejected",
+        }[action]
+        try:
+            result = loop.handle_event(
+                AgentEvent(
+                    id=str(uuid4()),
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    type=event_type,
+                    source="cli",
+                    correlation_id=task.id,
+                    expected_version=task.version,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"Task error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, default=_serialize, ensure_ascii=False))
+        return 0 if result.success or result.task_status in {"paused", "cancelled", "waiting_user"} else 1
     if args.interactive:
         return _run_interactive_loop(
             loop=loop,
@@ -198,6 +244,21 @@ def _serialize(value: object) -> object:
     if is_dataclass(value):
         return asdict(value)
     return str(value)
+
+
+def _selected_task_control(args) -> tuple[str, str] | None:
+    for action, attribute in (
+        ("status", "task_status"),
+        ("pause", "pause_task"),
+        ("resume", "resume_task"),
+        ("cancel", "cancel_task"),
+        ("approve", "approve_task"),
+        ("reject", "reject_task"),
+    ):
+        value = getattr(args, attribute, None)
+        if value:
+            return action, value
+    return None
 
 
 def _session_state_path(database_path: str | Path) -> Path:

@@ -42,6 +42,7 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS tool_actions (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        task_id TEXT,
         agent_id TEXT NOT NULL,
         tool_call_id TEXT NOT NULL,
         tool_name TEXT NOT NULL,
@@ -55,7 +56,61 @@ SCHEMA_STATEMENTS = (
         prepared_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
+        attempt INTEGER NOT NULL DEFAULT 1,
+        retry_of TEXT,
         updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        parent_task_id TEXT,
+        goal TEXT NOT NULL,
+        status TEXT NOT NULL,
+        step INTEGER NOT NULL,
+        plan_json TEXT NOT NULL,
+        working_memory_json TEXT NOT NULL,
+        pending_action_json TEXT,
+        last_observation_json TEXT,
+        reflection TEXT,
+        budget_json TEXT NOT NULL,
+        stop_reason TEXT,
+        version INTEGER NOT NULL,
+        waiting_deadline TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id),
+        FOREIGN KEY (parent_task_id) REFERENCES tasks(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS task_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        correlation_id TEXT,
+        causation_id TEXT,
+        sequence INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
+        FOREIGN KEY (session_id) REFERENCES sessions(id),
+        UNIQUE(task_id, sequence)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS task_traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        trace_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
         FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
     """,
@@ -125,6 +180,7 @@ def initialize_database(db_path: str | Path) -> None:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
         _ensure_tool_runs_action_id(connection)
+        _ensure_tool_action_columns(connection)
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_runs_action_id
@@ -136,6 +192,24 @@ def initialize_database(db_path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_tool_actions_session_status
             ON tool_actions(session_id, status)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_session_updated
+            ON tasks(session_id, updated_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_task_events_task_sequence
+            ON task_events(task_id, sequence)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_task_traces_task_id
+            ON task_traces(task_id, id)
             """
         )
         connection.commit()
@@ -150,3 +224,18 @@ def _ensure_tool_runs_action_id(connection: sqlite3.Connection) -> None:
     }
     if "action_id" not in columns:
         connection.execute("ALTER TABLE tool_runs ADD COLUMN action_id TEXT")
+
+
+def _ensure_tool_action_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(tool_actions)").fetchall()
+    }
+    additions = {
+        "task_id": "TEXT",
+        "attempt": "INTEGER NOT NULL DEFAULT 1",
+        "retry_of": "TEXT",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE tool_actions ADD COLUMN {name} {declaration}")

@@ -15,6 +15,8 @@ class DelegateTaskTool(Tool):
         "round trip."
     )
     has_side_effect = True
+    is_idempotent = False
+    risk_level = "medium"
     parameters_schema = {
         "type": "object",
         "properties": {

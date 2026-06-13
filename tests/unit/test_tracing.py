@@ -9,7 +9,7 @@ from uuid import uuid4
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.orchestrator.loop import AgentLoop
 from agent_app.state.db import initialize_database
-from agent_app.state.session_service import SessionService
+from agent_app.state.session_service import SessionService, TracePersistenceError
 from agent_app.tools.registry import build_default_registry
 from agent_app.types import ModelResponse, ToolCall, ToolResult
 
@@ -65,6 +65,40 @@ class TracingTests(unittest.TestCase):
         self.assertTrue(tool_traces[0].success)
         self.assertTrue(tool_traces[0].content_preview.startswith("1: print('old')"))
 
+        task_traces = self.sessions.list_task_traces(result.task_id)
+        trace_types = {trace.trace_type for trace in task_traces}
+        self.assertTrue(
+            {
+                "state_transition",
+                "budget",
+                "model_call",
+                "decision",
+                "tool_attempt",
+                "observation",
+                "critic",
+                "turn",
+            }.issubset(trace_types)
+        )
+        model_trace = next(trace for trace in task_traces if trace.trace_type == "model_call")
+        self.assertEqual(model_trace.payload["phase"], "policy")
+        self.assertIn("model", model_trace.payload)
+        self.assertIn("duration_ms", model_trace.payload)
+        self.assertIn("total_tokens", model_trace.payload)
+        self.assertEqual(model_trace.payload["usage_source"], "estimated")
+        tool_trace = next(trace for trace in task_traces if trace.trace_type == "tool_attempt")
+        self.assertEqual(tool_trace.payload["tool"], "file_read")
+        self.assertEqual(tool_trace.payload["arguments"], {"path": "src/module.py"})
+        self.assertIn("arguments_hash", tool_trace.payload)
+        self.assertEqual(tool_trace.payload["attempt"], 1)
+        state_trace = next(
+            trace
+            for trace in reversed(task_traces)
+            if trace.trace_type == "state_transition" and trace.payload["to"] == "completed"
+        )
+        self.assertEqual(state_trace.payload["from"], "running")
+        self.assertIn("budget", state_trace.payload)
+        self.assertIn("version", state_trace.payload)
+
     def test_content_preview_is_truncated(self) -> None:
         long_content = "x" * 700
         self.sessions.append_turn_trace(
@@ -117,7 +151,7 @@ class TracingTests(unittest.TestCase):
         self.assertTrue(turn_trace.used_todo)
         self.assertTrue(turn_trace.used_evidence)
 
-    def test_tracing_failure_does_not_block_turn(self) -> None:
+    def test_tracing_failure_fails_the_task(self) -> None:
         model = _FakeModelClient([_text_response("done")])
         loop = AgentLoop(
             agent=SINGLE_MAIN_AGENT,
@@ -134,7 +168,33 @@ class TracingTests(unittest.TestCase):
         finally:
             self.sessions.append_turn_trace = original_append  # type: ignore[assignment]
 
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "trace_persistence_error")
+        self.assertEqual(result.task_status, "failed")
+        self.assertEqual(self.sessions.get_task(result.task_id).stop_reason, "trace_persistence_error")
+
+    def test_mid_turn_task_trace_failure_is_converted_to_runtime_result(self) -> None:
+        model = _FakeModelClient([_text_response("done")])
+        loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=model,
+            tool_registry=self.registry,
+            session_service=self.sessions,
+            workspace_root=self.workspace_root,
+        )
+
+        original_append = self.sessions.append_task_trace
+        self.sessions.append_task_trace = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[assignment]
+            TracePersistenceError("trace fail")
+        )
+        try:
+            result = loop.run_turn(user_input="hello")
+        finally:
+            self.sessions.append_task_trace = original_append  # type: ignore[assignment]
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "trace_persistence_error")
+        self.assertEqual(result.task_status, "failed")
 
 
 def _text_response(text: str) -> ModelResponse:

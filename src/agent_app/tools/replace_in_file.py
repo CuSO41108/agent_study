@@ -35,6 +35,8 @@ class ReplaceInFileTool(Tool):
     name = "replace_in_file"
     description = "Safely replace exact text in a single existing UTF-8 text file."
     has_side_effect = True
+    is_idempotent = False
+    risk_level = "high"
     parameters_schema = {
         "type": "object",
         "properties": {

@@ -25,6 +25,7 @@ include = [
     "src/agent_app/types.py",
     "src/agent_app/model/*.py",
     "src/agent_app/orchestrator/*.py",
+    "src/agent_app/runtime/*.py",
     "src/agent_app/state/*.py",
     "src/agent_app/tools/*.py",
     "src/agent_app/agent/definition.py",

@@ -26,6 +26,7 @@ class ToolResult:
     success: bool
     content: str
     error: str | None = None
+    observation: "Observation | None" = None
 
 
 ToolActionStatus = Literal["prepared", "executing", "succeeded", "failed", "uncertain"]
@@ -47,6 +48,9 @@ class ToolAction:
     started_at: str | None
     completed_at: str | None
     updated_at: str
+    task_id: str | None = None
+    attempt: int = 1
+    retry_of: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -69,6 +73,143 @@ class SessionContext:
     summary_text: str | None = None
     summary_message_id: int | None = None
     todo_items: tuple[TodoItem, ...] = ()
+
+
+TaskStatus = Literal[
+    "created",
+    "running",
+    "waiting_user",
+    "waiting_tool",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
+    "expired",
+]
+EventType = Literal[
+    "task_created",
+    "user_message",
+    "user_approved",
+    "user_rejected",
+    "resume_requested",
+    "pause_requested",
+    "cancel_requested",
+    "task_expired",
+    "state_transition",
+    "observation_recorded",
+    "budget_updated",
+]
+ObservationErrorType = Literal[
+    "timeout",
+    "transient",
+    "invalid_arguments",
+    "permission_denied",
+    "not_found",
+    "conflict",
+    "user_denied",
+    "unsafe_action",
+    "runtime_error",
+    "uncertain_side_effect",
+]
+
+
+@dataclass(slots=True, frozen=True)
+class TaskBudget:
+    max_model_calls: int = 24
+    max_tool_calls: int = 24
+    max_tokens: int = 120_000
+    max_active_seconds: float = 900.0
+    waiting_user_timeout_seconds: int = 86_400
+    max_retries: int = 2
+    repeat_decision_limit: int = 3
+    max_replans: int = 1
+    used_model_calls: int = 0
+    used_tool_calls: int = 0
+    used_tokens: int = 0
+    used_active_seconds: float = 0.0
+    used_replans: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class PendingAction:
+    kind: Literal["ask_user", "tool_approval"]
+    prompt: str
+    decision: dict[str, Any] | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class Observation:
+    status: Literal["succeeded", "failed"]
+    error_type: ObservationErrorType | None
+    message: str
+    retryable: bool
+    side_effect: bool
+    raw_data: Any = None
+    evidence_ref: str | None = None
+    attempt: int = 1
+    duration_ms: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class AgentEvent:
+    id: str
+    task_id: str | None
+    session_id: str
+    type: EventType
+    source: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    sequence: int | None = None
+    created_at: str | None = None
+    expected_version: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class TaskState:
+    id: str
+    session_id: str
+    goal: str
+    status: TaskStatus
+    step: int
+    plan: tuple[TodoItem, ...]
+    working_memory: dict[str, Any]
+    pending_action: PendingAction | None
+    last_observation: Observation | None
+    reflection: str | None
+    budget: TaskBudget
+    stop_reason: str | None
+    version: int
+    created_at: str
+    updated_at: str
+    waiting_deadline: str | None = None
+    parent_task_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class TaskEvent:
+    id: str
+    task_id: str
+    session_id: str
+    type: str
+    source: str
+    payload: dict[str, Any]
+    correlation_id: str | None
+    causation_id: str | None
+    sequence: int
+    created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class TaskTrace:
+    id: int
+    task_id: str
+    session_id: str
+    trace_type: str
+    payload: dict[str, Any]
+    created_at: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -118,11 +259,28 @@ class ModelResponse:
     finish_reason: str | None = None
     raw_response: dict[str, Any] | None = None
     error_type: str | None = None
+    model_name: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    usage_source: Literal["provider", "estimated"] = "estimated"
 
 
 @dataclass(slots=True)
 class TurnResult:
     session_id: str
+    final_text: str | None
+    stop_reason: str | None
+    tool_runs: list[ToolResult]
+    success: bool
+    task_id: str | None = None
+    task_status: TaskStatus | None = None
+    pending_action: PendingAction | None = None
+
+
+@dataclass(slots=True)
+class TaskResult:
+    task: TaskState
     final_text: str | None
     stop_reason: str | None
     tool_runs: list[ToolResult]

@@ -3,15 +3,24 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from agent_app.types import (
+    AgentEvent,
     Message,
+    Observation,
+    PendingAction,
     SessionContext,
     StoredMessage,
     SubagentRun,
+    TaskBudget,
+    TaskEvent,
+    TaskState,
+    TaskStatus,
+    TaskTrace,
     TodoItem,
     ToolAction,
     ToolActionStatus,
@@ -20,6 +29,16 @@ from agent_app.types import (
     ToolResult,
     TurnTrace,
 )
+
+_UNSET = object()
+
+
+class TaskVersionConflict(RuntimeError):
+    pass
+
+
+class TracePersistenceError(RuntimeError):
+    pass
 
 
 def _utc_now() -> str:
@@ -73,6 +92,325 @@ class SessionService:
                 (_utc_now(), session_id),
             )
 
+    def create_task(
+        self,
+        session_id: str,
+        *,
+        goal: str,
+        parent_task_id: str | None = None,
+        budget: TaskBudget | None = None,
+    ) -> TaskState:
+        task_id = str(uuid4())
+        timestamp = _utc_now()
+        resolved_budget = budget or TaskBudget()
+        session_context = self.get_session_context(session_id)
+        previous_task = self.get_latest_task(session_id)
+        unfinished_previous_plan = (
+            previous_task.plan
+            if previous_task is not None
+            and previous_task.plan
+            and any(item.status != "completed" for item in previous_task.plan)
+            else ()
+        )
+        plan = session_context.todo_items or unfinished_previous_plan or _default_task_plan(goal)
+        event_id = str(uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    id, session_id, parent_task_id, goal, status, step,
+                    plan_json, working_memory_json, pending_action_json,
+                    last_observation_json, reflection, budget_json, stop_reason,
+                    version, waiting_deadline, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'created', 0, ?, '{}', NULL, NULL, NULL, ?, NULL, 1, NULL, ?, ?)
+                """,
+                (
+                    task_id,
+                    session_id,
+                    parent_task_id,
+                    goal,
+                    _todo_items_json(plan),
+                    _json_dumps(asdict(resolved_budget)),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events (
+                    id, task_id, session_id, event_type, source, payload_json,
+                    correlation_id, causation_id, sequence, created_at
+                ) VALUES (?, ?, ?, 'task_created', 'runtime', ?, NULL, NULL, 1, ?)
+                """,
+                (event_id, task_id, session_id, _json_dumps({"goal": goal}), timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                VALUES (?, ?, 'state_transition', ?, ?)
+                """,
+                (
+                    task_id,
+                    session_id,
+                    _json_dumps({"from": None, "to": "created", "reason": "task_created", "version": 1}),
+                    timestamp,
+                ),
+            )
+            if session_context.todo_items:
+                connection.execute(
+                    """
+                    UPDATE session_context
+                    SET todo_json = '[]', updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (timestamp, session_id),
+                )
+            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+        assert row is not None
+        return _task_from_row(row)
+
+    def get_task(self, task_id: str) -> TaskState | None:
+        with self._connect() as connection:
+            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+        return None if row is None else _task_from_row(row)
+
+    def list_tasks(self, session_id: str) -> list[TaskState]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _TASK_SELECT + " WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
+    def get_latest_task(self, session_id: str) -> TaskState | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _TASK_SELECT + " WHERE session_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else _task_from_row(row)
+
+    def apply_task_event(
+        self,
+        event: AgentEvent,
+        *,
+        target_status: TaskStatus | None = None,
+        step: int | None = None,
+        plan: tuple[TodoItem, ...] | None = None,
+        working_memory: dict | None = None,
+        pending_action: PendingAction | None | object = _UNSET,
+        last_observation: Observation | None | object = _UNSET,
+        reflection: str | None | object = _UNSET,
+        budget: TaskBudget | None = None,
+        stop_reason: str | None | object = _UNSET,
+        waiting_deadline: str | None | object = _UNSET,
+        transition_reason: str | None = None,
+    ) -> TaskState:
+        if event.task_id is None:
+            raise ValueError("Task event requires task_id.")
+        timestamp = event.created_at or _utc_now()
+        with self._connect() as connection:
+            duplicate = connection.execute(
+                "SELECT 1 FROM task_events WHERE id = ? LIMIT 1",
+                (event.id,),
+            ).fetchone()
+            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (event.task_id,)).fetchone()
+            if row is None:
+                raise KeyError(event.task_id)
+            current = _task_from_row(row)
+            if duplicate is not None:
+                return current
+            if event.expected_version is not None and event.expected_version != current.version:
+                raise TaskVersionConflict(
+                    f"Task '{current.id}' version changed from {event.expected_version} to {current.version}."
+                )
+
+            sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id = ?",
+                    (current.id,),
+                ).fetchone()[0]
+            )
+            next_status = target_status or current.status
+            next_version = current.version + 1
+            next_step = current.step if step is None else step
+            next_plan = current.plan if plan is None else plan
+            next_memory = current.working_memory if working_memory is None else working_memory
+            next_pending = current.pending_action if pending_action is _UNSET else pending_action
+            next_observation = current.last_observation if last_observation is _UNSET else last_observation
+            next_reflection = current.reflection if reflection is _UNSET else reflection
+            next_budget = current.budget if budget is None else budget
+            next_stop_reason = current.stop_reason if stop_reason is _UNSET else stop_reason
+            next_waiting_deadline = current.waiting_deadline if waiting_deadline is _UNSET else waiting_deadline
+
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, step = ?, plan_json = ?, working_memory_json = ?,
+                    pending_action_json = ?, last_observation_json = ?, reflection = ?,
+                    budget_json = ?, stop_reason = ?, version = ?, waiting_deadline = ?,
+                    updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    next_status,
+                    next_step,
+                    _todo_items_json(next_plan),
+                    _json_dumps(next_memory),
+                    _optional_dataclass_json(next_pending),
+                    _optional_dataclass_json(next_observation),
+                    next_reflection,
+                    _json_dumps(asdict(next_budget)),
+                    next_stop_reason,
+                    next_version,
+                    next_waiting_deadline,
+                    timestamp,
+                    current.id,
+                    current.version,
+                ),
+            )
+            if connection.total_changes == 0:
+                raise TaskVersionConflict(f"Task '{current.id}' was updated concurrently.")
+            connection.execute(
+                """
+                INSERT INTO task_events (
+                    id, task_id, session_id, event_type, source, payload_json,
+                    correlation_id, causation_id, sequence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    current.id,
+                    current.session_id,
+                    event.type,
+                    event.source,
+                    _json_dumps(event.payload),
+                    event.correlation_id,
+                    event.causation_id,
+                    sequence,
+                    timestamp,
+                ),
+            )
+            if next_status != current.status:
+                connection.execute(
+                    """
+                    INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                    VALUES (?, ?, 'state_transition', ?, ?)
+                    """,
+                    (
+                        current.id,
+                        current.session_id,
+                        _json_dumps(
+                            {
+                                "from": current.status,
+                                "to": next_status,
+                                "reason": transition_reason or event.type,
+                                "event_id": event.id,
+                                "version": next_version,
+                                "budget": asdict(next_budget),
+                            }
+                        ),
+                        timestamp,
+                    ),
+                )
+            if next_budget != current.budget:
+                connection.execute(
+                    """
+                    INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                    VALUES (?, ?, 'budget', ?, ?)
+                    """,
+                    (
+                        current.id,
+                        current.session_id,
+                        _json_dumps({"event_id": event.id, "budget": asdict(next_budget)}),
+                        timestamp,
+                    ),
+                )
+            updated_row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (current.id,)).fetchone()
+        assert updated_row is not None
+        return _task_from_row(updated_row)
+
+    def list_task_events(self, task_id: str) -> list[TaskEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, task_id, session_id, event_type, source, payload_json,
+                       correlation_id, causation_id, sequence, created_at
+                FROM task_events
+                WHERE task_id = ?
+                ORDER BY sequence ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [
+            TaskEvent(
+                id=row[0],
+                task_id=row[1],
+                session_id=row[2],
+                type=row[3],
+                source=row[4],
+                payload=json.loads(row[5]),
+                correlation_id=row[6],
+                causation_id=row[7],
+                sequence=row[8],
+                created_at=row[9],
+            )
+            for row in rows
+        ]
+
+    def task_event_exists(self, event_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM task_events WHERE id = ? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+        return row is not None
+
+    def append_task_trace(self, task_id: str, trace_type: str, payload: dict) -> int:
+        try:
+            task = self.get_task(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            timestamp = _utc_now()
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (task.id, task.session_id, trace_type, _json_dumps(payload), timestamp),
+                )
+            return int(cursor.lastrowid)
+        except TracePersistenceError:
+            raise
+        except Exception as exc:
+            raise TracePersistenceError(
+                f"Failed to persist task trace '{trace_type}' for task '{task_id}'."
+            ) from exc
+
+    def list_task_traces(self, task_id: str) -> list[TaskTrace]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, task_id, session_id, trace_type, payload_json, created_at
+                FROM task_traces
+                WHERE task_id = ?
+                ORDER BY id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [
+            TaskTrace(
+                id=row[0],
+                task_id=row[1],
+                session_id=row[2],
+                trace_type=row[3],
+                payload=json.loads(row[4]),
+                created_at=row[5],
+            )
+            for row in rows
+        ]
+
     def append_message(self, session_id: str, message: Message) -> None:
         timestamp = _utc_now()
         with self._connect() as connection:
@@ -112,9 +450,12 @@ class SessionService:
         agent_id: str,
         tool_call: ToolCall,
         recovery_metadata: dict,
+        task_id: str | None = None,
+        attempt: int = 1,
+        retry_of: str | None = None,
     ) -> ToolAction:
         timestamp = _utc_now()
-        idempotency_key = f"{session_id}:{agent_id}:{tool_call.id}"
+        idempotency_key = f"{session_id}:{agent_id}:{task_id or '-'}:{tool_call.id}:{attempt}"
         action_id = str(uuid4())
         arguments_json = json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         recovery_json = json.dumps(recovery_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -122,14 +463,15 @@ class SessionService:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO tool_actions (
-                    id, session_id, agent_id, tool_call_id, tool_name,
+                    id, session_id, task_id, agent_id, tool_call_id, tool_name,
                     arguments_json, idempotency_key, status, recovery_json,
-                    prepared_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)
+                    prepared_at, attempt, retry_of, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)
                 """,
                 (
                     action_id,
                     session_id,
+                    task_id,
                     agent_id,
                     tool_call.id,
                     tool_call.name,
@@ -137,6 +479,8 @@ class SessionService:
                     idempotency_key,
                     recovery_json,
                     timestamp,
+                    attempt,
+                    retry_of,
                     timestamp,
                 ),
             )
@@ -572,39 +916,101 @@ class SessionService:
 
 
 _TOOL_ACTION_SELECT = """
-SELECT id, session_id, agent_id, tool_call_id, tool_name, arguments_json,
+SELECT id, session_id, task_id, agent_id, tool_call_id, tool_name, arguments_json,
        idempotency_key, status, recovery_json, result_success, result_content,
-       result_error, prepared_at, started_at, completed_at, updated_at
+       result_error, prepared_at, started_at, completed_at, updated_at, attempt, retry_of
 FROM tool_actions
 """
 
 
 def _tool_action_from_row(row) -> ToolAction:
     result = None
-    if row[9] is not None:
+    if row[10] is not None:
         result = ToolResult(
-            tool_call_id=row[3],
-            tool_name=row[4],
-            success=bool(row[9]),
-            content=row[10] or "",
-            error=row[11],
+            tool_call_id=row[4],
+            tool_name=row[5],
+            success=bool(row[10]),
+            content=row[11] or "",
+            error=row[12],
         )
     return ToolAction(
         id=row[0],
         session_id=row[1],
-        agent_id=row[2],
-        tool_call_id=row[3],
-        tool_name=row[4],
-        arguments=json.loads(row[5]),
-        idempotency_key=row[6],
-        status=row[7],
-        recovery_metadata=json.loads(row[8]),
+        task_id=row[2],
+        agent_id=row[3],
+        tool_call_id=row[4],
+        tool_name=row[5],
+        arguments=json.loads(row[6]),
+        idempotency_key=row[7],
+        status=row[8],
+        recovery_metadata=json.loads(row[9]),
         result=result,
-        prepared_at=row[12],
-        started_at=row[13],
-        completed_at=row[14],
-        updated_at=row[15],
+        prepared_at=row[13],
+        started_at=row[14],
+        completed_at=row[15],
+        updated_at=row[16],
+        attempt=row[17],
+        retry_of=row[18],
     )
+
+
+_TASK_SELECT = """
+SELECT id, session_id, parent_task_id, goal, status, step, plan_json,
+       working_memory_json, pending_action_json, last_observation_json,
+       reflection, budget_json, stop_reason, version, waiting_deadline,
+       created_at, updated_at
+FROM tasks
+"""
+
+
+def _task_from_row(row) -> TaskState:
+    pending_raw = json.loads(row[8]) if row[8] else None
+    observation_raw = json.loads(row[9]) if row[9] else None
+    budget_raw = json.loads(row[11])
+    return TaskState(
+        id=row[0],
+        session_id=row[1],
+        parent_task_id=row[2],
+        goal=row[3],
+        status=row[4],
+        step=row[5],
+        plan=tuple(TodoItem(content=item["content"], status=item["status"]) for item in json.loads(row[6])),
+        working_memory=json.loads(row[7]),
+        pending_action=PendingAction(**pending_raw) if pending_raw else None,
+        last_observation=Observation(**observation_raw) if observation_raw else None,
+        reflection=row[10],
+        budget=TaskBudget(**budget_raw),
+        stop_reason=row[12],
+        version=row[13],
+        waiting_deadline=row[14],
+        created_at=row[15],
+        updated_at=row[16],
+    )
+
+
+def _default_task_plan(goal: str) -> tuple[TodoItem, ...]:
+    multi_step_markers = (" and ", " then ", "并", "然后", "再", "修改", "验证", "实现", "分析")
+    if not any(marker in goal.lower() for marker in multi_step_markers):
+        return ()
+    return (
+        TodoItem(content="Understand the goal and gather evidence", status="in_progress"),
+        TodoItem(content="Execute the required changes or actions", status="pending"),
+        TodoItem(content="Verify the result and report", status="pending"),
+    )
+
+
+def _todo_items_json(items: tuple[TodoItem, ...]) -> str:
+    return _json_dumps([asdict(item) for item in items])
+
+
+def _optional_dataclass_json(value) -> str | None:
+    if value is None:
+        return None
+    return _json_dumps(asdict(value))
+
+
+def _json_dumps(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _insert_tool_run(

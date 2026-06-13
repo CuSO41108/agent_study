@@ -100,6 +100,8 @@ class FileWriteTool(Tool):
     name = "file_write"
     description = "Safely write a small text file inside the workspace."
     has_side_effect = True
+    is_idempotent = False
+    risk_level = "high"
     parameters_schema = {
         "type": "object",
         "properties": {

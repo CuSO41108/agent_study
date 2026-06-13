@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+from math import ceil
 from typing import Any
 from urllib import error, request
 
@@ -56,6 +57,7 @@ class OpenAICompatibleModelClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        estimated_input_tokens = ceil(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) / 4)
 
         http_request = request.Request(
             url=f"{self.base_url}/chat/completions",
@@ -76,29 +78,41 @@ class OpenAICompatibleModelClient:
                 assistant_text=None,
                 raw_response={"status": exc.code, "body": response_body},
                 error_type="http_error",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
         except (error.URLError, TimeoutError, socket.timeout) as exc:
             return ModelResponse(
                 assistant_text=None,
                 raw_response={"detail": str(exc)},
                 error_type="request_error",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
         except json.JSONDecodeError as exc:
             return ModelResponse(
                 assistant_text=None,
                 raw_response={"detail": str(exc)},
                 error_type="invalid_json",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
 
-        return self._parse_response(raw_response)
+        return self._parse_response(raw_response, estimated_input_tokens=estimated_input_tokens)
 
-    def _parse_response(self, raw_response: dict[str, Any]) -> ModelResponse:
+    def _parse_response(self, raw_response: dict[str, Any], *, estimated_input_tokens: int = 0) -> ModelResponse:
         choices = raw_response.get("choices")
         if not isinstance(choices, list) or not choices:
             return ModelResponse(
                 assistant_text=None,
                 raw_response=raw_response,
                 error_type="invalid_response",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
 
         choice = choices[0]
@@ -107,6 +121,9 @@ class OpenAICompatibleModelClient:
                 assistant_text=None,
                 raw_response=raw_response,
                 error_type="invalid_response",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
 
         message = choice.get("message", {})
@@ -115,15 +132,35 @@ class OpenAICompatibleModelClient:
                 assistant_text=None,
                 raw_response=raw_response,
                 error_type="invalid_response",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
             )
 
         tool_calls, tool_error = self._parse_tool_calls(message.get("tool_calls"))
+        assistant_text = _extract_text_content(message.get("content"))
+        usage = raw_response.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = _usage_int(usage, "prompt_tokens", "input_tokens")
+            output_tokens = _usage_int(usage, "completion_tokens", "output_tokens")
+            total_tokens = _usage_int(usage, "total_tokens") or input_tokens + output_tokens
+            usage_source = "provider"
+        else:
+            input_tokens = estimated_input_tokens
+            output_tokens = ceil(len((assistant_text or "").encode("utf-8")) / 4)
+            total_tokens = input_tokens + output_tokens
+            usage_source = "estimated"
         return ModelResponse(
-            assistant_text=_extract_text_content(message.get("content")),
+            assistant_text=assistant_text,
             tool_calls=tool_calls,
             finish_reason=choice.get("finish_reason"),
             raw_response=raw_response,
             error_type=tool_error,
+            model_name=str(raw_response.get("model") or self.model),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            usage_source=usage_source,
         )
 
     def _parse_tool_calls(
@@ -174,3 +211,11 @@ def _extract_text_content(raw_content: Any) -> str | None:
                 parts.append(item["text"])
         return "".join(parts) or None
     return None
+
+
+def _usage_int(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return 0

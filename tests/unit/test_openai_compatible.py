@@ -90,6 +90,45 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(response.finish_reason, "stop")
         self.assertEqual(response.tool_calls, [])
         self.assertIsNone(response.error_type)
+        self.assertEqual(response.usage_source, "estimated")
+        self.assertGreater(response.total_tokens, 0)
+
+    @patch("agent_app.model.openai_compatible.request.urlopen")
+    def test_generate_records_provider_model_and_token_usage(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse(
+            {
+                "model": "provider-model",
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 7,
+                    "total_tokens": 19,
+                },
+                "choices": [
+                    {
+                        "message": {"content": "Hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+        client = OpenAICompatibleModelClient(
+            base_url="https://example.invalid/v1",
+            api_key="secret",
+            model="configured-model",
+            timeout=15,
+        )
+
+        response = client.generate(
+            system_prompt="sys",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+        )
+
+        self.assertEqual(response.model_name, "provider-model")
+        self.assertEqual(response.input_tokens, 12)
+        self.assertEqual(response.output_tokens, 7)
+        self.assertEqual(response.total_tokens, 19)
+        self.assertEqual(response.usage_source, "provider")
 
     @patch("agent_app.model.openai_compatible.request.urlopen")
     def test_generate_parses_tool_calls(self, mock_urlopen) -> None:

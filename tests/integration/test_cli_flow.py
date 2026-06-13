@@ -11,9 +11,12 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from agent_app import cli
+from agent_app.agent.definition import SINGLE_MAIN_AGENT
+from agent_app.orchestrator.loop import AgentLoop
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
-from agent_app.types import ModelResponse, ToolCall
+from agent_app.tools.registry import build_default_registry
+from agent_app.types import AgentEvent, ModelResponse, ToolCall
 
 
 class _FakeModelClient:
@@ -109,7 +112,19 @@ class CliIntegrationTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         output = json.loads(stdout.getvalue().strip())
-        self.assertEqual(sorted(output.keys()), ["final_text", "session_id", "stop_reason", "success", "tool_runs"])
+        self.assertEqual(
+            sorted(output.keys()),
+            [
+                "final_text",
+                "pending_action",
+                "session_id",
+                "stop_reason",
+                "success",
+                "task_id",
+                "task_status",
+                "tool_runs",
+            ],
+        )
         self.assertEqual(output["final_text"], "CLI delegation done")
         self.assertTrue(output["success"])
         self.assertEqual(output["tool_runs"][0]["tool_name"], "delegate_task")
@@ -325,6 +340,91 @@ class CliIntegrationTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("prompt cannot be used with --interactive", stderr.getvalue())
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_approves_waiting_file_action_after_process_restart(self, mock_from_config) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        first_loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([
+                _tool_call_response([
+                    ToolCall(
+                        id="call-persisted",
+                        name="file_write",
+                        arguments={"path": "src/module.py", "content": "print('new')\n"},
+                    )
+                ])
+            ]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        waiting = first_loop.run_turn(user_input="update the file")
+        self.assertEqual(waiting.task_status, "waiting_user")
+
+        mock_from_config.return_value = _FakeModelClient([_text_response("approved and complete")])
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--approve-task",
+                waiting.task_id,
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        output = json.loads(stdout.getvalue().strip())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(output["success"])
+        self.assertEqual(output["task_status"], "completed")
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('new')\n")
+        events = sessions.list_task_events(waiting.task_id)
+        self.assertIn("user_approved", [event.type for event in events])
+
+    def test_cross_process_approval_rejects_changed_file_version(self) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        first_loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([
+                _tool_call_response([
+                    ToolCall(
+                        id="call-stale",
+                        name="file_write",
+                        arguments={"path": "src/module.py", "content": "print('new')\n"},
+                    )
+                ])
+            ]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        waiting = first_loop.run_turn(user_input="update the file")
+        (self.workspace_root / "src" / "module.py").write_text("print('other')\n", encoding="utf-8")
+
+        restarted = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([_text_response("approval became stale")]),
+            tool_registry=build_default_registry(),
+            session_service=SessionService(database_path),
+            workspace_root=self.workspace_root,
+        )
+        result = restarted.handle_event(
+            AgentEvent(
+                id=str(uuid4()),
+                task_id=waiting.task_id,
+                session_id=waiting.session_id,
+                type="user_approved",
+                source="test",
+                expected_version=sessions.get_task(waiting.task_id).version,
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.tool_runs[0].observation.error_type, "conflict")
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('other')\n")
 
     def test_cli_requires_prompt_or_interactive(self) -> None:
         stderr = io.StringIO()
