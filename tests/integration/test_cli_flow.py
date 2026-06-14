@@ -426,17 +426,24 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(result.tool_runs[0].observation.error_type, "conflict")
         self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('other')\n")
 
-    def test_cli_requires_prompt_or_interactive(self) -> None:
-        stderr = io.StringIO()
+    @patch("builtins.input", return_value="quit")
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_without_prompt_defaults_to_interactive_mode(self, mock_from_config, _mock_input) -> None:
+        mock_from_config.return_value = _FakeModelClient([])
+        stdout = io.StringIO()
 
-        with patch("sys.stderr", stderr):
+        with redirect_stdout(stdout):
             exit_code = cli.main([
                 "--workspace-root",
                 str(self.workspace_root),
             ])
 
-        self.assertEqual(exit_code, 2)
-        self.assertIn("provide a prompt or use --interactive", stderr.getvalue())
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Interactive mode. Session:", output)
+        self.assertIn("Type /help for commands", output)
+        session_id = (self.workspace_root / ".agent_app" / "current_session.txt").read_text(encoding="utf-8").strip()
+        self.assertIn(session_id, output)
 
     @patch("builtins.input", side_effect=["", "hello", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
@@ -455,7 +462,147 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("Interactive mode.", stdout.getvalue())
         self.assertIn("interactive turn", stdout.getvalue())
+        self.assertIn("[task:", stdout.getvalue())
+        self.assertIn("| completed]", stdout.getvalue())
         self.assertEqual(len(fake_model.calls), 1)
+
+    @patch("builtins.input", side_effect=["hello", "/task", "/tasks", "/help", "/unknown", "quit"])
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_mode_supports_task_discovery_and_help_commands(self, mock_from_config, _mock_input) -> None:
+        mock_from_config.return_value = _FakeModelClient([_text_response("done")])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("done", output)
+        self.assertGreaterEqual(output.count("[task:"), 3)
+        self.assertIn("/approve", output)
+        self.assertIn("Unknown command: /unknown", output)
+
+    @patch("builtins.input", side_effect=["/approve", "quit"])
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_approve_uses_latest_waiting_task_without_id(self, mock_from_config, _mock_input) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        first_loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([
+                _tool_call_response([
+                    ToolCall(
+                        id="call-repl-approval",
+                        name="file_write",
+                        arguments={"path": "src/module.py", "content": "print('new')\n"},
+                    )
+                ])
+            ]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        waiting = first_loop.run_turn(user_input="update the file")
+        self.assertEqual(waiting.task_status, "waiting_user")
+        mock_from_config.return_value = _FakeModelClient([_text_response("approved")])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--workspace-root",
+                str(self.workspace_root),
+                "--session-id",
+                waiting.session_id,
+            ])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn(f"[task: {waiting.task_id} | completed]", output)
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('new')\n")
+        actions = sessions.list_tool_actions(waiting.session_id)
+        self.assertEqual(len(actions), 1)
+
+    @patch("builtins.input", side_effect=["/reject", "quit"])
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_reject_uses_latest_waiting_task_without_id(self, mock_from_config, _mock_input) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        first_loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([
+                _tool_call_response([
+                    ToolCall(
+                        id="call-repl-reject",
+                        name="file_write",
+                        arguments={"path": "src/module.py", "content": "print('new')\n"},
+                    )
+                ])
+            ]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        waiting = first_loop.run_turn(user_input="update the file")
+        mock_from_config.return_value = _FakeModelClient([_text_response("rejected")])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--workspace-root",
+                str(self.workspace_root),
+                "--session-id",
+                waiting.session_id,
+            ])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("rejected", output)
+        self.assertIn(f"[task: {waiting.task_id} | completed]", output)
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('old')\n")
+
+    @patch("builtins.input", side_effect=["/cancel", "quit"])
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_cancel_uses_latest_non_terminal_task_without_id(self, mock_from_config, _mock_input) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        first_loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([
+                _tool_call_response([
+                    ToolCall(
+                        id="call-repl-cancel",
+                        name="file_write",
+                        arguments={"path": "src/module.py", "content": "print('new')\n"},
+                    )
+                ])
+            ]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        waiting = first_loop.run_turn(user_input="update the file")
+        mock_from_config.return_value = _FakeModelClient([])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--workspace-root",
+                str(self.workspace_root),
+                "--session-id",
+                waiting.session_id,
+            ])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn(f"[task: {waiting.task_id} | cancelled]", output)
+        self.assertEqual(sessions.get_task(waiting.task_id).status, "cancelled")
+        self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('old')\n")
 
     @patch("builtins.input", side_effect=["first prompt", ":new", "second prompt", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")

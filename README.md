@@ -82,7 +82,45 @@ $env:MODEL_NAME = "qwen3.6-plus"
 
 ## 基本使用
 
-执行单轮请求：
+推荐使用连续对话 REPL。没有 prompt 时会默认进入交互模式：
+
+```powershell
+agent-app --workspace-root .
+python -m agent_app.cli --workspace-root .
+```
+
+启动后会显示当前 `Session ID`，每轮结束会显示完整 `Task ID` 和状态：
+
+```text
+Interactive mode. Session: 3d9...
+> 读取 README.md 并概括
+...
+[task: 13ab... | completed]
+```
+
+REPL 支持以下命令，操作当前 Session 时不需要手工输入 Task ID：
+
+```text
+/task       查看当前 Session 的最新 Task
+/tasks      列出当前 Session 的 Task
+/approve    批准最新的 waiting_user 工具动作
+/reject     拒绝最新的 waiting_user 工具动作
+/cancel     取消最新的非终态 Task
+/new        新建 Session
+/help       查看帮助
+exit        退出
+```
+
+仍可显式指定交互模式：
+
+```powershell
+python -m agent_app.cli --interactive --workspace-root .
+agent-app --interactive --workspace-root .
+```
+
+输入 `:new` 可以开始新 session，也可以使用等价的 `/new`；输入 `exit` 或 `quit` 退出。
+
+执行适合脚本和自动化处理的单轮 JSON 请求：
 
 ```powershell
 python -m agent_app.cli "hello, what model are you" --workspace-root .
@@ -100,14 +138,7 @@ python -m agent_app.cli "do you remember my last question" --workspace-root .
 python -m agent_app.cli "hello" --workspace-root . --new-session
 ```
 
-启动交互式 REPL：
-
-```powershell
-python -m agent_app.cli --interactive --workspace-root .
-agent-app --interactive --workspace-root .
-```
-
-查询和控制持久化任务：
+在 REPL 之外查询和控制指定的持久化任务：
 
 ```powershell
 python -m agent_app.cli --workspace-root . --task-status TASK_ID
@@ -118,7 +149,7 @@ python -m agent_app.cli --workspace-root . --approve-task TASK_ID
 python -m agent_app.cli --workspace-root . --reject-task TASK_ID
 ```
 
-交互模式会让同一个进程持续运行，便于继续回答模型的自然语言追问。输入 `:new` 可以开始新 session，输入 `exit` 或 `quit` 退出。
+这些带 `TASK_ID` 的参数主要供跨进程恢复、脚本和自动化使用；普通连续对话优先使用 `/task`、`/approve` 等 REPL 命令。
 
 `--workspace-root` 应指向真实存在的工作区根目录。CLI 会把 `.agent_app/agent.db` 和 `.agent_app/current_session.txt` 存在该目录下，也会从同一路径加载 `.agent_app/.env.local`。
 
