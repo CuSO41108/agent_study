@@ -19,7 +19,19 @@ from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_replace_in_file_request
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry
-from agent_app.types import AgentEvent, ToolCall
+from agent_app.types import AgentEvent, TaskState, ToolCall, TurnResult
+
+
+_TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "expired"}
+_REPL_HELP = """Commands:
+  /task       Show the latest task in this session.
+  /tasks      List tasks in this session.
+  /approve    Approve the latest task waiting for tool approval.
+  /reject     Reject the latest task waiting for tool approval.
+  /cancel     Cancel the latest non-terminal task.
+  /new        Start a new session.
+  /help       Show this help.
+  exit        Leave interactive mode."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         dest="interactive",
         action="store_true",
-        help="Start an interactive REPL instead of handling a single prompt.",
+        help="Explicitly start the interactive REPL (also the default when no prompt is supplied).",
     )
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
@@ -61,14 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     control = _selected_task_control(args)
+    interactive = args.interactive or (args.prompt is None and control is None)
     if args.interactive and args.prompt is not None:
         print("Argument error: prompt cannot be used with --interactive.", file=sys.stderr)
         return 2
     if control is not None and (args.interactive or args.prompt is not None):
         print("Argument error: task controls cannot be combined with a prompt or --interactive.", file=sys.stderr)
-        return 2
-    if not args.interactive and args.prompt is None and control is None:
-        print("Argument error: provide a prompt or use --interactive.", file=sys.stderr)
         return 2
 
     try:
@@ -139,10 +149,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(json.dumps(result, default=_serialize, ensure_ascii=False))
         return 0 if result.success or result.task_status in {"paused", "cancelled", "waiting_user"} else 1
-    if args.interactive:
+    if interactive:
+        interactive_session_id = sessions.get_or_create_session(resolved_session_id)
+        _persist_current_session(session_state_path, interactive_session_id)
         return _run_interactive_loop(
             loop=loop,
-            session_id=resolved_session_id,
+            session_service=sessions,
+            session_id=interactive_session_id,
             session_state_path=session_state_path,
         )
 
@@ -290,11 +303,13 @@ def _persist_current_session(session_state_path: Path, session_id: str) -> None:
 def _run_interactive_loop(
     *,
     loop: AgentLoop,
-    session_id: str | None,
+    session_service: SessionService,
+    session_id: str,
     session_state_path: Path,
 ) -> int:
     current_session_id = session_id
-    print("Interactive mode. Type 'exit' or 'quit' to leave, ':new' to start a new session.")
+    print(f"Interactive mode. Session: {current_session_id}")
+    print("Type /help for commands; use 'exit' or 'quit' to leave.")
 
     while True:
         try:
@@ -309,18 +324,122 @@ def _run_interactive_loop(
         lowered = stripped.lower()
         if lowered in {"exit", "quit"}:
             return 0
-        if stripped == ":new":
-            current_session_id = None
-            print("Started a new session.")
+        if lowered in {":new", "/new"}:
+            current_session_id = session_service.create_session()
+            _persist_current_session(session_state_path, current_session_id)
+            print(f"Started a new session. Session: {current_session_id}")
+            continue
+        if lowered == "/help":
+            print(_REPL_HELP)
+            continue
+        if lowered == "/task":
+            _print_latest_task(session_service, current_session_id)
+            continue
+        if lowered == "/tasks":
+            _print_task_list(session_service, current_session_id)
+            continue
+        if lowered in {"/approve", "/reject", "/cancel"}:
+            result = _run_repl_task_control(
+                loop=loop,
+                session_service=session_service,
+                session_id=current_session_id,
+                command=lowered,
+            )
+            if result is not None:
+                _print_turn_result(result)
+            continue
+        if stripped.startswith("/"):
+            print(f"Unknown command: {stripped}. Type /help for commands.")
             continue
 
         result = loop.run_turn(user_input=stripped, session_id=current_session_id)
         current_session_id = result.session_id
         _persist_current_session(session_state_path, result.session_id)
-        if result.final_text:
-            print(result.final_text)
-        elif not result.success:
-            print(f"Error: {result.stop_reason or 'unknown_error'}")
+        _print_turn_result(result)
+
+
+def _run_repl_task_control(
+    *,
+    loop: AgentLoop,
+    session_service: SessionService,
+    session_id: str,
+    command: str,
+) -> TurnResult | None:
+    tasks = session_service.list_tasks(session_id)
+    if command in {"/approve", "/reject"}:
+        task = next(
+            (
+                item
+                for item in reversed(tasks)
+                if item.status == "waiting_user"
+                and item.pending_action is not None
+                and item.pending_action.kind == "tool_approval"
+            ),
+            None,
+        )
+        if task is None:
+            print("No task is waiting for tool approval in this session.")
+            return None
+        event_type = "user_approved" if command == "/approve" else "user_rejected"
+    else:
+        task = next(
+            (item for item in reversed(tasks) if item.status not in _TERMINAL_TASK_STATUSES),
+            None,
+        )
+        if task is None:
+            print("No non-terminal task exists in this session.")
+            return None
+        event_type = "cancel_requested"
+
+    try:
+        return loop.handle_event(
+            AgentEvent(
+                id=str(uuid4()),
+                task_id=task.id,
+                session_id=task.session_id,
+                type=event_type,
+                source="repl",
+                correlation_id=task.id,
+                expected_version=task.version,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"Task error: {exc}")
+        return None
+
+
+def _print_latest_task(session_service: SessionService, session_id: str) -> None:
+    task = session_service.get_latest_task(session_id)
+    if task is None:
+        print("No tasks in this session.")
+        return
+    _print_task_summary(task)
+
+
+def _print_task_list(session_service: SessionService, session_id: str) -> None:
+    tasks = session_service.list_tasks(session_id)
+    if not tasks:
+        print("No tasks in this session.")
+        return
+    for task in tasks:
+        _print_task_summary(task)
+
+
+def _print_task_summary(task: TaskState) -> None:
+    print(f"[task: {task.id} | {task.status}] {task.goal}")
+    if task.pending_action is not None:
+        print(f"  pending: {task.pending_action.kind} - {task.pending_action.prompt}")
+    if task.stop_reason:
+        print(f"  stop_reason: {task.stop_reason}")
+
+
+def _print_turn_result(result: TurnResult) -> None:
+    if result.final_text:
+        print(result.final_text)
+    elif not result.success:
+        print(f"Error: {result.stop_reason or 'unknown_error'}")
+    if result.task_id is not None:
+        print(f"[task: {result.task_id} | {result.task_status or 'unknown'}]")
 
 
 if __name__ == "__main__":
