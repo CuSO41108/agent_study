@@ -199,6 +199,23 @@ python -m coverage report --fail-under=90
 python -m coverage report --precision=2 --fail-under=90
 ```
 
+运行报告型 eval MVP：
+
+```powershell
+python -m evals.runner --dry-run
+python -m evals.runner
+python -m evals.runner --live-model
+```
+
+Eval 用例位于 `evals/cases/`，fixture 位于 `evals/fixtures/`。当前 v1 suite
+包含 20 个固定任务。Runner 会保留
+`.eval_runs/<run-id>/` 工作区，并把 JSONL 报告写入 `evals/results/`。v1 eval
+只报告 `task_pass`、`verify_pass`、changed-file oracle、trajectory oracle、工具调用数和
+重试数和 repair attempt 数，不作为默认测试阻塞门槛。默认 `python -m evals.runner`
+不会调用真实模型；需要显式传 `--live-model`。
+
+真实项目 demo 的展示方式见 `docs/EVAL_DEMO.md`。
+
 快速 smoke test：
 
 ```powershell

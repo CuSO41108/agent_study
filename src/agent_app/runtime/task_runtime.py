@@ -35,13 +35,14 @@ class TaskRuntime:
         *,
         session_id: str,
         user_input: str,
+        budget: TaskBudget | None = None,
         event: AgentEvent | None = None,
     ) -> TaskState:
         latest = self._sessions.get_latest_task(session_id)
         if latest is not None and latest.status == "waiting_user":
             return self.resume_with_user_message(latest.id, user_input, event=event)
 
-        task = self._sessions.create_task(session_id, goal=user_input)
+        task = self._sessions.create_task(session_id, goal=user_input, budget=budget)
         return self.transition(
             task.id,
             target_status="running",
@@ -281,6 +282,14 @@ class TaskRuntime:
         task = self.require_task(task_id)
         self._ensure_mutable(task)
         return self._update_budget(task, replace(task.budget, used_tool_calls=task.budget.used_tool_calls + 1))
+
+    def consume_repair_attempt(self, task_id: str) -> TaskState:
+        task = self.require_task(task_id)
+        self._ensure_mutable(task)
+        return self._update_budget(
+            task,
+            replace(task.budget, used_repair_attempts=task.budget.used_repair_attempts + 1),
+        )
 
     def add_active_time(self, task_id: str, elapsed_seconds: float) -> TaskState:
         task = self.require_task(task_id)

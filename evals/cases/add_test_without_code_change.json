@@ -1,0 +1,22 @@
+{
+  "id": "add_test_without_code_change_001",
+  "category": "task_completion",
+  "prompt": "Create focused tests for slugify lowercasing behavior only. Leave src/string_tools.py unchanged.",
+  "fixture": "string_tools",
+  "budget": {
+    "max_model_calls": 8,
+    "max_tool_calls": 8,
+    "max_tokens": 25000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_command": "python -m unittest discover -s tests -v",
+    "required_changed_files": ["tests/test_string_tools.py"],
+    "allowed_changed_files": ["tests/test_string_tools.py"],
+    "forbidden_changed_paths": ["src/string_tools.py", ".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "forbidden_tools": []
+  }
+}

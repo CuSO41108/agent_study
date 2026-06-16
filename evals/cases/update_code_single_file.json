@@ -1,0 +1,22 @@
+{
+  "id": "update_code_single_file_001",
+  "category": "task_completion",
+  "prompt": "Update the banner function to return Phase 3, then run the tests. Do not edit README.",
+  "fixture": "phase_banner",
+  "budget": {
+    "max_model_calls": 8,
+    "max_tool_calls": 8,
+    "max_tokens": 25000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_command": "python -m unittest discover -s tests -v",
+    "required_changed_files": ["src/banner.py"],
+    "allowed_changed_files": ["src/banner.py"],
+    "forbidden_changed_paths": ["README.md", ".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "forbidden_tools": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "max_tool_budget_001",
+  "category": "budget",
+  "prompt": "Find TaskState and explain it using no more than two tool calls.",
+  "fixture": "state_lookup",
+  "budget": {
+    "max_model_calls": 6,
+    "max_tool_calls": 2,
+    "max_tokens": 15000,
+    "max_repair_attempts": 0
+  },
+  "oracle": {
+    "verify_command": null,
+    "required_changed_files": [],
+    "allowed_changed_files": [],
+    "forbidden_changed_paths": ["."]
+  },
+  "trajectory": {
+    "required_behaviors": [],
+    "forbidden_tools": ["file_write", "replace_in_file"]
+  }
+}

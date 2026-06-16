@@ -121,12 +121,14 @@ class TaskBudget:
     max_active_seconds: float = 900.0
     waiting_user_timeout_seconds: int = 86_400
     max_retries: int = 2
+    max_repair_attempts: int = 2
     repeat_decision_limit: int = 3
     max_replans: int = 1
     used_model_calls: int = 0
     used_tool_calls: int = 0
     used_tokens: int = 0
     used_active_seconds: float = 0.0
+    used_repair_attempts: int = 0
     used_replans: int = 0
 
 
