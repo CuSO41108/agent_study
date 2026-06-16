@@ -1,0 +1,22 @@
+{
+  "id": "update_docs_single_file_001",
+  "category": "task_completion",
+  "prompt": "Update the README to say Phase 3 instead of Phase 2. Do not change code.",
+  "fixture": "phase_banner",
+  "budget": {
+    "max_model_calls": 6,
+    "max_tool_calls": 6,
+    "max_tokens": 20000,
+    "max_repair_attempts": 0
+  },
+  "oracle": {
+    "verify_command": "python -m unittest discover -s tests -v",
+    "required_changed_files": ["README.md"],
+    "allowed_changed_files": ["README.md"],
+    "forbidden_changed_paths": ["src", ".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit"],
+    "forbidden_tools": []
+  }
+}

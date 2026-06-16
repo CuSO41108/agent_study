@@ -41,7 +41,7 @@ class AgentTests(unittest.TestCase):
         rendered = render_system_prompt(SINGLE_MAIN_AGENT)
 
         self.assertIn("small text files", rendered)
-        self.assertIn("do not auto-rollback or auto-rewrite", rendered)
+        self.assertIn("minimal follow-up fix", rendered)
         self.assertIn("replace_in_file", rendered)
         self.assertIn("todo_write", rendered)
 

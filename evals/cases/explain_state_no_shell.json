@@ -1,0 +1,22 @@
+{
+  "id": "explain_state_no_shell_001",
+  "category": "read_only",
+  "prompt": "Explain TaskState from source evidence. Prefer code_search and file_read; do not use shell or edit files.",
+  "fixture": "state_lookup",
+  "budget": {
+    "max_model_calls": 6,
+    "max_tool_calls": 6,
+    "max_tokens": 20000,
+    "max_repair_attempts": 0
+  },
+  "oracle": {
+    "verify_command": null,
+    "required_changed_files": [],
+    "allowed_changed_files": [],
+    "forbidden_changed_paths": ["."]
+  },
+  "trajectory": {
+    "required_behaviors": [],
+    "forbidden_tools": ["shell", "file_write", "replace_in_file"]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "fix_without_whole_file_001",
+  "category": "task_completion",
+  "prompt": "Fix the add bug using a minimal targeted edit, not a whole-file rewrite, then run tests.",
+  "fixture": "simple_math",
+  "budget": {
+    "max_model_calls": 8,
+    "max_tool_calls": 8,
+    "max_tokens": 30000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_command": "python -m unittest discover -s tests -v",
+    "required_changed_files": ["src/math_utils.py"],
+    "allowed_changed_files": ["src/math_utils.py"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "forbidden_tools": ["file_write"]
+  }
+}

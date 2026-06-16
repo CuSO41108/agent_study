@@ -28,6 +28,7 @@ from agent_app.types import (
     PendingAction,
     SessionContext,
     StoredMessage,
+    TaskBudget,
     TodoItem,
     ToolAction,
     ToolCall,
@@ -86,6 +87,7 @@ class AgentLoop:
         *,
         user_input: str,
         session_id: str | None = None,
+        budget: TaskBudget | None = None,
         _task_id: str | None = None,
         _append_user_message: bool = True,
     ) -> TurnResult:
@@ -95,6 +97,7 @@ class AgentLoop:
             return self._run_turn_impl(
                 user_input=user_input,
                 session_id=session_id,
+                budget=budget,
                 _task_id=_task_id,
                 _append_user_message=_append_user_message,
             )
@@ -116,6 +119,7 @@ class AgentLoop:
         *,
         user_input: str,
         session_id: str | None = None,
+        budget: TaskBudget | None = None,
         _task_id: str | None = None,
         _append_user_message: bool = True,
     ) -> TurnResult:
@@ -137,6 +141,7 @@ class AgentLoop:
             task = self._tasks.start_for_user_message(
                 session_id=resolved_session_id,
                 user_input=user_input,
+                budget=budget,
             )
         else:
             task = self._tasks.require_task(_task_id)
@@ -481,6 +486,27 @@ class AgentLoop:
                         "content": tool_result.content if tool_result.success else (tool_result.error or tool_result.content or "Tool execution failed."),
                     }
                 )
+
+                repair_stop = self._record_repair_attempt_if_needed(
+                    task_id=task.id,
+                    tool_call=tool_call,
+                    tool_result=tool_result,
+                    tool_runs=tool_runs,
+                )
+                if repair_stop is not None:
+                    return self._finalize_turn(
+                        session_id=resolved_session_id,
+                        user_input=user_input,
+                        context_message_count=base_context_message_count,
+                        context_token_estimate=base_context_token_estimate,
+                        used_summary=used_summary,
+                        used_todo=used_todo,
+                        used_evidence=used_evidence,
+                        final_text=None,
+                        stop_reason=repair_stop,
+                        tool_runs=tool_runs,
+                        success=False,
+                    )
 
                 if tool_result.success:
                     consecutive_failure_tool = None
@@ -1529,6 +1555,50 @@ class AgentLoop:
 
         return None
 
+    def _record_repair_attempt_if_needed(
+        self,
+        *,
+        task_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        tool_runs: list[ToolResult],
+    ) -> str | None:
+        if not _is_failed_verification_after_edit(tool_call, tool_result, tool_runs):
+            return None
+
+        task = self._tasks.require_task(task_id)
+        command = str(tool_call.arguments.get("command", ""))
+        output = tool_result.content or tool_result.error or ""
+        if task.budget.used_repair_attempts >= task.budget.max_repair_attempts:
+            self._session_service.append_task_trace(
+                task_id,
+                "repair",
+                {
+                    "trigger": "verification_failure",
+                    "command": command,
+                    "allowed": False,
+                    "attempt": task.budget.used_repair_attempts + 1,
+                    "max_attempts": task.budget.max_repair_attempts,
+                    "output_preview": output[:1000],
+                },
+            )
+            return "repair_attempt_budget_exceeded"
+
+        updated = self._tasks.consume_repair_attempt(task_id)
+        self._session_service.append_task_trace(
+            task_id,
+            "repair",
+            {
+                "trigger": "verification_failure",
+                "command": command,
+                "allowed": True,
+                "attempt": updated.budget.used_repair_attempts,
+                "max_attempts": updated.budget.max_repair_attempts,
+                "output_preview": output[:1000],
+            },
+        )
+        return None
+
 
 def _message_to_provider_message(message: Message) -> dict[str, Any]:
     payload: dict[str, Any] = {"role": message.role, "content": message.content}
@@ -1723,6 +1793,38 @@ def _extract_file_read_excerpt(tool_runs: list[ToolResult]) -> str | None:
         if tool_run.tool_name == "file_read" and tool_run.success and tool_run.content:
             return "\n".join(tool_run.content.splitlines()[:8])
     return None
+
+
+def _is_failed_verification_after_edit(
+    tool_call: ToolCall,
+    tool_result: ToolResult,
+    tool_runs: list[ToolResult],
+) -> bool:
+    if tool_result.success or tool_result.tool_name != "shell":
+        return False
+    command = str(tool_call.arguments.get("command", "")).strip().lower()
+    if not _looks_like_verification_command(command):
+        return False
+    return _has_unverified_successful_edit(tool_runs)
+
+
+def _looks_like_verification_command(command: str) -> bool:
+    return (
+        command.startswith("python -m unittest")
+        or command.startswith("python -m pytest")
+        or command.startswith("pytest")
+    )
+
+
+def _has_unverified_successful_edit(tool_runs: list[ToolResult]) -> bool:
+    last_successful_shell = -1
+    for index, tool_run in enumerate(tool_runs):
+        if tool_run.tool_name == "shell" and tool_run.success:
+            last_successful_shell = index
+    return any(
+        tool_run.success and tool_run.tool_name in {"file_write", "replace_in_file"}
+        for tool_run in tool_runs[last_successful_shell + 1 :]
+    )
 
 
 def _decision_payload(response: ModelResponse) -> dict[str, Any]:
