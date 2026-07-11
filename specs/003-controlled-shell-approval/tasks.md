@@ -7,4 +7,4 @@
 - [X] T005 Render shell approval details in src/agent_app/cli.py
 - [X] T006 Add approve/reject/boundary tests in tests/unit/test_tools.py and tests/unit/test_loop.py
 - [X] T007 Run full relevant regression and coverage validation
-- [ ] T008 Stage only feature-owned hunks and create an isolated commit
+- [X] T008 Stage only feature-owned hunks and create an isolated commit
