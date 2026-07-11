@@ -174,6 +174,39 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.stop_reason, "model_error")
 
+    def test_explicit_research_runs_web_search_before_model_response(self) -> None:
+        model = _FakeModelClient([_text_response("sources considered")])
+        search = self.registry.get_required("web_search")
+        with patch.object(
+            search,
+            "execute",
+            return_value=ToolResult(
+                tool_call_id="ignored",
+                tool_name="web_search",
+                success=True,
+                content='{"query":"请查阅示例","sources":[{"title":"Example","url":"https://example.com","content":"evidence"}]}',
+                error=None,
+            ),
+        ):
+            result = self._build_loop(model).run_turn(user_input="请查阅示例主题")
+
+        self.assertTrue(result.success, result.tool_runs[0].error if result.tool_runs else result.stop_reason)
+        self.assertEqual(result.tool_runs[0].tool_name, "web_search")
+        self.assertIn("required public-web search", model.calls[0]["messages"][0]["content"])
+        traces = self.sessions.list_task_traces(result.task_id)
+        requirement = next(trace for trace in traces if trace.trace_type == "research_requirement")
+        self.assertTrue(requirement.payload["success"])
+        self.assertEqual(requirement.payload["source_count"], 1)
+
+    def test_explicit_research_without_configuration_stops_before_model_call(self) -> None:
+        model = _FakeModelClient([_text_response("must not be used")])
+
+        result = self._build_loop(model).run_turn(user_input="请查阅示例主题")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "search_configuration_error")
+        self.assertEqual(model.calls, [])
+
     def test_run_turn_returns_invalid_model_response_when_text_and_tools_are_missing(self) -> None:
         model = _FakeModelClient([ModelResponse(assistant_text=None, tool_calls=[], raw_response={"choices": [{"message": {"content": None}}]})])
         loop = self._build_loop(model)
@@ -196,6 +229,25 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('new')\n")
         self.assertEqual(result.tool_runs[0].tool_name, "file_write")
         self.assertTrue(result.tool_runs[0].success)
+
+    def test_confirmed_controlled_shell_move_executes_only_after_approval(self) -> None:
+        (self.workspace_root / "outputs").mkdir()
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="move-1", name="shell", arguments={"command": "Move-Item -Path README.md -Destination outputs/README.md"})]),
+            _text_response("moved"),
+        ])
+        result = self._build_loop(model, confirmation_handler=lambda _call, _context: True).run_turn(user_input="move readme")
+        self.assertTrue(result.success)
+        self.assertFalse((self.workspace_root / "README.md").exists())
+        self.assertTrue((self.workspace_root / "outputs" / "README.md").exists())
+
+    def test_rejected_controlled_shell_move_does_not_execute(self) -> None:
+        (self.workspace_root / "outputs").mkdir()
+        model = _FakeModelClient([_tool_call_response([ToolCall(id="move-1", name="shell", arguments={"command": "Move-Item -Path README.md -Destination outputs/README.md"})])])
+        result = self._build_loop(model, confirmation_handler=lambda _call, _context: False).run_turn(user_input="move readme")
+        self.assertFalse(result.success)
+        self.assertTrue((self.workspace_root / "README.md").exists())
+        self.assertFalse((self.workspace_root / "outputs" / "README.md").exists())
 
     def test_missing_confirmation_handler_persists_waiting_user(self) -> None:
         model = _FakeModelClient([

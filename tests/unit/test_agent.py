@@ -10,7 +10,7 @@ class AgentTests(unittest.TestCase):
     def test_single_main_agent_has_expected_tools(self) -> None:
         self.assertEqual(
             SINGLE_MAIN_AGENT.allowed_tools,
-            ["file_read", "code_search", "delegate_task", "todo_read", "todo_write", "replace_in_file", "file_write", "shell"],
+            ["file_read", "code_search", "web_search", "delegate_task", "todo_read", "todo_write", "replace_in_file", "file_write", "shell"],
         )
         self.assertEqual(SINGLE_MAIN_AGENT.max_tool_rounds, 8)
         self.assertEqual(SINGLE_MAIN_AGENT.role, "coordinator")

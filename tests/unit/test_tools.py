@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from agent_app.tools.approval import approve_tool_call, validate_shell_command
+from agent_app.tools.approval import approve_tool_call, parse_controlled_shell_command, validate_shell_command
 from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.code_search import CodeSearchTool
 from agent_app.tools.delegate_task import DelegateTaskTool
@@ -93,6 +93,7 @@ class ToolLayerTests(unittest.TestCase):
 
     def test_approval_auto_allows_file_read_and_safe_shell(self) -> None:
         self.assertEqual(approve_tool_call("file_read", {"path": "sample.txt"}).decision, "allow")
+        self.assertEqual(approve_tool_call("web_search", {"query": "example"}).decision, "allow")
         self.assertEqual(approve_tool_call("shell", {"command": "git status --short"}).decision, "allow")
         self.assertEqual(approve_tool_call("todo_read", {}).decision, "allow")
         self.assertEqual(approve_tool_call("todo_write", {"items": []}).decision, "allow")
@@ -105,6 +106,25 @@ class ToolLayerTests(unittest.TestCase):
             approve_tool_call("replace_in_file", {"path": "sample.txt", "old_text": "a", "new_text": "b"}).decision,
             "confirm",
         )
+
+    def test_controlled_shell_commands_require_approval_and_reject_operators(self) -> None:
+        self.assertEqual(approve_tool_call("shell", {"command": "New-Item -ItemType Directory -Path outputs -Force"}).decision, "confirm")
+        self.assertEqual(approve_tool_call("shell", {"command": "Move-Item -Path sample.txt -Destination src/sample.txt"}).decision, "confirm")
+        self.assertEqual(approve_tool_call("shell", {"command": "Remove-Item -Recurse outputs"}).decision, "deny")
+        self.assertEqual(approve_tool_call("shell", {"command": "New-Item -ItemType Directory -Path outputs; whoami"}).decision, "deny")
+        self.assertEqual(parse_controlled_shell_command("Copy-Item -Path sample.txt -Destination src/copy.txt").operation, "copy")
+
+    def test_controlled_shell_inspection_enforces_workspace_and_destination_rules(self) -> None:
+        tool = ShellTool()
+        inspection, error = tool.inspect(arguments={"command": "New-Item -ItemType Directory -Path outputs -Force"}, context=self.context)
+        self.assertIsNotNone(inspection)
+        self.assertIsNone(error)
+        inspection, error = tool.inspect(arguments={"command": "Move-Item -Path sample.txt -Destination src/app.py"}, context=self.context)
+        self.assertIsNone(inspection)
+        self.assertIn("already exists", error)
+        inspection, error = tool.inspect(arguments={"command": "Move-Item -Path sample.txt -Destination ../outside.txt"}, context=self.context)
+        self.assertIsNone(inspection)
+        self.assertIn("escapes", error)
 
     def test_root_registry_includes_delegate_task_and_worker_registry_does_not(self) -> None:
         runner = SubagentRunner(

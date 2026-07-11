@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import unittest
@@ -8,7 +9,7 @@ from uuid import uuid4
 
 from agent_app.runtime.task_runtime import InvalidTaskTransition, TaskRuntime
 from agent_app.state.db import initialize_database
-from agent_app.state.session_service import SessionService, TaskVersionConflict
+from agent_app.state.session_service import ActiveTaskConflict, SessionService, TaskVersionConflict
 from agent_app.types import (
     AgentEvent,
     Observation,
@@ -66,6 +67,17 @@ class TaskRuntimeTests(unittest.TestCase):
         second = self.runtime.start_for_user_message(session_id=self.session_id, user_input="second")
         self.assertNotEqual(first.id, second.id)
         self.assertEqual(second.status, "running")
+
+    def test_session_allows_only_one_active_task(self) -> None:
+        first = self.runtime.start_for_user_message(session_id=self.session_id, user_input="first")
+
+        with self.assertRaises(ActiveTaskConflict) as raised:
+            self.runtime.start_for_user_message(session_id=self.session_id, user_input="parallel")
+
+        self.assertEqual(raised.exception.task.id, first.id)
+        other_session = self.sessions.create_session("session-2")
+        parallel = self.runtime.start_for_user_message(session_id=other_session, user_input="parallel")
+        self.assertEqual(parallel.session_id, other_session)
 
     def test_stale_version_rejects_transition_without_mutation(self) -> None:
         task = self.runtime.start_for_user_message(session_id=self.session_id, user_input="work")
@@ -157,6 +169,58 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertIsNone(resumed.pending_action)
         self.assertIsNone(resumed.waiting_deadline)
         self.assertEqual(self.sessions.list_task_events(task.id)[-1].id, event.id)
+
+    def test_approval_is_bound_to_pending_action_id(self) -> None:
+        task = self.runtime.start_for_user_message(session_id=self.session_id, user_input="edit")
+        waiting = self.runtime.wait_for_user(
+            task.id,
+            PendingAction(kind="tool_approval", prompt="Approve?"),
+        )
+        stale_event = AgentEvent(
+            id="stale-approval",
+            task_id=task.id,
+            session_id=self.session_id,
+            type="user_approved",
+            source="test",
+            payload={"pending_action_id": "old-action"},
+            expected_version=waiting.version,
+        )
+
+        with self.assertRaisesRegex(InvalidTaskTransition, "Pending action changed"):
+            self.runtime.approve(task.id, event=stale_event)
+
+        persisted = self.sessions.get_task(task.id)
+        self.assertEqual(persisted.status, "waiting_user")
+        self.assertEqual(persisted.pending_action.id, waiting.pending_action.id)
+
+    def test_legacy_pending_action_gets_stable_compatibility_id(self) -> None:
+        task = self.runtime.start_for_user_message(session_id=self.session_id, user_input="edit")
+        waiting = self.runtime.wait_for_user(
+            task.id,
+            PendingAction(kind="tool_approval", prompt="Approve?"),
+        )
+        legacy_payload = {
+            "kind": waiting.pending_action.kind,
+            "prompt": waiting.pending_action.prompt,
+            "decision": waiting.pending_action.decision,
+            "created_at": waiting.pending_action.created_at,
+            "expires_at": waiting.pending_action.expires_at,
+        }
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "UPDATE tasks SET pending_action_json = ? WHERE id = ?",
+                (json.dumps(legacy_payload), task.id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        first_read = self.sessions.get_task(task.id)
+        second_read = SessionService(self.db_path).get_task(task.id)
+
+        self.assertEqual(first_read.pending_action.id, f"legacy-{task.id}")
+        self.assertEqual(second_read.pending_action.id, first_read.pending_action.id)
 
     def test_waiting_user_expires_at_budget_deadline(self) -> None:
         task = self.sessions.create_task(
@@ -294,12 +358,14 @@ class TaskRuntimeTests(unittest.TestCase):
         tool_limited = self.runtime.consume_tool_call(reflected.id)
         self.assertEqual(self.runtime.budget_stop_reason(tool_limited), "tool_call_budget_exceeded")
 
+        token_session = self.sessions.create_session("token-session")
         token_budget = TaskBudget(max_model_calls=5, max_tokens=1, used_tokens=1)
-        token_task = self.sessions.create_task(self.session_id, goal="tokens", budget=token_budget)
+        token_task = self.sessions.create_task(token_session, goal="tokens", budget=token_budget)
         self.assertEqual(self.runtime.budget_stop_reason(token_task), "token_budget_exceeded")
 
+        active_session = self.sessions.create_session("active-session")
         active_budget = TaskBudget(max_model_calls=5, max_tokens=100, max_active_seconds=1)
-        active_task = self.sessions.create_task(self.session_id, goal="time", budget=active_budget)
+        active_task = self.sessions.create_task(active_session, goal="time", budget=active_budget)
         active_running = self.runtime.transition(
             active_task.id,
             target_status="running",

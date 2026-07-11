@@ -14,11 +14,13 @@ from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
 from agent_app.orchestrator.loop import AgentLoop
 from agent_app.state.db import initialize_database
-from agent_app.state.session_service import SessionService
+from agent_app.state.session_service import ActiveTaskConflict, SessionService
 from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_replace_in_file_request
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry
+from agent_app.tools.web_search import WebSearchTool
+from agent_app.tools.shell import ShellInspection, ShellTool
 from agent_app.types import AgentEvent, TaskState, ToolCall, TurnResult
 
 
@@ -26,8 +28,10 @@ _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "expired"}
 _REPL_HELP = """Commands:
   /task       Show the latest task in this session.
   /tasks      List tasks in this session.
-  /approve    Approve the latest task waiting for tool approval.
-  /reject     Reject the latest task waiting for tool approval.
+  /approve [task-id-prefix]
+              Approve a task waiting for tool approval.
+  /reject [task-id-prefix]
+              Reject a task waiting for tool approval.
   /cancel     Cancel the latest non-terminal task.
   /new        Start a new session.
   /help       Show this help.
@@ -107,7 +111,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop = AgentLoop(
         agent=SINGLE_MAIN_AGENT,
         model_client=model_client,
-        tool_registry=build_root_registry(subagent_runner=subagent_runner),
+        tool_registry=build_root_registry(
+            subagent_runner=subagent_runner,
+            web_search_tool=WebSearchTool(
+                base_url=config.search_base_url,
+                api_key=config.search_api_key,
+                timeout=config.search_timeout,
+                max_results=config.search_max_results,
+            ),
+        ),
         session_service=sessions,
         workspace_root=config.workspace_root,
         tool_timeout=config.tool_timeout,
@@ -133,6 +145,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reject": "user_rejected",
         }[action]
         try:
+            event_payload = {}
+            if action in {"approve", "reject"} and task.pending_action is not None:
+                event_payload["pending_action_id"] = task.pending_action.id
             result = loop.handle_event(
                 AgentEvent(
                     id=str(uuid4()),
@@ -140,6 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     session_id=task.session_id,
                     type=event_type,
                     source="cli",
+                    payload=event_payload,
                     correlation_id=task.id,
                     expected_version=task.version,
                 )
@@ -159,7 +175,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_state_path=session_state_path,
         )
 
-    result = loop.run_turn(user_input=args.prompt, session_id=resolved_session_id)
+    try:
+        result = loop.run_turn(user_input=args.prompt, session_id=resolved_session_id)
+    except ActiveTaskConflict as exc:
+        print(f"Task error: {exc}", file=sys.stderr)
+        return 1
     _persist_current_session(session_state_path, result.session_id)
     print(json.dumps(result, default=_serialize, ensure_ascii=False))
     return 0 if result.success else 1
@@ -169,12 +189,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionContext) -> bool:
     prompt_text = _build_confirmation_prompt(tool_call, context)
     print(prompt_text)
-    decision = input("Approve this edit? [y/N]: ").strip().lower()
-    return decision == "y"
+    decision = input("Approve this action? [y/N]: ").strip().lower()
+    return decision in {"y", "yes"}
 
 
 
 def _build_confirmation_prompt(tool_call: ToolCall, context: ToolExecutionContext) -> str:
+    if tool_call.name == "shell":
+        inspection = context.prepared_edits.get(tool_call.id)
+        if not isinstance(inspection, ShellInspection):
+            inspection, error = ShellTool().inspect(arguments=tool_call.arguments, context=context)
+            if inspection is None:
+                return f"Shell action confirmation\nValidation unavailable: {error}"
+        return (
+            "Shell action confirmation\n"
+            f"Risk: {inspection.controlled.risk_level} workspace change\n"
+            f"Operation: {inspection.controlled.operation}\n"
+            f"Command: {inspection.controlled.command}\n"
+            "Affected paths:\n" + "\n".join(f"- {path}" for path in inspection.paths)
+        )
     if tool_call.name == "file_write":
         inspection, error = _resolve_file_write_confirmation_inspection(tool_call=tool_call, context=context)
         if inspection is None:
@@ -338,12 +371,15 @@ def _run_interactive_loop(
         if lowered == "/tasks":
             _print_task_list(session_service, current_session_id)
             continue
-        if lowered in {"/approve", "/reject", "/cancel"}:
+        command, _, raw_target = stripped.partition(" ")
+        command = command.lower()
+        if command in {"/approve", "/reject", "/cancel"}:
             result = _run_repl_task_control(
                 loop=loop,
                 session_service=session_service,
                 session_id=current_session_id,
-                command=lowered,
+                command=command,
+                task_prefix=raw_target.strip() or None,
             )
             if result is not None:
                 _print_turn_result(result)
@@ -352,7 +388,11 @@ def _run_interactive_loop(
             print(f"Unknown command: {stripped}. Type /help for commands.")
             continue
 
-        result = loop.run_turn(user_input=stripped, session_id=current_session_id)
+        try:
+            result = loop.run_turn(user_input=stripped, session_id=current_session_id)
+        except ActiveTaskConflict as exc:
+            print(f"Task error: {exc}")
+            continue
         current_session_id = result.session_id
         _persist_current_session(session_state_path, result.session_id)
         _print_turn_result(result)
@@ -364,34 +404,49 @@ def _run_repl_task_control(
     session_service: SessionService,
     session_id: str,
     command: str,
+    task_prefix: str | None = None,
 ) -> TurnResult | None:
     tasks = session_service.list_tasks(session_id)
     if command in {"/approve", "/reject"}:
-        task = next(
-            (
-                item
-                for item in reversed(tasks)
-                if item.status == "waiting_user"
-                and item.pending_action is not None
-                and item.pending_action.kind == "tool_approval"
-            ),
-            None,
+        candidates = [
+            item
+            for item in reversed(tasks)
+            if item.status == "waiting_user"
+            and item.pending_action is not None
+            and item.pending_action.kind == "tool_approval"
+        ]
+        if not candidates:
+            print("No task is waiting for tool approval in this session.")
+            return None
+        task = _select_task_candidate(
+            candidates,
+            task_prefix=task_prefix,
+            command=command,
         )
         if task is None:
-            print("No task is waiting for tool approval in this session.")
             return None
         event_type = "user_approved" if command == "/approve" else "user_rejected"
     else:
-        task = next(
-            (item for item in reversed(tasks) if item.status not in _TERMINAL_TASK_STATUSES),
-            None,
+        candidates = [
+            item
+            for item in reversed(tasks)
+            if item.status not in _TERMINAL_TASK_STATUSES
+        ]
+        task = _select_task_candidate(
+            candidates,
+            task_prefix=task_prefix,
+            command=command,
         )
         if task is None:
-            print("No non-terminal task exists in this session.")
+            if not candidates:
+                print("No non-terminal task exists in this session.")
             return None
         event_type = "cancel_requested"
 
     try:
+        event_payload = {}
+        if command in {"/approve", "/reject"} and task.pending_action is not None:
+            event_payload["pending_action_id"] = task.pending_action.id
         return loop.handle_event(
             AgentEvent(
                 id=str(uuid4()),
@@ -399,6 +454,7 @@ def _run_repl_task_control(
                 session_id=task.session_id,
                 type=event_type,
                 source="repl",
+                payload=event_payload,
                 correlation_id=task.id,
                 expected_version=task.version,
             )
@@ -406,6 +462,33 @@ def _run_repl_task_control(
     except (RuntimeError, ValueError) as exc:
         print(f"Task error: {exc}")
         return None
+
+
+def _select_task_candidate(
+    candidates: list[TaskState],
+    *,
+    task_prefix: str | None,
+    command: str,
+) -> TaskState | None:
+    if task_prefix is not None:
+        matches = [task for task in candidates if task.id.startswith(task_prefix)]
+        if not matches:
+            print(f"No task matches prefix '{task_prefix}' for {command}.")
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        print(f"Task prefix '{task_prefix}' is ambiguous for {command}:")
+        for task in matches:
+            _print_task_summary(task)
+        return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        print(f"Multiple tasks are eligible for {command}; specify a task-id prefix:")
+        for task in candidates:
+            _print_task_summary(task)
+    return None
 
 
 def _print_latest_task(session_service: SessionService, session_id: str) -> None:
@@ -428,7 +511,10 @@ def _print_task_list(session_service: SessionService, session_id: str) -> None:
 def _print_task_summary(task: TaskState) -> None:
     print(f"[task: {task.id} | {task.status}] {task.goal}")
     if task.pending_action is not None:
-        print(f"  pending: {task.pending_action.kind} - {task.pending_action.prompt}")
+        print(
+            f"  pending: {task.pending_action.kind} "
+            f"[{task.pending_action.id}] - {task.pending_action.prompt}"
+        )
     if task.stop_reason:
         print(f"  stop_reason: {task.stop_reason}")
 

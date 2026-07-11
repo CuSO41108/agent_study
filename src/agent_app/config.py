@@ -16,6 +16,10 @@ class AppConfig:
     tool_timeout: float
     context_token_budget: int
     summary_trigger_tokens: int
+    search_base_url: str = "https://api.tavily.com"
+    search_api_key: str = ""
+    search_timeout: float = 30.0
+    search_max_results: int = 5
 
     @property
     def database_path(self) -> Path:
@@ -54,6 +58,15 @@ def load_config(
         "SUMMARY_TRIGGER_TOKENS",
         env_map.get("SUMMARY_TRIGGER_TOKENS", local_values.get("SUMMARY_TRIGGER_TOKENS", "3000")),
     )
+    search_timeout = _load_positive_timeout(
+        "SEARCH_TIMEOUT",
+        env_map.get("SEARCH_TIMEOUT", local_values.get("SEARCH_TIMEOUT", "30")),
+    )
+    search_max_results = _load_bounded_positive_int(
+        "SEARCH_MAX_RESULTS",
+        env_map.get("SEARCH_MAX_RESULTS", local_values.get("SEARCH_MAX_RESULTS", "5")),
+        maximum=10,
+    )
 
     return AppConfig(
         workspace_root=resolved_workspace,
@@ -64,6 +77,10 @@ def load_config(
         tool_timeout=tool_timeout,
         context_token_budget=context_token_budget,
         summary_trigger_tokens=summary_trigger_tokens,
+        search_base_url=env_map.get("SEARCH_BASE_URL", local_values.get("SEARCH_BASE_URL", "https://api.tavily.com")).rstrip("/"),
+        search_api_key=env_map.get("SEARCH_API_KEY", local_values.get("SEARCH_API_KEY", "")),
+        search_timeout=search_timeout,
+        search_max_results=search_max_results,
     )
 
 
@@ -100,4 +117,11 @@ def _load_positive_int(name: str, raw_value: str) -> int:
         raise ValueError(f"{name} must be a positive integer.") from exc
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+def _load_bounded_positive_int(name: str, raw_value: str, *, maximum: int) -> int:
+    value = _load_positive_int(name, raw_value)
+    if value > maximum:
+        raise ValueError(f"{name} must be less than or equal to {maximum}.")
     return value
