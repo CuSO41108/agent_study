@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -49,7 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace-root",
         dest="workspace_root",
-        help="Workspace root for file and shell tools.",
+        default=os.getcwd(),
+        help="Workspace root for file and shell tools (default: current directory).",
     )
     parser.add_argument(
         "--new-session",
