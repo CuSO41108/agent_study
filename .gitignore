@@ -8,3 +8,6 @@ __pycache__/
 htmlcov/
 .eval_runs/
 evals/results/*.jsonl
+.claude/
+.agents/
+.specify/
