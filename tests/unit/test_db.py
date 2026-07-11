@@ -106,6 +106,31 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertIn("action_id", columns)
 
+    def test_initialize_database_enforces_one_active_task_per_session(self) -> None:
+        temp_root = Path(__file__).resolve().parents[2] / ".test_tmp"
+        temp_root.mkdir(exist_ok=True)
+        temp_dir = temp_root / f"db_active_task_{uuid4().hex}"
+        temp_dir.mkdir()
+        try:
+            db_path = temp_dir / ".agent_app" / "agent.db"
+            initialize_database(db_path)
+            connection = sqlite3.connect(db_path)
+            try:
+                index = connection.execute(
+                    """
+                    SELECT sql FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_tasks_one_active_per_session'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        self.assertIsNotNone(index)
+        self.assertIn("UNIQUE INDEX", index[0])
+        self.assertIn("waiting_user", index[0])
+
 
 if __name__ == "__main__":
     unittest.main()

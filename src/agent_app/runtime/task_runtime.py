@@ -4,7 +4,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from agent_app.state.session_service import SessionService
+from agent_app.state.session_service import ActiveTaskConflict, SessionService
 from agent_app.types import AgentEvent, Observation, PendingAction, TaskBudget, TaskState, TaskStatus, TodoItem
 
 TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled", "expired"})
@@ -38,9 +38,11 @@ class TaskRuntime:
         budget: TaskBudget | None = None,
         event: AgentEvent | None = None,
     ) -> TaskState:
-        latest = self._sessions.get_latest_task(session_id)
-        if latest is not None and latest.status == "waiting_user":
-            return self.resume_with_user_message(latest.id, user_input, event=event)
+        active = self._sessions.get_active_task(session_id)
+        if active is not None and active.status == "waiting_user":
+            return self.resume_with_user_message(active.id, user_input, event=event)
+        if active is not None:
+            raise ActiveTaskConflict(active)
 
         task = self._sessions.create_task(session_id, goal=user_input, budget=budget)
         return self.transition(
@@ -84,7 +86,10 @@ class TaskRuntime:
             target_status="waiting_user",
             event_type="state_transition",
             source="runtime",
-            payload={"pending_kind": pending.kind},
+            payload={
+                "pending_kind": pending.kind,
+                "pending_action_id": pending.id,
+            },
             pending_action=pending,
             waiting_deadline=deadline,
             reason="waiting_for_user",
@@ -113,12 +118,16 @@ class TaskRuntime:
         task = self.require_task(task_id)
         if task.pending_action is None:
             raise InvalidTaskTransition(f"Task '{task_id}' has no pending action.")
+        self._validate_pending_action_event(task, event)
         return self.transition(
             task.id,
             target_status="running",
             event_type="user_approved",
             source="user",
-            payload={"pending_kind": task.pending_action.kind},
+            payload={
+                "pending_kind": task.pending_action.kind,
+                "pending_action_id": task.pending_action.id,
+            },
             pending_action=None,
             waiting_deadline=None,
             reason="user_approved",
@@ -129,12 +138,16 @@ class TaskRuntime:
         task = self.require_task(task_id)
         if task.pending_action is None:
             raise InvalidTaskTransition(f"Task '{task_id}' has no pending action.")
+        self._validate_pending_action_event(task, event)
         return self.transition(
             task.id,
             target_status="running",
             event_type="user_rejected",
             source="user",
-            payload={"pending_kind": task.pending_action.kind},
+            payload={
+                "pending_kind": task.pending_action.kind,
+                "pending_action_id": task.pending_action.id,
+            },
             pending_action=None,
             waiting_deadline=None,
             reason="user_rejected",
@@ -371,6 +384,16 @@ class TaskRuntime:
         if task.status in TERMINAL_STATUSES:
             raise InvalidTaskTransition(f"Task '{task.id}' is terminal ({task.status}).")
 
+    @staticmethod
+    def _validate_pending_action_event(task: TaskState, event: AgentEvent | None) -> None:
+        if event is None or task.pending_action is None:
+            return
+        expected_id = event.payload.get("pending_action_id")
+        if expected_id is not None and expected_id != task.pending_action.id:
+            raise InvalidTaskTransition(
+                f"Pending action changed for task '{task.id}'. Refresh the task before approving it."
+            )
+
 
 def _event(task: TaskState, *, event_type, source: str, payload: dict) -> AgentEvent:
     return AgentEvent(
@@ -404,7 +427,7 @@ def _resolved_event(
     return replace(
         event,
         task_id=task.id,
-        payload=event.payload or payload,
+        payload={**payload, **event.payload},
         correlation_id=event.correlation_id or task.id,
         expected_version=task.version if event.expected_version is None else event.expected_version,
     )

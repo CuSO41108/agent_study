@@ -37,6 +37,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.context_token_budget, 6000)
         self.assertEqual(config.summary_trigger_tokens, 3000)
         self.assertEqual(config.timeout, 12.5)
+        self.assertEqual(config.search_base_url, "https://api.tavily.com")
+        self.assertEqual(config.search_api_key, "")
+        self.assertEqual(config.search_timeout, 30.0)
+        self.assertEqual(config.search_max_results, 5)
+
+    def test_load_config_reads_search_settings_and_bounds_result_count(self) -> None:
+        config = load_config(
+            workspace_root=self.workspace_root,
+            env={
+                "SEARCH_BASE_URL": "https://search.example.invalid/",
+                "SEARCH_API_KEY": "search-secret",
+                "SEARCH_TIMEOUT": "18",
+                "SEARCH_MAX_RESULTS": "7",
+            },
+        )
+
+        self.assertEqual(config.search_base_url, "https://search.example.invalid")
+        self.assertEqual(config.search_api_key, "search-secret")
+        self.assertEqual(config.search_timeout, 18.0)
+        self.assertEqual(config.search_max_results, 7)
 
     def test_load_config_reads_local_env_file(self) -> None:
         local_env = self.workspace_root / ".agent_app" / ".env.local"
@@ -111,11 +131,15 @@ class ConfigTests(unittest.TestCase):
             {"MODEL_TIMEOUT": "10", "TOOL_TIMEOUT": "abc"},
             {"MODEL_TIMEOUT": "10", "CONTEXT_TOKEN_BUDGET": "0"},
             {"MODEL_TIMEOUT": "10", "SUMMARY_TRIGGER_TOKENS": "abc"},
+            {"SEARCH_TIMEOUT": "0"},
         )
 
         for env in invalid_envs:
             with self.assertRaisesRegex(ValueError, "must be a positive"):
                 load_config(workspace_root=self.workspace_root, env=env)
+
+        with self.assertRaisesRegex(ValueError, "less than or equal to 10"):
+            load_config(workspace_root=self.workspace_root, env={"SEARCH_MAX_RESULTS": "11"})
 
     def test_database_path_lives_under_workspace(self) -> None:
         config = load_config(workspace_root=self.workspace_root, env={})

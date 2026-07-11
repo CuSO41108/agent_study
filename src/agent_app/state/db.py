@@ -202,6 +202,13 @@ def initialize_database(db_path: str | Path) -> None:
         )
         connection.execute(
             """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_per_session
+            ON tasks(session_id)
+            WHERE status IN ('created', 'running', 'waiting_user', 'waiting_tool', 'paused')
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_task_events_task_sequence
             ON task_events(task_id, sequence)
             """

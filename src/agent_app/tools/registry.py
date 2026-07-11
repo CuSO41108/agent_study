@@ -10,6 +10,7 @@ from agent_app.tools.replace_in_file import ReplaceInFileTool
 from agent_app.tools.file_write import FileWriteTool
 from agent_app.tools.shell import ShellTool
 from agent_app.tools.todo import TodoReadTool, TodoWriteTool
+from agent_app.tools.web_search import WebSearchTool
 
 
 class ToolRegistry:
@@ -34,8 +35,10 @@ def build_root_registry(
     subagent_runner=None,
     shell_runtime=None,
     runner=None,
+    web_search_tool: WebSearchTool | None = None,
 ) -> ToolRegistry:
     tools = _build_shared_tools(shell_runtime=shell_runtime, runner=runner)
+    tools.insert(2, web_search_tool or WebSearchTool())
     if subagent_runner is not None:
         tools.insert(2, DelegateTaskTool(runner=subagent_runner))
     return ToolRegistry(tools)
@@ -54,11 +57,13 @@ def build_default_registry(
     subagent_runner=None,
     shell_runtime=None,
     runner=None,
+    web_search_tool: WebSearchTool | None = None,
 ) -> ToolRegistry:
     return build_root_registry(
         subagent_runner=subagent_runner,
         shell_runtime=shell_runtime,
         runner=runner,
+        web_search_tool=web_search_tool,
     )
 
 

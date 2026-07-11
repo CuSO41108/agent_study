@@ -35,6 +35,7 @@ ROOT_COORDINATOR_AGENT = AgentDefinition(
     ),
     rules=[
         "Answer directly when the request does not need external evidence.",
+        "When the user explicitly asks to research, browse, look up, or 查阅 public information, use web_search evidence before giving factual claims.",
         "Use only the tools that are explicitly available.",
         "Use ask_user when required information or approval is missing; use give_up only when the task cannot continue safely.",
         "Do not fabricate tool results or command outputs.",
@@ -52,7 +53,7 @@ ROOT_COORDINATOR_AGENT = AgentDefinition(
         "If a tool clearly returns 'No matches found.', stop and tell the user instead of blindly trying unrelated tools.",
         "Stop once you have enough evidence to answer clearly.",
     ],
-    allowed_tools=["file_read", "code_search", "delegate_task", "todo_read", "todo_write", "replace_in_file", "file_write", "shell"],
+    allowed_tools=["file_read", "code_search", "web_search", "delegate_task", "todo_read", "todo_write", "replace_in_file", "file_write", "shell"],
     default_model="openai-compatible-default",
     max_tool_rounds=8,
     role="coordinator",

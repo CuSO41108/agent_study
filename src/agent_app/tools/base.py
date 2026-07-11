@@ -65,6 +65,12 @@ class Tool(ABC):
     ) -> dict[str, Any]:
         return {"side_effect": self.has_side_effect}
 
+    def has_side_effect_for(self, arguments: dict[str, Any]) -> bool:
+        return self.has_side_effect
+
+    def is_idempotent_for(self, arguments: dict[str, Any]) -> bool:
+        return self.is_idempotent
+
     def can_retry(self, observation: Observation) -> bool:
         return (
             observation.retryable
@@ -156,7 +162,10 @@ def observation_from_tool_result(
 
     error = result.error or "Tool execution failed."
     lowered = error.lower()
-    if "timed out" in lowered or "timeout" in lowered:
+    if lowered.startswith("search_"):
+        error_type = lowered.split(":", 1)[0]
+        retryable = error_type == "search_request_error"
+    elif "timed out" in lowered or "timeout" in lowered:
         error_type = "timeout"
         retryable = True
     elif "not found" in lowered or "no match" in lowered:

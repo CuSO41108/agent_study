@@ -6,6 +6,7 @@ import os
 import shutil
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -13,10 +14,11 @@ from uuid import uuid4
 from agent_app import cli
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.orchestrator.loop import AgentLoop
+from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.registry import build_default_registry
-from agent_app.types import AgentEvent, ModelResponse, ToolCall
+from agent_app.types import AgentEvent, ModelResponse, PendingAction, ToolCall
 
 
 class _FakeModelClient:
@@ -485,9 +487,9 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("/approve", output)
         self.assertIn("Unknown command: /unknown", output)
 
-    @patch("builtins.input", side_effect=["/approve", "quit"])
+    @patch("builtins.input")
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
-    def test_interactive_approve_uses_latest_waiting_task_without_id(self, mock_from_config, _mock_input) -> None:
+    def test_interactive_approve_accepts_task_id_prefix(self, mock_from_config, mock_input) -> None:
         database_path = self.workspace_root / ".agent_app" / "agent.db"
         initialize_database(database_path)
         sessions = SessionService(database_path)
@@ -509,6 +511,7 @@ class CliIntegrationTests(unittest.TestCase):
         waiting = first_loop.run_turn(user_input="update the file")
         self.assertEqual(waiting.task_status, "waiting_user")
         mock_from_config.return_value = _FakeModelClient([_text_response("approved")])
+        mock_input.side_effect = [f"/approve {waiting.task_id[:8]}", "quit"]
 
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -525,6 +528,67 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual((self.workspace_root / "src" / "module.py").read_text(encoding="utf-8"), "print('new')\n")
         actions = sessions.list_tool_actions(waiting.session_id)
         self.assertEqual(len(actions), 1)
+        approval_event = next(
+            event
+            for event in sessions.list_task_events(waiting.task_id)
+            if event.type == "user_approved"
+        )
+        self.assertEqual(
+            approval_event.payload["pending_action_id"],
+            waiting.pending_action.id,
+        )
+
+    def test_repl_approval_rejects_ambiguous_or_unknown_task_prefix(self) -> None:
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=_FakeModelClient([]),
+            tool_registry=build_default_registry(),
+            session_service=sessions,
+            workspace_root=self.workspace_root,
+        )
+        session_id = sessions.create_session("candidate-session")
+        task = sessions.create_task(session_id, goal="candidate")
+        runtime = TaskRuntime(sessions)
+        running = runtime.transition(
+            task.id,
+            target_status="running",
+            event_type="user_message",
+            source="test",
+            reason="test",
+        )
+        waiting = runtime.wait_for_user(
+            running.id,
+            PendingAction(kind="tool_approval", prompt="Approve?"),
+        )
+        candidates = [
+            replace(waiting, id="abc-first"),
+            replace(waiting, id="abc-second"),
+        ]
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), patch.object(sessions, "list_tasks", return_value=candidates):
+            ambiguous = cli._run_repl_task_control(
+                loop=loop,
+                session_service=sessions,
+                session_id=session_id,
+                command="/approve",
+                task_prefix="abc",
+            )
+            missing = cli._run_repl_task_control(
+                loop=loop,
+                session_service=sessions,
+                session_id=session_id,
+                command="/approve",
+                task_prefix="missing",
+            )
+
+        self.assertIsNone(ambiguous)
+        self.assertIsNone(missing)
+        self.assertIn("is ambiguous", stdout.getvalue())
+        self.assertIn("No task matches prefix 'missing'", stdout.getvalue())
 
     @patch("builtins.input", side_effect=["/reject", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")

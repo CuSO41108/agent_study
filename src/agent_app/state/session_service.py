@@ -37,6 +37,15 @@ class TaskVersionConflict(RuntimeError):
     pass
 
 
+class ActiveTaskConflict(RuntimeError):
+    def __init__(self, task: TaskState) -> None:
+        self.task = task
+        super().__init__(
+            f"Session '{task.session_id}' already has active task '{task.id}' "
+            f"in status '{task.status}'. Resume or cancel it, or start a new session."
+        )
+
+
 class TracePersistenceError(RuntimeError):
     pass
 
@@ -114,58 +123,75 @@ class SessionService:
         )
         plan = session_context.todo_items or unfinished_previous_plan or _default_task_plan(goal)
         event_id = str(uuid4())
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO tasks (
-                    id, session_id, parent_task_id, goal, status, step,
-                    plan_json, working_memory_json, pending_action_json,
-                    last_observation_json, reflection, budget_json, stop_reason,
-                    version, waiting_deadline, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'created', 0, ?, '{}', NULL, NULL, NULL, ?, NULL, 1, NULL, ?, ?)
-                """,
-                (
-                    task_id,
-                    session_id,
-                    parent_task_id,
-                    goal,
-                    _todo_items_json(plan),
-                    _json_dumps(asdict(resolved_budget)),
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO task_events (
-                    id, task_id, session_id, event_type, source, payload_json,
-                    correlation_id, causation_id, sequence, created_at
-                ) VALUES (?, ?, ?, 'task_created', 'runtime', ?, NULL, NULL, 1, ?)
-                """,
-                (event_id, task_id, session_id, _json_dumps({"goal": goal}), timestamp),
-            )
-            connection.execute(
-                """
-                INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
-                VALUES (?, ?, 'state_transition', ?, ?)
-                """,
-                (
-                    task_id,
-                    session_id,
-                    _json_dumps({"from": None, "to": "created", "reason": "task_created", "version": 1}),
-                    timestamp,
-                ),
-            )
-            if session_context.todo_items:
+        try:
+            with self._connect() as connection:
+                active_row = connection.execute(
+                    _TASK_SELECT
+                    + """
+                      WHERE session_id = ?
+                        AND status IN ('created', 'running', 'waiting_user', 'waiting_tool', 'paused')
+                      LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if active_row is not None:
+                    raise ActiveTaskConflict(_task_from_row(active_row))
                 connection.execute(
                     """
-                    UPDATE session_context
-                    SET todo_json = '[]', updated_at = ?
-                    WHERE session_id = ?
+                    INSERT INTO tasks (
+                        id, session_id, parent_task_id, goal, status, step,
+                        plan_json, working_memory_json, pending_action_json,
+                        last_observation_json, reflection, budget_json, stop_reason,
+                        version, waiting_deadline, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'created', 0, ?, '{}', NULL, NULL, NULL, ?, NULL, 1, NULL, ?, ?)
                     """,
-                    (timestamp, session_id),
+                    (
+                        task_id,
+                        session_id,
+                        parent_task_id,
+                        goal,
+                        _todo_items_json(plan),
+                        _json_dumps(asdict(resolved_budget)),
+                        timestamp,
+                        timestamp,
+                    ),
                 )
-            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO task_events (
+                        id, task_id, session_id, event_type, source, payload_json,
+                        correlation_id, causation_id, sequence, created_at
+                    ) VALUES (?, ?, ?, 'task_created', 'runtime', ?, NULL, NULL, 1, ?)
+                    """,
+                    (event_id, task_id, session_id, _json_dumps({"goal": goal}), timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                    VALUES (?, ?, 'state_transition', ?, ?)
+                    """,
+                    (
+                        task_id,
+                        session_id,
+                        _json_dumps({"from": None, "to": "created", "reason": "task_created", "version": 1}),
+                        timestamp,
+                    ),
+                )
+                if session_context.todo_items:
+                    connection.execute(
+                        """
+                        UPDATE session_context
+                        SET todo_json = '[]', updated_at = ?
+                        WHERE session_id = ?
+                        """,
+                        (timestamp, session_id),
+                    )
+                row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+        except sqlite3.IntegrityError as exc:
+            active = self.get_active_task(session_id)
+            if active is not None:
+                raise ActiveTaskConflict(active) from exc
+            raise
         assert row is not None
         return _task_from_row(row)
 
@@ -186,6 +212,20 @@ class SessionService:
         with self._connect() as connection:
             row = connection.execute(
                 _TASK_SELECT + " WHERE session_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else _task_from_row(row)
+
+    def get_active_task(self, session_id: str) -> TaskState | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _TASK_SELECT
+                + """
+                  WHERE session_id = ?
+                    AND status IN ('created', 'running', 'waiting_user', 'waiting_tool', 'paused')
+                  ORDER BY updated_at DESC, created_at DESC
+                  LIMIT 1
+                """,
                 (session_id,),
             ).fetchone()
         return None if row is None else _task_from_row(row)
@@ -965,6 +1005,8 @@ FROM tasks
 
 def _task_from_row(row) -> TaskState:
     pending_raw = json.loads(row[8]) if row[8] else None
+    if pending_raw is not None and "id" not in pending_raw:
+        pending_raw["id"] = f"legacy-{row[0]}"
     observation_raw = json.loads(row[9]) if row[9] else None
     budget_raw = json.loads(row[11])
     return TaskState(

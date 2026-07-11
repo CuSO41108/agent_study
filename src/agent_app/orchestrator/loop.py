@@ -219,6 +219,46 @@ class AgentLoop:
             context_token_budget=self._context_token_budget,
             evidence_message=evidence_message,
         )
+        tool_runs: list[ToolResult] = []
+        if _requires_web_research(user_input) and not task.working_memory.get("web_research_preflight_completed"):
+            research_call = ToolCall(
+                id=f"web-research-{task.id}",
+                name="web_search",
+                arguments={"query": user_input},
+            )
+            research_result = self._execute_tool_call(research_call)
+            tool_runs.append(research_result)
+            error_type = _search_stop_reason(research_result.error)
+            self._session_service.append_task_trace(
+                task.id,
+                "research_requirement",
+                {
+                    "tool_call_id": research_call.id,
+                    "required": True,
+                    "success": research_result.success,
+                    "error_type": error_type if not research_result.success else None,
+                    "source_count": _web_search_source_count(research_result.content),
+                },
+            )
+            if not research_result.success:
+                return self._finalize_turn(
+                    session_id=resolved_session_id,
+                    user_input=user_input,
+                    context_message_count=len(provider_messages),
+                    context_token_estimate=sum(
+                        estimate_messages_tokens([StoredMessage(id=index, role=message["role"], content=message.get("content"))])
+                        for index, message in enumerate(provider_messages, start=1)
+                    ),
+                    used_summary=bool(session_context.summary_text),
+                    used_todo=bool(session_context.todo_items),
+                    used_evidence=bool(evidence_message),
+                    final_text=None,
+                    stop_reason=error_type,
+                    tool_runs=tool_runs,
+                    success=False,
+                )
+            task = self._tasks.update_working_memory(task.id, {"web_research_preflight_completed": True})
+            provider_messages.insert(0, {"role": "system", "content": _web_search_observation_message(research_result.content)})
         base_context_message_count = len(provider_messages)
         base_context_token_estimate = sum(
             estimate_messages_tokens([StoredMessage(id=index, role=message["role"], content=message.get("content"))])
@@ -226,9 +266,8 @@ class AgentLoop:
         )
         used_summary = bool(session_context.summary_text)
         used_todo = bool(session_context.todo_items)
-        used_evidence = bool(evidence_message)
+        used_evidence = bool(evidence_message) or bool(tool_runs)
         system_prompt = render_system_prompt(self._agent)
-        tool_runs: list[ToolResult] = []
         tool_rounds = 0
         consecutive_failure_tool: str | None = None
         consecutive_failure_count = 0
@@ -836,6 +875,8 @@ class AgentLoop:
                 error=f"Tool '{tool_call.name}' is not registered.",
             ), approval_decision="deny")
 
+        side_effect = tool.has_side_effect_for(tool_call.arguments)
+
         validation_error = tool.validate_arguments(tool_call.arguments)
         if validation_error is not None:
             return self._record_untracked_tool_result(ToolResult(
@@ -844,7 +885,7 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=validation_error,
-            ), side_effect=tool.has_side_effect, approval_decision="not_requested")
+            ), side_effect=side_effect, approval_decision="not_requested")
 
         approval = approve_tool_call(tool_call.name, tool_call.arguments)
         if approval.decision == "deny":
@@ -854,7 +895,7 @@ class AgentLoop:
                 success=False,
                 content="",
                 error=approval.reason,
-            ), side_effect=tool.has_side_effect, approval_decision="deny")
+            ), side_effect=side_effect, approval_decision="deny")
 
         if approval.decision == "confirm":
             approved_ids = self._tool_context.turn_state.setdefault("approved_tool_calls", set())
@@ -867,7 +908,7 @@ class AgentLoop:
                         success=False,
                         content="",
                         error=error or "Unable to inspect edit.",
-                    ), side_effect=tool.has_side_effect, approval_decision="inspection_failed")
+                    ), side_effect=side_effect, approval_decision="inspection_failed")
 
                 self._tool_context.prepared_edits[tool_call.id] = inspection
                 task_id = self._require_active_task_id()
@@ -935,7 +976,7 @@ class AgentLoop:
                         success=False,
                         content="",
                         error="Tool use denied by user.",
-                    ), side_effect=tool.has_side_effect, approval_decision="reject")
+                    ), side_effect=side_effect, approval_decision="reject")
 
         session_id = self._tool_context.session_id
         if session_id is None:
@@ -957,7 +998,7 @@ class AgentLoop:
                         content="",
                         error=inspection_error or "Unable to revalidate approved action.",
                     ),
-                    side_effect=tool.has_side_effect,
+                    side_effect=side_effect,
                     approval_decision="approve_revalidation_failed",
                 )
             self._tool_context.prepared_edits[tool_call.id] = inspection
@@ -977,7 +1018,7 @@ class AgentLoop:
                         content="",
                         error="Approved action changed since inspection. Please review it again.",
                     ),
-                    side_effect=tool.has_side_effect,
+                    side_effect=side_effect,
                     approval_decision="approve_conflict",
                 )
         retry_of: str | None = None
@@ -993,7 +1034,7 @@ class AgentLoop:
                 )
                 observation = observation_from_tool_result(
                     tool_result,
-                    side_effect=tool.has_side_effect,
+                    side_effect=side_effect,
                     attempt=attempt,
                     duration_ms=0,
                 )
@@ -1012,7 +1053,7 @@ class AgentLoop:
                         "success": False,
                         "error_type": observation.error_type,
                         "retryable": False,
-                        "side_effect": tool.has_side_effect,
+                        "side_effect": side_effect,
                         "budget_blocked": True,
                     },
                 )
@@ -1055,7 +1096,7 @@ class AgentLoop:
                     )
                     status = "succeeded" if tool_result.success else "failed"
                 except Exception as exc:
-                    if tool.has_side_effect:
+                    if side_effect:
                         status, tool_result = self._classify_tool_action_recovery(action)
                     else:
                         status = "failed"
@@ -1077,7 +1118,7 @@ class AgentLoop:
 
             observation = observation_from_tool_result(
                 tool_result,
-                side_effect=tool.has_side_effect,
+                side_effect=side_effect,
                 attempt=attempt,
                 duration_ms=duration_ms,
             )
@@ -1118,7 +1159,8 @@ class AgentLoop:
                     "duration_ms": duration_ms,
                 },
             )
-            if tool_result.success or not tool.can_retry(observation) or attempt > task.budget.max_retries:
+            can_retry = observation.retryable and (not side_effect or tool.is_idempotent_for(tool_call.arguments))
+            if tool_result.success or not can_retry or attempt > task.budget.max_retries:
                 return tool_result
             retry_of = action.id
             self._session_service.append_task_trace(
@@ -1850,6 +1892,37 @@ def _estimate_response_tokens(messages: list[dict[str, Any]], response: ModelRes
     if response.tool_calls:
         payload += json.dumps(_decision_payload(response), ensure_ascii=False)
     return max(1, (len(payload.encode("utf-8")) + 3) // 4)
+
+
+def _requires_web_research(user_input: str) -> bool:
+    normalized = user_input.casefold()
+    phrases = ("查阅", "联网检索", "搜索网页", "网上搜索", "web search", "browse the web", "look up")
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _search_stop_reason(error_message: str | None) -> str:
+    if error_message:
+        match = re.match(r"(search_[a-z_]+):", error_message.casefold())
+        if match:
+            return match.group(1)
+    return "search_configuration_error"
+
+
+def _web_search_source_count(content: str) -> int:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return 0
+    sources = payload.get("sources") if isinstance(payload, dict) else None
+    return len(sources) if isinstance(sources, list) else 0
+
+
+def _web_search_observation_message(content: str) -> str:
+    return (
+        "A required public-web search completed before this response. Use only the following source-backed "
+        "evidence for factual claims that depend on the research request, and include relevant source URLs in the final answer.\n"
+        f"Search observation: {content}"
+    )
 
 
 def _uncertain_file_recovery_result(action: ToolAction, detail: str) -> tuple[str, ToolResult]:
