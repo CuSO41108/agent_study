@@ -48,8 +48,8 @@ def load_config(
         "MODEL_TIMEOUT",
         env_map.get("MODEL_TIMEOUT", local_values.get("MODEL_TIMEOUT", "30")),
     )
-    tool_timeout_raw = env_map.get("TOOL_TIMEOUT", local_values.get("TOOL_TIMEOUT"))
-    tool_timeout = model_timeout if tool_timeout_raw is None else _load_positive_timeout("TOOL_TIMEOUT", tool_timeout_raw)
+    tool_timeout_raw = env_map.get("TOOL_TIMEOUT", local_values.get("TOOL_TIMEOUT", "600"))
+    tool_timeout = _load_positive_timeout("TOOL_TIMEOUT", tool_timeout_raw)
     context_token_budget = _load_positive_int(
         "CONTEXT_TOKEN_BUDGET",
         env_map.get("CONTEXT_TOKEN_BUDGET", local_values.get("CONTEXT_TOKEN_BUDGET", "6000")),

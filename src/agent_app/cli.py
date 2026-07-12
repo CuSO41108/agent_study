@@ -21,7 +21,6 @@ from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_rep
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry
 from agent_app.tools.web_search import WebSearchTool
-from agent_app.tools.shell import ShellInspection, ShellTool
 from agent_app.types import AgentEvent, TaskState, ToolCall, TurnResult
 
 
@@ -188,9 +187,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 
-def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionContext) -> bool:
+def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionContext) -> bool | str:
     prompt_text = _build_confirmation_prompt(tool_call, context)
     print(prompt_text)
+    if tool_call.name == "shell":
+        decision = input("Approve once [y], allow this prefix for this session [a], or reject [N]? ").strip().lower()
+        return "session" if decision in {"a", "allow"} else decision in {"y", "yes"}
     decision = input("Approve this action? [y/N]: ").strip().lower()
     return decision in {"y", "yes"}
 
@@ -198,17 +200,11 @@ def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionCont
 
 def _build_confirmation_prompt(tool_call: ToolCall, context: ToolExecutionContext) -> str:
     if tool_call.name == "shell":
-        inspection = context.prepared_edits.get(tool_call.id)
-        if not isinstance(inspection, ShellInspection):
-            inspection, error = ShellTool().inspect(arguments=tool_call.arguments, context=context)
-            if inspection is None:
-                return f"Shell action confirmation\nValidation unavailable: {error}"
         return (
             "Shell action confirmation\n"
-            f"Risk: {inspection.controlled.risk_level} workspace change\n"
-            f"Operation: {inspection.controlled.operation}\n"
-            f"Command: {inspection.controlled.command}\n"
-            "Affected paths:\n" + "\n".join(f"- {path}" for path in inspection.paths)
+            "Risk: high — command runs with your local user permissions\n"
+            f"Working directory: {context.workspace_root}\n"
+            f"Command: {tool_call.arguments.get('command', '<unknown>')}"
         )
     if tool_call.name == "file_write":
         inspection, error = _resolve_file_write_confirmation_inspection(tool_call=tool_call, context=context)

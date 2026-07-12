@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from agent_app.tools.approval import approve_tool_call, parse_controlled_shell_command, validate_shell_command
+from agent_app.tools.approval import approve_tool_call, command_matches_prefix, shell_approval_prefix, validate_shell_command
 from agent_app.tools.base import ToolExecutionContext
 from agent_app.tools.code_search import CodeSearchTool
 from agent_app.tools.delegate_task import DelegateTaskTool
@@ -91,10 +91,10 @@ class ToolLayerTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             registry.get_required("missing")
 
-    def test_approval_auto_allows_file_read_and_safe_shell(self) -> None:
+    def test_approval_auto_allows_read_tools_and_confirms_shell(self) -> None:
         self.assertEqual(approve_tool_call("file_read", {"path": "sample.txt"}).decision, "allow")
         self.assertEqual(approve_tool_call("web_search", {"query": "example"}).decision, "allow")
-        self.assertEqual(approve_tool_call("shell", {"command": "git status --short"}).decision, "allow")
+        self.assertEqual(approve_tool_call("shell", {"command": "git status --short"}).decision, "confirm")
         self.assertEqual(approve_tool_call("todo_read", {}).decision, "allow")
         self.assertEqual(approve_tool_call("todo_write", {"items": []}).decision, "allow")
         self.assertEqual(
@@ -107,24 +107,16 @@ class ToolLayerTests(unittest.TestCase):
             "confirm",
         )
 
-    def test_controlled_shell_commands_require_approval_and_reject_operators(self) -> None:
+    def test_shell_commands_require_approval_and_only_reject_forbidden_recursive_deletion(self) -> None:
         self.assertEqual(approve_tool_call("shell", {"command": "New-Item -ItemType Directory -Path outputs -Force"}).decision, "confirm")
         self.assertEqual(approve_tool_call("shell", {"command": "Move-Item -Path sample.txt -Destination src/sample.txt"}).decision, "confirm")
         self.assertEqual(approve_tool_call("shell", {"command": "Remove-Item -Recurse outputs"}).decision, "deny")
-        self.assertEqual(approve_tool_call("shell", {"command": "New-Item -ItemType Directory -Path outputs; whoami"}).decision, "deny")
-        self.assertEqual(parse_controlled_shell_command("Copy-Item -Path sample.txt -Destination src/copy.txt").operation, "copy")
-
-    def test_controlled_shell_inspection_enforces_workspace_and_destination_rules(self) -> None:
-        tool = ShellTool()
-        inspection, error = tool.inspect(arguments={"command": "New-Item -ItemType Directory -Path outputs -Force"}, context=self.context)
-        self.assertIsNotNone(inspection)
-        self.assertIsNone(error)
-        inspection, error = tool.inspect(arguments={"command": "Move-Item -Path sample.txt -Destination src/app.py"}, context=self.context)
-        self.assertIsNone(inspection)
-        self.assertIn("already exists", error)
-        inspection, error = tool.inspect(arguments={"command": "Move-Item -Path sample.txt -Destination ../outside.txt"}, context=self.context)
-        self.assertIsNone(inspection)
-        self.assertIn("escapes", error)
+        self.assertEqual(approve_tool_call("shell", {"command": "New-Item -ItemType Directory -Path outputs; whoami"}).decision, "confirm")
+        self.assertEqual(approve_tool_call("shell", {"command": "Remove-Item -Path one-file.txt"}).decision, "confirm")
+        self.assertEqual(approve_tool_call("shell", {"command": "del /s outputs"}).decision, "deny")
+        self.assertEqual(shell_approval_prefix("python -m unittest discover -s tests"), "python -m unittest")
+        self.assertTrue(command_matches_prefix("git status --short", "git status"))
+        self.assertFalse(command_matches_prefix("git statusx", "git status"))
 
     def test_root_registry_includes_delegate_task_and_worker_registry_does_not(self) -> None:
         runner = SubagentRunner(
@@ -148,11 +140,10 @@ class ToolLayerTests(unittest.TestCase):
         self.assertEqual(result.decision, "deny")
         self.assertIn("not available", result.reason)
 
-    def test_approval_rejects_non_whitelisted_shell_command(self) -> None:
+    def test_approval_confirms_arbitrary_shell_command(self) -> None:
         result = approve_tool_call("shell", {"command": "python -c \"print(1)\""})
 
-        self.assertEqual(result.decision, "deny")
-        self.assertIn("whitelist", result.reason)
+        self.assertEqual(result.decision, "confirm")
 
     def test_shell_validation_rejects_empty_command(self) -> None:
         approved, reason = validate_shell_command("")
@@ -160,18 +151,17 @@ class ToolLayerTests(unittest.TestCase):
         self.assertFalse(approved)
         self.assertIn("non-empty string", reason)
 
-    def test_shell_validation_explains_powershell_compatibility(self) -> None:
+    def test_shell_validation_allows_powershell_and_cmd_syntax_for_user_review(self) -> None:
         approved, reason = validate_shell_command("dir /b src")
 
-        self.assertFalse(approved)
-        self.assertIn("PowerShell", reason)
-        self.assertIn("Get-ChildItem", reason)
+        self.assertTrue(approved)
+        self.assertIn("user approval", reason)
 
-    def test_shell_validation_explains_unix_recursion_hint(self) -> None:
+    def test_shell_validation_allows_unix_style_command_for_user_review(self) -> None:
         approved, reason = validate_shell_command("ls -r src")
 
-        self.assertFalse(approved)
-        self.assertIn("Get-ChildItem -Recurse", reason)
+        self.assertTrue(approved)
+        self.assertIn("user approval", reason)
 
     def test_file_read_reads_workspace_file(self) -> None:
         tool = FileReadTool()
@@ -495,8 +485,11 @@ class ToolLayerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error, "Code search timed out.")
 
-    def test_shell_rejects_redirects(self) -> None:
-        tool = ShellTool()
+    def test_shell_allows_redirects_after_approval(self) -> None:
+        def _runner(*args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        tool = ShellTool(runner=_runner)
 
         result = tool.execute(
             tool_call_id="call-1",
@@ -504,8 +497,7 @@ class ToolLayerTests(unittest.TestCase):
             context=self.context,
         )
 
-        self.assertFalse(result.success)
-        self.assertIn("disallowed", result.error)
+        self.assertTrue(result.success)
 
     def test_shell_returns_timeout_error(self) -> None:
         def _timeout_runner(*args, **kwargs):
