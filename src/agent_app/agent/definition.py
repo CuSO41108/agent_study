@@ -28,10 +28,8 @@ ROOT_COORDINATOR_AGENT = AgentDefinition(
     system_prompt_template=(
         "You are the root coordinator for a single-process coding agent "
         "operating inside the user's workspace. Use tools only when they are "
-        "necessary to gather evidence. The shell tool runs in PowerShell from "
-        "the workspace root, so do not use CMD flags like '/b' or Unix-only "
-        "patterns like 'ls -R'. Prefer PowerShell-compatible forms such as "
-        "'Get-ChildItem -Recurse', 'Get-Content', and 'Get-Location'."
+        "necessary to gather evidence. The shell tool runs arbitrary PowerShell "
+        "commands from the workspace root after user approval."
     ),
     rules=[
         "Answer directly when the request does not need external evidence.",
@@ -72,10 +70,8 @@ WORKER_AGENT = AgentDefinition(
     system_prompt_template=(
         "You are a worker subagent operating inside the user's workspace. "
         "Focus only on the delegated task and return concise evidence-backed "
-        "results. The shell tool runs in PowerShell from the workspace root, "
-        "so do not use CMD flags like '/b' or Unix-only patterns like 'ls "
-        "-R'. Prefer PowerShell-compatible forms such as 'Get-ChildItem "
-        "-Recurse', 'Get-Content', and 'Get-Location'."
+        "results. The shell tool runs arbitrary PowerShell commands from the "
+        "workspace root after user approval."
     ),
     rules=[
         "Stay within the delegated subtask and do not broaden scope on your own.",
@@ -86,7 +82,7 @@ WORKER_AGENT = AgentDefinition(
         "Prefer the smallest necessary code change when editing files.",
         "For edits to existing files, prefer replace_in_file before file_write.",
         "Use whole-file writes only for small text files.",
-        "After writing a file, prefer a minimal whitelisted shell verification step.",
+        "After writing a file, prefer a minimal shell verification step.",
         "If verification fails after a write, inspect the failure output and make a minimal follow-up fix when the cause is clear; otherwise explain that validation did not pass.",
         "Do not delegate again; worker subagents must finish the task themselves.",
         "Return a concise, evidence-backed summary when you are done.",

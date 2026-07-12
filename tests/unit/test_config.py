@@ -33,7 +33,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.api_key, "secret")
         self.assertEqual(config.model, "qwen-plus")
         self.assertEqual(config.model_timeout, 12.5)
-        self.assertEqual(config.tool_timeout, 12.5)
+        self.assertEqual(config.tool_timeout, 600.0)
         self.assertEqual(config.context_token_budget, 6000)
         self.assertEqual(config.summary_trigger_tokens, 3000)
         self.assertEqual(config.timeout, 12.5)
@@ -74,7 +74,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.api_key, "from-local")
         self.assertEqual(config.model, "qwen-local")
         self.assertEqual(config.model_timeout, 15.0)
-        self.assertEqual(config.tool_timeout, 15.0)
+        self.assertEqual(config.tool_timeout, 600.0)
 
     def test_environment_variables_override_local_env_file(self) -> None:
         local_env = self.workspace_root / ".agent_app" / ".env.local"
@@ -107,7 +107,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.context_token_budget, 7200)
         self.assertEqual(config.summary_trigger_tokens, 3600)
 
-    def test_tool_timeout_falls_back_to_model_timeout_when_unset(self) -> None:
+    def test_tool_timeout_defaults_to_ten_minutes_when_unset(self) -> None:
         local_env = self.workspace_root / ".agent_app" / ".env.local"
         local_env.write_text(
             "MODEL_BASE_URL=https://example.invalid/v1\n"
@@ -120,7 +120,7 @@ class ConfigTests(unittest.TestCase):
         config = load_config(workspace_root=self.workspace_root, env={})
 
         self.assertEqual(config.model_timeout, 18.0)
-        self.assertEqual(config.tool_timeout, 18.0)
+        self.assertEqual(config.tool_timeout, 600.0)
 
     def test_load_config_rejects_invalid_timeout_values(self) -> None:
         invalid_envs = (

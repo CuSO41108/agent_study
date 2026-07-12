@@ -7,6 +7,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from agent_app.agent.definition import AgentDefinition
 from agent_app.agent.prompts import render_system_prompt
@@ -17,7 +18,7 @@ from agent_app.state.session_service import (
     TaskVersionConflict,
     TracePersistenceError,
 )
-from agent_app.tools.approval import approve_tool_call
+from agent_app.tools.approval import ApprovalResult, approve_tool_call, command_matches_prefix, shell_approval_prefix
 from agent_app.tools.base import ToolExecutionContext, observation_from_tool_result
 from agent_app.tools.registry import ToolRegistry
 from agent_app.types import (
@@ -36,7 +37,7 @@ from agent_app.types import (
     TurnResult,
 )
 
-ConfirmationHandler = Callable[[ToolCall, ToolExecutionContext], bool]
+ConfirmationHandler = Callable[[ToolCall, ToolExecutionContext], bool | str]
 
 
 class InvalidTaskEvent(RuntimeError):
@@ -63,7 +64,7 @@ class AgentLoop:
             raise ValueError("Only one of 'tool_timeout' or 'shell_timeout' may be provided.")
         resolved_tool_timeout = tool_timeout if tool_timeout is not None else shell_timeout
         if resolved_tool_timeout is None:
-            resolved_tool_timeout = 15.0
+            resolved_tool_timeout = 600.0
 
         self._agent = agent
         self._model_client = model_client
@@ -79,6 +80,8 @@ class AgentLoop:
         )
         self._confirmation_handler = confirmation_handler
         self._tasks = TaskRuntime(session_service)
+        self._process_id = str(uuid4())
+        self._session_shell_prefixes: dict[str, set[str]] = {}
         self._active_task_id: str | None = None
         self._turn_started_at: float | None = None
 
@@ -185,7 +188,7 @@ class AgentLoop:
         self._tool_context = replace(
             self._tool_context,
             prepared_edits={},
-            turn_state={},
+            turn_state={"shell_approval_prefixes": self._session_shell_prefixes.setdefault(resolved_session_id, set())},
             session_id=resolved_session_id,
             task_id=task.id,
             session_service=self._session_service,
@@ -669,6 +672,19 @@ class AgentLoop:
             raise InvalidTaskEvent(f"Task '{task.id}' is not waiting for user input.")
 
         pending = task.pending_action
+        if (
+            pending.kind == "tool_approval"
+            and pending.decision is not None
+            and pending.decision.get("tool_name") == "shell"
+            and pending.decision.get("approval_process_id") != self._process_id
+        ):
+            task = self._tasks.reject(task.id)
+            self._session_service.append_task_trace(
+                task.id,
+                "approval",
+                {"tool": "shell", "decision": "expired", "reason": "process_restarted"},
+            )
+            return self._task_result(task, final_text=None, stop_reason="shell_approval_expired", success=False)
         if event.type == "user_approved":
             task = self._tasks.approve(task.id, event=event)
         else:
@@ -697,6 +713,7 @@ class AgentLoop:
                 "approved_action_metadata": {
                     tool_call.id: dict(pending.decision.get("approval_metadata", {}))
                 },
+                "shell_approval_prefixes": self._session_shell_prefixes.setdefault(task.session_id, set()),
             },
             session_id=task.session_id,
             task_id=task.id,
@@ -888,6 +905,11 @@ class AgentLoop:
             ), side_effect=side_effect, approval_decision="not_requested")
 
         approval = approve_tool_call(tool_call.name, tool_call.arguments)
+        if tool_call.name == "shell" and approval.decision == "confirm":
+            command = tool_call.arguments.get("command")
+            prefixes = self._tool_context.turn_state.get("shell_approval_prefixes", set())
+            if isinstance(command, str) and any(command_matches_prefix(command, prefix) for prefix in prefixes):
+                approval = ApprovalResult("allow", "Allowed by a user-approved session prefix.")
         if approval.decision == "deny":
             return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
@@ -900,17 +922,23 @@ class AgentLoop:
         if approval.decision == "confirm":
             approved_ids = self._tool_context.turn_state.setdefault("approved_tool_calls", set())
             if tool_call.id not in approved_ids:
-                inspection, error = tool.inspect(arguments=tool_call.arguments, context=self._tool_context)
-                if inspection is None:
-                    return self._record_untracked_tool_result(ToolResult(
+                approval_metadata: dict[str, Any] = {"side_effect": True} if tool_call.name == "shell" else {}
+                if tool_call.name != "shell":
+                    inspection, error = tool.inspect(arguments=tool_call.arguments, context=self._tool_context)
+                    if inspection is None:
+                        return self._record_untracked_tool_result(ToolResult(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            success=False,
+                            content="",
+                            error=error or "Unable to inspect edit.",
+                        ), side_effect=side_effect, approval_decision="inspection_failed")
+                    self._tool_context.prepared_edits[tool_call.id] = inspection
+                    approval_metadata = tool.recovery_metadata(
                         tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        success=False,
-                        content="",
-                        error=error or "Unable to inspect edit.",
-                    ), side_effect=side_effect, approval_decision="inspection_failed")
-
-                self._tool_context.prepared_edits[tool_call.id] = inspection
+                        arguments=tool_call.arguments,
+                        context=self._tool_context,
+                    )
                 task_id = self._require_active_task_id()
                 pending = PendingAction(
                     kind="tool_approval",
@@ -920,11 +948,8 @@ class AgentLoop:
                         "tool_call_id": tool_call.id,
                         "tool_name": tool_call.name,
                         "arguments": tool_call.arguments,
-                        "approval_metadata": tool.recovery_metadata(
-                            tool_call_id=tool_call.id,
-                            arguments=tool_call.arguments,
-                            context=self._tool_context,
-                        ),
+                        "approval_metadata": approval_metadata,
+                        "approval_process_id": self._process_id,
                     },
                 )
                 self._tasks.wait_for_user(task_id, pending)
@@ -957,10 +982,18 @@ class AgentLoop:
                 if confirmed:
                     self._tasks.approve(task_id)
                     approved_ids.add(tool_call.id)
+                    approval_decision = "approve"
+                    if confirmed == "session" and tool_call.name == "shell":
+                        command = tool_call.arguments.get("command")
+                        if isinstance(command, str):
+                            prefix = shell_approval_prefix(command)
+                            if prefix:
+                                self._tool_context.turn_state.setdefault("shell_approval_prefixes", set()).add(prefix)
+                                approval_decision = "approve_session_prefix"
                     self._session_service.append_task_trace(
                         task_id,
                         "approval",
-                        {"tool": tool_call.name, "decision": "approve", "tool_call_id": tool_call.id},
+                        {"tool": tool_call.name, "decision": approval_decision, "tool_call_id": tool_call.id},
                     )
                 else:
                     self._tasks.reject(task_id)
@@ -1067,7 +1100,7 @@ class AgentLoop:
             action = self._session_service.prepare_tool_action(
                 session_id,
                 agent_id=self._agent.id,
-                tool_call=tool_call,
+                tool_call=_persisted_tool_call(tool_call),
                 recovery_metadata=recovery_metadata,
                 task_id=task_id,
                 attempt=attempt,
@@ -1130,7 +1163,7 @@ class AgentLoop:
                 {
                     "tool_call_id": tool_call.id,
                     "tool": tool_call.name,
-                    "arguments": tool_call.arguments,
+                    "arguments": _audit_arguments(tool_call),
                     "arguments_hash": hashlib.sha256(
                         json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True).encode("utf-8")
                     ).hexdigest(),
@@ -1923,6 +1956,27 @@ def _web_search_observation_message(content: str) -> str:
         "evidence for factual claims that depend on the research request, and include relevant source URLs in the final answer.\n"
         f"Search observation: {content}"
     )
+
+
+def _persisted_tool_call(tool_call: ToolCall) -> ToolCall:
+    if tool_call.name != "shell":
+        return tool_call
+    return ToolCall(
+        id=tool_call.id,
+        name=tool_call.name,
+        arguments={"command_sha256": _shell_command_sha256(tool_call.arguments)},
+    )
+
+
+def _audit_arguments(tool_call: ToolCall) -> dict[str, Any]:
+    if tool_call.name != "shell":
+        return tool_call.arguments
+    return {"command_redacted": True, "command_sha256": _shell_command_sha256(tool_call.arguments)}
+
+
+def _shell_command_sha256(arguments: dict[str, Any]) -> str:
+    command = arguments.get("command")
+    return hashlib.sha256(str(command).encode("utf-8")).hexdigest()
 
 
 def _uncertain_file_recovery_result(action: ToolAction, detail: str) -> tuple[str, ToolResult]:

@@ -15,7 +15,7 @@ from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.file_write import FileWriteTool, inspect_file_write_request
 from agent_app.tools.registry import build_default_registry, build_root_registry
-from agent_app.types import ModelResponse, ToolCall, ToolResult
+from agent_app.types import AgentEvent, ModelResponse, ToolCall, ToolResult
 
 
 class _FakeModelClient:
@@ -249,6 +249,54 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue((self.workspace_root / "README.md").exists())
         self.assertFalse((self.workspace_root / "outputs" / "README.md").exists())
 
+    def test_shell_session_prefix_skips_later_confirmation(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="shell-1", name="shell", arguments={"command": "git status --short"})]),
+            _text_response("first"),
+            _tool_call_response([ToolCall(id="shell-2", name="shell", arguments={"command": "git status --branch"})]),
+            _text_response("second"),
+        ])
+        confirmations: list[str] = []
+        loop = self._build_loop(
+            model,
+            confirmation_handler=lambda call, _context: confirmations.append(call.arguments["command"]) or "session",
+        )
+        tool = self.registry.get_required("shell")
+        outcomes = [
+            ToolResult(tool_call_id="shell-1", tool_name="shell", success=True, content="", error=None),
+            ToolResult(tool_call_id="shell-2", tool_name="shell", success=True, content="", error=None),
+        ]
+
+        with patch.object(tool, "execute", side_effect=outcomes):
+            first = loop.run_turn(user_input="check status")
+            second = loop.run_turn(user_input="check status again", session_id=first.session_id)
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(confirmations, ["git status --short"])
+
+    def test_shell_pending_approval_expires_after_process_restart(self) -> None:
+        model = _FakeModelClient([_tool_call_response([ToolCall(id="shell-1", name="shell", arguments={"command": "git status --short"})])])
+        first_loop = self._build_loop(model)
+
+        waiting = first_loop.run_turn(user_input="check status")
+        task = self.sessions.get_task(waiting.task_id)
+        restarted_loop = self._build_loop(_FakeModelClient([]))
+        result = restarted_loop.handle_event(
+            AgentEvent(
+                id="approve-after-restart",
+                task_id=task.id,
+                session_id=task.session_id,
+                type="user_approved",
+                source="test",
+                payload={"pending_action_id": task.pending_action.id},
+                expected_version=task.version,
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "shell_approval_expired")
+
     def test_missing_confirmation_handler_persists_waiting_user(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_write", arguments={"path": "src/module.py", "content": "print('new')\n"})]),
@@ -398,7 +446,7 @@ class AgentLoopTests(unittest.TestCase):
     def test_write_then_failed_shell_keeps_written_content(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_write", arguments={"path": "src/module.py", "content": "print('new')\n"})]),
-            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"print(1)\""})]),
+            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"import sys; sys.exit(1)\""})]),
             _text_response("The change was written, but validation did not pass."),
         ])
         loop = self._build_loop(model, confirmation_handler=lambda tool_call, context: True)
@@ -526,10 +574,10 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_repeated_failed_tool_stops_after_second_failure(self) -> None:
         model = _FakeModelClient([
-            _tool_call_response([ToolCall(id="call-1", name="shell", arguments={"command": "python -c \"print(1)\""})]),
-            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"print(1)\""})]),
+            _tool_call_response([ToolCall(id="call-1", name="shell", arguments={"command": "python -c \"import sys; sys.exit(1)\""})]),
+            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"import sys; sys.exit(1)\""})]),
         ])
-        loop = self._build_loop(model)
+        loop = self._build_loop(model, confirmation_handler=lambda _call, _context: True)
 
         result = loop.run_turn(user_input="try shell twice")
 
@@ -587,10 +635,10 @@ class AgentLoopTests(unittest.TestCase):
     def test_repeated_failures_can_fall_back_to_file_read_evidence(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"})]),
-            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"print(1)\""})]),
-            _tool_call_response([ToolCall(id="call-3", name="shell", arguments={"command": "python -c \"print(1)\""})]),
+            _tool_call_response([ToolCall(id="call-2", name="shell", arguments={"command": "python -c \"import sys; sys.exit(1)\""})]),
+            _tool_call_response([ToolCall(id="call-3", name="shell", arguments={"command": "python -c \"import sys; sys.exit(1)\""})]),
         ])
-        loop = self._build_loop(model)
+        loop = self._build_loop(model, confirmation_handler=lambda _call, _context: True)
 
         result = loop.run_turn(user_input="README 说了什么")
 
