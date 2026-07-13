@@ -27,7 +27,7 @@ agent-app "src/agent_app/state/ 目录下有哪些文件，各自负责什么"
 
 **TaskState 持久化状态机** — 每个用户目标都有独立的生命周期（created → running → waiting_user → completed/failed/cancelled），状态迁移以事务和乐观锁保证一致性。任务可以在一个进程中暂停、在另一个进程中恢复审批，所有中间状态落 SQLite。
 
-**受控 Shell 审批** — 只读白名单命令（git status、dir、Get-Content 等）自动放行；目录创建、文件移动和复制进入审批流程并追踪受影响路径；递归删除、管道组合、越界路径硬拒绝，拒绝原因写入 trace。
+**通用 Shell 审批** — Agent 可从 workspace 根目录执行 PowerShell 命令；默认逐条人工审批，也可仅在当前 session 内对用户明确选择的命令前缀免审批。递归/批量删除保持硬拒绝，重启后待审批 Shell 命令自动失效。
 
 **副作用安全与崩溃恢复** — 文件编辑和 Shell 变更执行前持久化 ToolAction 与幂等键。有副作用的操作崩溃后不自动重试，而是要求用户重新审批，避免写入重复或不确定状态。
 
@@ -37,7 +37,7 @@ agent-app "src/agent_app/state/ 目录下有哪些文件，各自负责什么"
 
 **Eval 评测闭环** — 20 个固定任务覆盖文件编辑、shell 边界、工具预算等场景。支持 dry-run 和 live-model 两种模式，保留工作区快照，输出 JSONL 报告。
 
-**完整 Trace 可观测** — 模型调用、审批决策、工具执行、预算快照和状态迁移按 task_id 即时关联，支持跨进程回溯问题根因。247 项测试，核心代码覆盖率 90%。
+**完整 Trace 可观测** — 模型调用、审批决策、工具执行、预算快照和状态迁移按 task_id 持久化关联。`--task-trace` 提供任务结束后的可回放时间线，REPL `/trace` 自动查看当前活跃任务（无活跃任务时查看最新任务）；`--watch-trace` 以本地轮询方式持续输出新增事件，提供接近 SSE 的终端跟随体验；`--task-trace-json` 用于程序化导出。251 项测试，核心代码覆盖率 90%。
 
 ## 日常使用
 
@@ -53,6 +53,7 @@ agent-app "hello" --new-session  # 开启新 session
 |---|---|
 | `/task` | 查看当前 session 最新 task |
 | `/tasks` | 列出当前 session 所有 task |
+| `/trace [task-id前缀]` | 查看 task 的持久化 Trace 时间线 |
 | `/approve [task-id前缀]` | 批准待审批的工具动作 |
 | `/reject [task-id前缀]` | 拒绝待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态 task |
@@ -64,6 +65,10 @@ agent-app "hello" --new-session  # 开启新 session
 
 ```powershell
 agent-app --task-status TASK_ID     # 查看 task 状态
+agent-app --task-trace TASK_ID      # 查看可回放 Trace 时间线
+agent-app --task-trace-json TASK_ID # 导出结构化 Trace JSON
+agent-app --watch-trace             # 跟随当前活跃/最新 task 的新增事件
+agent-app --watch-trace TASK_ID     # 跟随指定 task 的新增事件
 agent-app --approve-task TASK_ID    # 批准
 agent-app --reject-task TASK_ID     # 拒绝
 agent-app --cancel-task TASK_ID     # 取消

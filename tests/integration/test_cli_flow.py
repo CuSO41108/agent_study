@@ -50,6 +50,31 @@ class CliIntegrationTests(unittest.TestCase):
         shutil.rmtree(self.workspace_root, ignore_errors=True)
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_renders_and_exports_task_trace(self, mock_from_config) -> None:
+        mock_from_config.return_value = _FakeModelClient([])
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        session_id = sessions.create_session("trace-session")
+        task = sessions.create_task(session_id, goal="trace this task")
+        sessions.append_task_trace(task.id, "tool_attempt", {"tool": "file_read", "success": True, "duration_ms": 8})
+
+        timeline_stdout = io.StringIO()
+        with redirect_stdout(timeline_stdout):
+            timeline_code = cli.main(["--task-trace", task.id, "--workspace-root", str(self.workspace_root)])
+        json_stdout = io.StringIO()
+        with redirect_stdout(json_stdout):
+            json_code = cli.main(["--task-trace-json", task.id, "--workspace-root", str(self.workspace_root)])
+
+        self.assertEqual(timeline_code, 0)
+        self.assertIn("Trace:", timeline_stdout.getvalue())
+        self.assertIn("file_read / success / 8 ms", timeline_stdout.getvalue())
+        self.assertEqual(json_code, 0)
+        exported = json.loads(json_stdout.getvalue())
+        self.assertEqual(exported["trace_id"], task.id)
+        self.assertEqual(exported["schema_version"], 1)
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_runs_full_turn_and_persists_session_data(self, mock_from_config) -> None:
         mock_from_config.return_value = _FakeModelClient(
             [

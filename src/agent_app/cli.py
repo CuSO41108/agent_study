@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Sequence
@@ -13,6 +14,7 @@ from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.config import load_config
 from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
+from agent_app.observability import export_task_trace, render_task_timeline, render_trace_events
 from agent_app.orchestrator.loop import AgentLoop
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import ActiveTaskConflict, SessionService
@@ -28,6 +30,8 @@ _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "expired"}
 _REPL_HELP = """Commands:
   /task       Show the latest task in this session.
   /tasks      List tasks in this session.
+  /trace [task-id-prefix]
+              Show the active task trace, or the latest task when none is active.
   /approve [task-id-prefix]
               Approve a task waiting for tool approval.
   /reject [task-id-prefix]
@@ -71,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
     controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
     controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
+    controls.add_argument("--task-trace", metavar="TASK_ID", help="Show a persisted task trace timeline.")
+    controls.add_argument("--task-trace-json", metavar="TASK_ID", help="Export a persisted task trace as JSON.")
+    controls.add_argument("--watch-trace", nargs="?", const="latest", metavar="TASK_ID", help="Follow a task trace; omit TASK_ID for the active/latest task.")
     return parser
 
 
@@ -130,6 +137,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if control is not None:
         action, task_id = control
+        if task_id == "latest":
+            latest = sessions.get_active_task(resolved_session_id) or sessions.get_latest_task(resolved_session_id)
+            if latest is None:
+                print("Task error: no task exists in the selected session.", file=sys.stderr)
+                return 1
+            task_id = latest.id
+        if action in {"trace", "trace_json", "watch_trace"}:
+            try:
+                trace = export_task_trace(sessions, task_id)
+            except KeyError:
+                print(f"Task error: task '{task_id}' was not found.", file=sys.stderr)
+                return 1
+            if action == "trace_json":
+                print(json.dumps(trace, default=_serialize, ensure_ascii=False))
+            elif action == "watch_trace":
+                _watch_task_trace(sessions, task_id)
+            else:
+                print(render_task_timeline(trace))
+            return 0
         try:
             task = loop.get_task(task_id)
         except KeyError:
@@ -302,6 +328,9 @@ def _selected_task_control(args) -> tuple[str, str] | None:
         ("cancel", "cancel_task"),
         ("approve", "approve_task"),
         ("reject", "reject_task"),
+        ("trace", "task_trace"),
+        ("trace_json", "task_trace_json"),
+        ("watch_trace", "watch_trace"),
     ):
         value = getattr(args, attribute, None)
         if value:
@@ -378,6 +407,13 @@ def _run_interactive_loop(
             continue
         command, _, raw_target = stripped.partition(" ")
         command = command.lower()
+        if command == "/trace":
+            tasks = session_service.list_tasks(current_session_id)
+            target = raw_target.strip() or None
+            task = _select_trace_task(tasks, task_prefix=target, command=command)
+            if task is not None:
+                print(render_task_timeline(export_task_trace(session_service, task.id)))
+            continue
         if command in {"/approve", "/reject", "/cancel"}:
             result = _run_repl_task_control(
                 loop=loop,
@@ -494,6 +530,37 @@ def _select_task_candidate(
         for task in candidates:
             _print_task_summary(task)
     return None
+
+
+def _select_trace_task(
+    tasks: list[TaskState],
+    *,
+    task_prefix: str | None,
+    command: str,
+) -> TaskState | None:
+    if task_prefix is not None:
+        return _select_task_candidate(tasks, task_prefix=task_prefix, command=command)
+    active = [task for task in tasks if task.status not in _TERMINAL_TASK_STATUSES]
+    if active:
+        return active[-1]
+    if tasks:
+        return tasks[-1]
+    print("No tasks in this session.")
+    return None
+
+
+def _watch_task_trace(session_service: SessionService, task_id: str, *, interval_seconds: float = 0.5) -> None:
+    print(f"Following trace: {task_id} (Ctrl+C to stop)")
+    seen_event_ids: set[int] = set()
+    while True:
+        trace = export_task_trace(session_service, task_id)
+        new_events = [event for event in trace["events"] if event["event_id"] not in seen_event_ids]
+        if new_events:
+            print("\n".join(render_trace_events(new_events)))
+            seen_event_ids.update(event["event_id"] for event in new_events)
+        if trace["task"]["status"] in _TERMINAL_TASK_STATUSES:
+            return
+        time.sleep(interval_seconds)
 
 
 def _print_latest_task(session_service: SessionService, session_id: str) -> None:
