@@ -514,6 +514,20 @@ class ToolLayerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error, "Shell command timed out.")
 
+    def test_shell_returns_cancellation_error(self) -> None:
+        class _CancelledRuntime:
+            def run(self, command, *, workspace_root, timeout):
+                return RuntimeExecutionResult(False, "", "", "", None, "cancelled")
+
+        result = ShellTool(runtime=_CancelledRuntime()).execute(
+            tool_call_id="call-1",
+            arguments={"command": "python -m http.server 8080"},
+            context=self.context,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "Shell command cancelled.")
+
     def test_shell_preserves_leading_spaces_in_output(self) -> None:
         def _runner(*args, **kwargs):
             return subprocess.CompletedProcess(

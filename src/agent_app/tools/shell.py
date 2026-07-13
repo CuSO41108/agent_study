@@ -67,6 +67,14 @@ class ShellTool(Tool):
                 content=execution.combined_output,
                 error="Shell command timed out.",
             )
+        if execution.error_type == "cancelled":
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                success=False,
+                content=execution.combined_output,
+                error="Shell command cancelled.",
+            )
         if execution.error_type == "nonzero_exit":
             return ToolResult(
                 tool_call_id=tool_call_id,
