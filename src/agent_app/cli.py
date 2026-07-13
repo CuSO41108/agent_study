@@ -190,11 +190,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionContext) -> bool | str:
     prompt_text = _build_confirmation_prompt(tool_call, context)
     print(prompt_text)
-    if tool_call.name == "shell":
-        decision = input("Approve once [y], allow this prefix for this session [a], or reject [N]? ").strip().lower()
-        return "session" if decision in {"a", "allow"} else decision in {"y", "yes"}
-    decision = input("Approve this action? [y/N]: ").strip().lower()
-    return decision in {"y", "yes"}
+    try:
+        if tool_call.name == "shell":
+            decision = input("Approve once [y], allow this prefix for this session [a], or reject [N]? ").strip().lower()
+            return "session" if decision in {"a", "allow"} else decision in {"y", "yes"}
+        decision = input("Approve this action? [y/N]: ").strip().lower()
+        return decision in {"y", "yes"}
+    except KeyboardInterrupt:
+        print("\nApproval cancelled.")
+        return False
 
 
 
@@ -348,6 +352,9 @@ def _run_interactive_loop(
         except EOFError:
             print()
             return 0
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            continue
 
         stripped = user_input.strip()
         if not stripped:

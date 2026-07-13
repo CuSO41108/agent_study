@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_app.runtime.shell_runtime import RuntimeExecutionResult, ShellRuntime
 
@@ -77,3 +78,33 @@ class ShellRuntimeTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error_type, "runtime_error")
         self.assertIn("cannot start powershell", result.combined_output)
+
+    @patch("agent_app.runtime.shell_runtime.subprocess.run")
+    @patch("agent_app.runtime.shell_runtime.subprocess.Popen")
+    def test_runtime_cancellation_terminates_the_started_process_tree(self, mock_popen, mock_run) -> None:
+        class _InterruptingProcess:
+            args = ["powershell"]
+            pid = 4321
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    raise KeyboardInterrupt
+                return "", ""
+
+        mock_popen.return_value = _InterruptingProcess()
+        runtime = ShellRuntime(executable_resolver=lambda: "powershell")
+
+        result = runtime.run("Start-Sleep 60", workspace_root=self.workspace_root, timeout=60.0)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        mock_run.assert_called_once_with(
+            ["taskkill", "/PID", "4321", "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
