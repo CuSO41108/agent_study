@@ -19,6 +19,7 @@ from agent_app.orchestrator.loop import AgentLoop
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import ActiveTaskConflict, SessionService
 from agent_app.tools.base import ToolExecutionContext
+from agent_app.tools.approval import shell_approval_prefix
 from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_replace_in_file_request
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry
@@ -218,6 +219,17 @@ def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionCont
     print(prompt_text)
     try:
         if tool_call.name == "shell":
+            command = str(tool_call.arguments.get("command", ""))
+            prefix = shell_approval_prefix(command)
+            selected = _select_terminal_option(
+                [
+                    ("once", "Approve once"),
+                    ("session", f"Allow '{prefix}' for this session"),
+                    ("reject", "Reject"),
+                ]
+            )
+            if selected is not None:
+                return "session" if selected == "session" else selected == "once"
             decision = input("Approve once [y], allow this prefix for this session [a], or reject [N]? ").strip().lower()
             return "session" if decision in {"a", "allow"} else decision in {"y", "yes"}
         decision = input("Approve this action? [y/N]: ").strip().lower()
@@ -225,6 +237,41 @@ def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionCont
     except (EOFError, KeyboardInterrupt):
         print("\nApproval cancelled.")
         return False
+
+
+def _select_terminal_option(options: list[tuple[str, str]]) -> str | None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        import msvcrt
+    except ImportError:
+        return None
+
+    selected = 0
+    print("Use ↑/↓ to choose, Enter to confirm:")
+    print("\x1b[?25l", end="")
+    try:
+        while True:
+            for index, (_value, label) in enumerate(options):
+                marker = "❯" if index == selected else " "
+                style = "\x1b[7;96m" if index == selected else "\x1b[90m"
+                print(f"\x1b[2K{style}{marker} {label}\x1b[0m")
+            key = msvcrt.getwch()
+            if key in {"\x00", "\xe0"}:
+                key = msvcrt.getwch()
+                if key == "H":
+                    selected = (selected - 1) % len(options)
+                elif key == "P":
+                    selected = (selected + 1) % len(options)
+            elif key in {"\r", "\n"}:
+                return options[selected][0]
+            elif key == "\x03":
+                raise KeyboardInterrupt
+            elif key.casefold() in {"y", "a", "n"}:
+                return {"y": "once", "a": "session", "n": "reject"}[key.casefold()]
+            print(f"\x1b[{len(options)}A", end="")
+    finally:
+        print("\x1b[?25h", end="")
 
 
 
