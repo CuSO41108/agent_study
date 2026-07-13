@@ -222,7 +222,7 @@ def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionCont
             return "session" if decision in {"a", "allow"} else decision in {"y", "yes"}
         decision = input("Approve this action? [y/N]: ").strip().lower()
         return decision in {"y", "yes"}
-    except KeyboardInterrupt:
+    except (EOFError, KeyboardInterrupt):
         print("\nApproval cancelled.")
         return False
 
@@ -372,6 +372,7 @@ def _run_interactive_loop(
     session_state_path: Path,
 ) -> int:
     current_session_id = session_id
+    continuation: list[str] = []
     print(f"Interactive mode. Session: {current_session_id}")
     print("Type /help for commands; use 'exit' or 'quit' to leave.")
 
@@ -383,6 +384,18 @@ def _run_interactive_loop(
             return 0
         except KeyboardInterrupt:
             print("\nCancelled.")
+            continue
+
+        if continuation:
+            continuation.append(user_input)
+            combined = "\n".join(continuation)
+            if _needs_input_continuation(combined):
+                continue
+            user_input = combined
+            continuation = []
+        elif _needs_input_continuation(user_input):
+            continuation = [user_input]
+            print("... ", end="", flush=True)
             continue
 
         stripped = user_input.strip()
@@ -437,6 +450,28 @@ def _run_interactive_loop(
         current_session_id = result.session_id
         _persist_current_session(session_state_path, result.session_id)
         _print_turn_result(result)
+
+
+def _needs_input_continuation(value: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for char in value:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+    return quote is not None or depth > 0
 
 
 def _run_repl_task_control(

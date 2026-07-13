@@ -174,6 +174,17 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.stop_reason, "model_error")
 
+    def test_keyboard_interrupt_cancels_active_task(self) -> None:
+        model = _FakeModelClient([])
+        model.generate = lambda **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt())
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="interrupt model work")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "cancelled")
+        self.assertEqual(result.task_status, "cancelled")
+
     def test_explicit_research_runs_web_search_before_model_response(self) -> None:
         model = _FakeModelClient([_text_response("sources considered")])
         search = self.registry.get_required("web_search")
