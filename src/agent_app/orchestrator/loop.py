@@ -104,6 +104,11 @@ class AgentLoop:
                 _task_id=_task_id,
                 _append_user_message=_append_user_message,
             )
+        except KeyboardInterrupt:
+            if self._active_task_id is None:
+                raise
+            task = self._tasks.cancel(self._active_task_id)
+            return self._task_result(task, final_text="Cancelled.", stop_reason="cancelled", success=False)
         except TracePersistenceError:
             return self._runtime_failure_result(
                 session_id=session_id,
