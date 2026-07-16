@@ -2,6 +2,7 @@
 
 import argparse
 import difflib
+import getpass
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
-from agent_app.config import AppConfig, load_config
+from agent_app.config import AppConfig, global_config_path, load_config, save_global_model_config
 from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
 from agent_app.observability import export_task_trace, render_task_timeline, render_trace_events
@@ -149,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly start the interactive REPL (also the default when no prompt is supplied).",
     )
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Interactively save model settings to the user-global config file.",
+    )
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
     controls.add_argument("--pause-task", metavar="TASK_ID", help="Pause a running task.")
@@ -166,13 +172,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     control = _selected_task_control(args)
-    interactive = args.interactive or (args.prompt is None and control is None)
+    interactive = args.interactive or (args.prompt is None and control is None and not args.configure)
     if args.interactive and args.prompt is not None:
         print("Argument error: prompt cannot be used with --interactive.", file=sys.stderr)
         return 2
     if control is not None and (args.interactive or args.prompt is not None):
         print("Argument error: task controls cannot be combined with a prompt or --interactive.", file=sys.stderr)
         return 2
+    if args.configure and (args.interactive or args.prompt is not None or control is not None):
+        print("Argument error: --configure cannot be combined with a prompt, task control, or --interactive.", file=sys.stderr)
+        return 2
+    if args.configure:
+        return _configure_global_model()
 
     try:
         config = load_config(workspace_root=args.workspace_root)
@@ -424,6 +435,32 @@ def _build_confirmation_prompt(tool_call: ToolCall, context: ToolExecutionContex
     if tool_call.name != "file_write":
         return f"Tool '{tool_call.name}' requires confirmation."
     return f"Tool '{tool_call.name}' requires confirmation."
+
+
+def _configure_global_model() -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("Configuration error: --configure requires an interactive terminal.", file=sys.stderr)
+        return 2
+    print(f"Agent Study global config: {global_config_path()}")
+    print("This stores model settings for all workspaces. The API key will not be echoed.")
+    try:
+        base_url = input("MODEL_BASE_URL: ").strip()
+        api_key = getpass.getpass("MODEL_API_KEY: ").strip()
+        model = input("MODEL_NAME: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nConfiguration cancelled.")
+        return 1
+    if not base_url or not api_key or not model:
+        print("Configuration error: MODEL_BASE_URL, MODEL_API_KEY, and MODEL_NAME are required.", file=sys.stderr)
+        return 2
+    try:
+        config_path = save_global_model_config(base_url=base_url, api_key=api_key, model=model)
+    except OSError as exc:
+        print(f"Configuration error: could not write {global_config_path()}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Saved global configuration to {config_path}.")
+    print("Project .agent_app/.env.local and environment variables can still override these values.")
+    return 0
 
 
 def _resolve_file_write_confirmation_inspection(

@@ -22,6 +22,14 @@ agent-app "src/agent_app/state/ 目录下有哪些文件，各自负责什么"
 
 项目兼容 **OpenAI Chat Completions 协议**；任何实现 `/v1/chat/completions` 的模型提供方均可接入，例如阿里云百炼、OpenAI、DeepSeek、Ollama 等。配置细节见 `.env.example`。
 
+首次希望在任意项目目录使用时，执行一次全局配置向导：
+
+```powershell
+agent-app --configure
+```
+
+它把模型地址、API Key 和模型名写入 `%USERPROFILE%\.agent-study\config.toml`，不会显示 API Key。配置优先级是：环境变量 → 当前项目 `.agent_app\.env.local` → 用户全局 `config.toml` → 内置默认值。无论从哪里启动，当前目录仍是工作空间；每个工作空间仍分别保存自己的 `.agent_app\agent.db`。
+
 ## 核心亮点
 
 **持久化 TaskState 状态机** — 每个目标都有独立生命周期（`created → running → waiting_user → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
