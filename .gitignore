@@ -11,3 +11,4 @@ evals/results/*.jsonl
 .claude/
 .agents/
 .specify/
+docs/AGENT_CONTEXT_ENGINEERING.md
