@@ -17,7 +17,7 @@ src/agent_app/
 ├── tools/
 │   ├── base.py                工具基类、Observation 构造、schema 校验
 │   ├── approval.py            命令分类与审批决策
-│   ├── shell.py               PowerShell 执行（只读白名单 + 受控变更审批）
+│   ├── shell.py               通用 PowerShell 执行与审批边界
 │   ├── file_read.py           文件读取
 │   ├── file_write.py          文件写入（含检查点恢复）
 │   ├── replace_in_file.py     精准文本替换（含检查点恢复）
@@ -32,7 +32,7 @@ src/agent_app/
 │   └── session_service.py     Session/Task/Event/Action/Trace 持久化
 ├── runtime/
 │   ├── task_runtime.py        TaskState 状态机
-│   ├── shell_runtime.py       Shell 白名单与安全执行
+│   ├── shell_runtime.py       Shell 生命周期、超时/中断与进程树清理
 │   └── agent_runtime.py       Agent 运行时适配
 └── model/
     └── openai_compatible.py   OpenAI 兼容模型客户端
@@ -75,4 +75,4 @@ evals/
 - **SQLite 单文件持久化**：所有 session、task、trace 存于 `.agent_app/agent.db`
 - **乐观锁防冲突**：TaskState 的 `version` 字段保证并发安全
 - **副作用追溯**：所有写操作持久化 ToolAction + 幂等键，崩溃后可恢复
-- **工具安全边界**：路径约束在工作区、Shell 白名单+审批、文件编辑检查点
+- **工具安全边界**：文件路径约束在工作区；Shell 默认审批、session 前缀授权与递归删除硬拒绝；文件编辑使用检查点
