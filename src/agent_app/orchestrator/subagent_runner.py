@@ -41,6 +41,7 @@ class SubagentRunner:
         max_delegation_depth: int = 1,
         max_subagents_per_turn: int = 2,
         loop_factory: LoopFactory | None = None,
+        skill_registry=None,
     ) -> None:
         self._model_client = model_client
         self._session_service = session_service
@@ -50,10 +51,11 @@ class SubagentRunner:
         self._summary_trigger_tokens = summary_trigger_tokens
         self._confirmation_handler = confirmation_handler
         self._worker_agent = worker_agent
+        self._skill_registry = skill_registry
         if worker_registry is None:
             from agent_app.tools.registry import build_worker_registry
 
-            worker_registry = build_worker_registry()
+            worker_registry = build_worker_registry(skill_registry=skill_registry)
         self._worker_registry = worker_registry
         self._max_delegation_depth = max_delegation_depth
         self._max_subagents_per_turn = max_subagents_per_turn
@@ -141,6 +143,7 @@ class SubagentRunner:
                 summary_trigger_tokens=self._summary_trigger_tokens,
                 confirmation_handler=self._confirmation_handler,
                 delegation_depth=delegation_depth,
+                skill_registry=self._skill_registry,
             )
 
         from agent_app.orchestrator.loop import AgentLoop
@@ -156,6 +159,7 @@ class SubagentRunner:
             summary_trigger_tokens=self._summary_trigger_tokens,
             confirmation_handler=self._confirmation_handler,
             delegation_depth=delegation_depth,
+            skill_registry=self._skill_registry,
         )
 
 

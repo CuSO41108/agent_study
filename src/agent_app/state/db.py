@@ -168,6 +168,49 @@ SCHEMA_STATEMENTS = (
         FOREIGN KEY (child_session_id) REFERENCES sessions(id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS task_skill_activations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        skill_name TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK(scope IN ('project', 'user')),
+        source_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        version TEXT,
+        activation_reason TEXT NOT NULL CHECK(activation_reason IN ('explicit', 'model_match', 'inherited_handoff')),
+        state TEXT NOT NULL CHECK(state IN ('active', 'dropped')),
+        activated_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS task_handoffs (
+        source_task_id TEXT PRIMARY KEY,
+        target_task_id TEXT NOT NULL UNIQUE,
+        target_session_id TEXT NOT NULL,
+        summary_text TEXT,
+        evidence_refs_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (source_task_id) REFERENCES tasks(id),
+        FOREIGN KEY (target_task_id) REFERENCES tasks(id),
+        FOREIGN KEY (target_session_id) REFERENCES sessions(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS skill_drafts (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK(scope IN ('project', 'user')),
+        skill_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('draft', 'saved')),
+        created_at TEXT NOT NULL,
+        saved_at TEXT,
+        saved_path TEXT,
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )
+    """,
 )
 
 
@@ -192,6 +235,18 @@ def initialize_database(db_path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_tool_actions_session_status
             ON tool_actions(session_id, status)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_skill_drafts_session_status
+            ON skill_drafts(session_id, status, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_task_skill_activations_active
+            ON task_skill_activations(task_id, state, id)
             """
         )
         connection.execute(

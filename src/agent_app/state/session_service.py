@@ -14,10 +14,14 @@ from agent_app.types import (
     Observation,
     PendingAction,
     SessionContext,
+    SessionOverview,
+    SkillDraft,
+    SkillActivation,
     StoredMessage,
     SubagentRun,
     TaskBudget,
     TaskEvent,
+    TaskHandoff,
     TaskState,
     TaskStatus,
     TaskTrace,
@@ -207,6 +211,60 @@ class SessionService:
                 (session_id,),
             ).fetchall()
         return [_task_from_row(row) for row in rows]
+
+    def list_recent_session_overviews(self, *, limit: int = 8) -> list[SessionOverview]:
+        """Return a compact, read-only cross-session view for the REPL."""
+        if not 1 <= limit <= 20:
+            raise ValueError("Session overview limit must be between 1 and 20.")
+        with self._connect() as connection:
+            session_rows = connection.execute(
+                """
+                SELECT id, created_at, updated_at
+                FROM sessions
+                ORDER BY updated_at DESC, created_at DESC, id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            overviews: list[SessionOverview] = []
+            for session_id, created_at, updated_at in session_rows:
+                latest_row = connection.execute(
+                    _TASK_SELECT
+                    + " WHERE session_id = ? ORDER BY updated_at DESC, created_at DESC, id ASC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                active_row = connection.execute(
+                    _TASK_SELECT
+                    + """
+                      WHERE session_id = ?
+                        AND status IN ('created', 'running', 'waiting_user', 'waiting_tool', 'paused')
+                      ORDER BY updated_at DESC, created_at DESC, id ASC
+                      LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                task_count = int(
+                    connection.execute("SELECT COUNT(*) FROM tasks WHERE session_id = ?", (session_id,)).fetchone()[0]
+                )
+                context_row = connection.execute(
+                    """
+                    SELECT summary_text, summary_message_id, todo_json
+                    FROM session_context WHERE session_id = ? LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                overviews.append(
+                    SessionOverview(
+                        id=session_id,
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        task_count=task_count,
+                        latest_task=_task_from_row(latest_row) if latest_row is not None else None,
+                        active_task=_task_from_row(active_row) if active_row is not None else None,
+                        context=_session_context_from_row(context_row),
+                    )
+                )
+        return overviews
 
     def get_latest_task(self, session_id: str) -> TaskState | None:
         with self._connect() as connection:
@@ -450,6 +508,506 @@ class SessionService:
             )
             for row in rows
         ]
+
+    def activate_skill(
+        self,
+        *,
+        task_id: str,
+        skill_name: str,
+        scope: str,
+        source_path: str,
+        content_hash: str,
+        version: str | None,
+        activation_reason: str,
+        source: str,
+    ) -> SkillActivation:
+        """Persist a task-local Skill activation with its own event and trace."""
+        if scope not in {"project", "user"}:
+            raise ValueError("Skill scope must be project or user.")
+        if activation_reason not in {"explicit", "model_match", "inherited_handoff"}:
+            raise ValueError("Unknown Skill activation reason.")
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = _task_from_row(row)
+            if task.status != "running":
+                raise RuntimeError(f"Skill activation requires a running task (current: {task.status}).")
+            existing_row = connection.execute(
+                _SKILL_ACTIVATION_SELECT + " WHERE task_id = ? AND skill_name = ? AND state = 'active' ORDER BY id DESC LIMIT 1",
+                (task.id, skill_name),
+            ).fetchone()
+            if existing_row is not None:
+                existing = _skill_activation_from_row(existing_row)
+                if (
+                    existing.scope == scope
+                    and existing.source_path == source_path
+                    and existing.content_hash == content_hash
+                    and existing.version == version
+                ):
+                    return existing
+                connection.execute("UPDATE task_skill_activations SET state = 'dropped' WHERE id = ?", (existing_row[0],))
+
+            activation = SkillActivation(
+                task_id=task.id,
+                skill_name=skill_name,
+                scope=scope,
+                source_path=source_path,
+                content_hash=content_hash,
+                version=version,
+                activation_reason=activation_reason,
+                state="active",
+                activated_at=timestamp,
+            )
+            connection.execute(
+                """
+                INSERT INTO task_skill_activations (
+                    task_id, skill_name, scope, source_path, content_hash, version,
+                    activation_reason, state, activated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                """,
+                (
+                    activation.task_id,
+                    activation.skill_name,
+                    activation.scope,
+                    activation.source_path,
+                    activation.content_hash,
+                    activation.version,
+                    activation.activation_reason,
+                    activation.activated_at,
+                ),
+            )
+            self._append_skill_event(
+                connection,
+                task=task,
+                event_type="skill_activated",
+                source=source,
+                payload={
+                    "skill_name": skill_name,
+                    "scope": scope,
+                    "content_hash": content_hash,
+                    "activation_reason": activation_reason,
+                },
+                trace_type="skill_activation",
+                trace_payload={
+                    "skill_name": skill_name,
+                    "scope": scope,
+                    "content_hash": content_hash,
+                    "activation_reason": activation_reason,
+                    "state": "active",
+                },
+                timestamp=timestamp,
+            )
+        return activation
+
+    def drop_skill(self, *, task_id: str, skill_name: str, source: str = "user") -> SkillActivation | None:
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = _task_from_row(row)
+            if task.status != "running":
+                raise RuntimeError(f"Skill deactivation requires a running task (current: {task.status}).")
+            activation_row = connection.execute(
+                _SKILL_ACTIVATION_SELECT + " WHERE task_id = ? AND skill_name = ? AND state = 'active' ORDER BY id DESC LIMIT 1",
+                (task.id, skill_name),
+            ).fetchone()
+            if activation_row is None:
+                return None
+            connection.execute("UPDATE task_skill_activations SET state = 'dropped' WHERE id = ?", (activation_row[0],))
+            dropped = _skill_activation_from_row((*activation_row[:8], "dropped", activation_row[9]))
+            self._append_skill_event(
+                connection,
+                task=task,
+                event_type="skill_dropped",
+                source=source,
+                payload={"skill_name": skill_name},
+                trace_type="skill_activation",
+                trace_payload={"skill_name": skill_name, "state": "dropped"},
+                timestamp=timestamp,
+            )
+        return dropped
+
+    def list_skill_activations(self, task_id: str, *, active_only: bool = False) -> list[SkillActivation]:
+        query = _SKILL_ACTIVATION_SELECT + " WHERE task_id = ?"
+        if active_only:
+            query += " AND state = 'active'"
+        query += " ORDER BY id ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, (task_id,)).fetchall()
+        return [_skill_activation_from_row(row) for row in rows]
+
+    def list_active_skill_activations(self, task_id: str) -> list[SkillActivation]:
+        return self.list_skill_activations(task_id, active_only=True)
+
+    def handoff_task(
+        self,
+        *,
+        source_task_id: str,
+        target_session_id: str,
+        summary_text: str | None,
+        evidence_refs: tuple[str, ...],
+        inherited_skills: tuple[SkillActivation, ...] = (),
+    ) -> tuple[TaskState, TaskHandoff]:
+        """Atomically archive a resumable checkpoint and create its child in another session."""
+        timestamp = _utc_now()
+        child_id = str(uuid4())
+        with self._connect() as connection:
+            source_row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (source_task_id,)).fetchone()
+            if source_row is None:
+                raise KeyError(source_task_id)
+            source_task = _task_from_row(source_row)
+            if source_task.status not in {"running", "paused", "completed"}:
+                raise RuntimeError("Only a running, paused, or completed task can be handed off.")
+            if source_task.pending_action is not None:
+                raise RuntimeError("Resolve the pending action before handing off a task.")
+            target_session = connection.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (target_session_id,)).fetchone()
+            if target_session is None:
+                raise KeyError(f"Unknown target session '{target_session_id}'.")
+            active_target = connection.execute(
+                _TASK_SELECT
+                + " WHERE session_id = ? AND status IN ('created', 'running', 'waiting_user', 'waiting_tool', 'paused') LIMIT 1",
+                (target_session_id,),
+            ).fetchone()
+            if active_target is not None:
+                raise ActiveTaskConflict(_task_from_row(active_target))
+            previous_handoff = connection.execute(
+                "SELECT 1 FROM task_handoffs WHERE source_task_id = ? LIMIT 1", (source_task.id,)
+            ).fetchone()
+            if previous_handoff is not None:
+                raise RuntimeError("Task has already been handed off.")
+
+            remaining_plan = tuple(item for item in source_task.plan if item.status != "completed")
+            compact_summary = _compact_handoff_summary(summary_text, source_task=source_task, evidence_refs=evidence_refs)
+            next_source_version = source_task.version + 1
+            source_event_id = str(uuid4())
+            source_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id = ?", (source_task.id,)
+                ).fetchone()[0]
+            )
+            source_update = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'handed_off', pending_action_json = NULL, waiting_deadline = NULL,
+                    stop_reason = 'handed_off', version = ?, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (next_source_version, timestamp, source_task.id, source_task.version),
+            )
+            if source_update.rowcount != 1:
+                raise TaskVersionConflict(f"Task '{source_task.id}' was updated concurrently.")
+            connection.execute(
+                """
+                INSERT INTO task_events (
+                    id, task_id, session_id, event_type, source, payload_json,
+                    correlation_id, causation_id, sequence, created_at
+                ) VALUES (?, ?, ?, 'task_handed_off', 'user', ?, ?, NULL, ?, ?)
+                """,
+                (
+                    source_event_id,
+                    source_task.id,
+                    source_task.session_id,
+                    _json_dumps({"target_session_id": target_session_id, "target_task_id": child_id}),
+                    source_task.id,
+                    source_sequence,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                VALUES (?, ?, 'state_transition', ?, ?)
+                """,
+                (
+                    source_task.id,
+                    source_task.session_id,
+                    _json_dumps({"from": source_task.status, "to": "handed_off", "reason": "task_handed_off", "version": next_source_version}),
+                    timestamp,
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    id, session_id, parent_task_id, goal, status, step, plan_json,
+                    working_memory_json, pending_action_json, last_observation_json,
+                    reflection, budget_json, stop_reason, version, waiting_deadline, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'created', ?, ?, '{}', NULL, NULL, ?, ?, NULL, 1, NULL, ?, ?)
+                """,
+                (
+                    child_id,
+                    target_session_id,
+                    source_task.id,
+                    source_task.goal,
+                    source_task.step,
+                    _todo_items_json(remaining_plan),
+                    source_task.reflection,
+                    _json_dumps(asdict(source_task.budget)),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events (
+                    id, task_id, session_id, event_type, source, payload_json,
+                    correlation_id, causation_id, sequence, created_at
+                ) VALUES (?, ?, ?, 'task_created', 'handoff', ?, ?, ?, 1, ?)
+                """,
+                (
+                    str(uuid4()),
+                    child_id,
+                    target_session_id,
+                    _json_dumps({"goal": source_task.goal, "parent_task_id": source_task.id}),
+                    child_id,
+                    source_event_id,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+                VALUES (?, ?, 'state_transition', ?, ?)
+                """,
+                (child_id, target_session_id, _json_dumps({"from": None, "to": "created", "reason": "task_handoff_created", "version": 1}), timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_handoffs (
+                    source_task_id, target_task_id, target_session_id, summary_text, evidence_refs_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_task.id, child_id, target_session_id, compact_summary, _json_dumps(list(evidence_refs)), timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO session_context (session_id, summary_text, summary_message_id, todo_json, updated_at)
+                VALUES (?, ?, NULL, '[]', ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    summary_text = excluded.summary_text,
+                    summary_message_id = NULL,
+                    todo_json = '[]',
+                    updated_at = excluded.updated_at
+                """,
+                (target_session_id, compact_summary, timestamp),
+            )
+            child_task = _task_from_row(connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (child_id,)).fetchone())
+            for activation in _unique_active_skills(inherited_skills):
+                connection.execute(
+                    """
+                    INSERT INTO task_skill_activations (
+                        task_id, skill_name, scope, source_path, content_hash, version,
+                        activation_reason, state, activated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'inherited_handoff', 'active', ?)
+                    """,
+                    (
+                        child_id,
+                        activation.skill_name,
+                        activation.scope,
+                        activation.source_path,
+                        activation.content_hash,
+                        activation.version,
+                        timestamp,
+                    ),
+                )
+                child_task = self._append_skill_event(
+                    connection,
+                    task=child_task,
+                    event_type="skill_activated",
+                    source="handoff",
+                    payload={
+                        "skill_name": activation.skill_name,
+                        "scope": activation.scope,
+                        "content_hash": activation.content_hash,
+                        "activation_reason": "inherited_handoff",
+                    },
+                    trace_type="skill_activation",
+                    trace_payload={
+                        "skill_name": activation.skill_name,
+                        "scope": activation.scope,
+                        "content_hash": activation.content_hash,
+                        "activation_reason": "inherited_handoff",
+                        "state": "active",
+                    },
+                    timestamp=timestamp,
+                )
+            updated_child_row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (child_id,)).fetchone()
+        assert updated_child_row is not None
+        handoff = TaskHandoff(
+            source_task_id=source_task.id,
+            target_task_id=child_id,
+            target_session_id=target_session_id,
+            summary_text=compact_summary,
+            evidence_refs=evidence_refs,
+            created_at=timestamp,
+        )
+        return _task_from_row(updated_child_row), handoff
+
+    def get_task_handoff(self, source_task_id: str) -> TaskHandoff | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT source_task_id, target_task_id, target_session_id, summary_text, evidence_refs_json, created_at
+                FROM task_handoffs WHERE source_task_id = ? LIMIT 1
+                """,
+                (source_task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TaskHandoff(
+            source_task_id=row[0],
+            target_task_id=row[1],
+            target_session_id=row[2],
+            summary_text=row[3],
+            evidence_refs=tuple(json.loads(row[4])),
+            created_at=row[5],
+        )
+
+    def create_skill_draft(
+        self,
+        *,
+        session_id: str,
+        scope: str,
+        skill_name: str,
+        content: str,
+        content_hash: str,
+    ) -> SkillDraft:
+        if scope not in {"project", "user"}:
+            raise ValueError("Skill draft scope must be project or user.")
+        if not self.session_exists(session_id):
+            raise KeyError(session_id)
+        draft = SkillDraft(
+            id=str(uuid4()),
+            session_id=session_id,
+            scope=scope,
+            skill_name=skill_name,
+            content=content,
+            content_hash=content_hash,
+            status="draft",
+            created_at=_utc_now(),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_drafts (
+                    id, session_id, scope, skill_name, content, content_hash,
+                    status, created_at, saved_at, saved_path
+                ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, NULL, NULL)
+                """,
+                (
+                    draft.id,
+                    draft.session_id,
+                    draft.scope,
+                    draft.skill_name,
+                    draft.content,
+                    draft.content_hash,
+                    draft.created_at,
+                ),
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (draft.created_at, draft.session_id),
+            )
+        return draft
+
+    def list_skill_drafts(self, session_id: str, *, status: str | None = None, limit: int = 12) -> list[SkillDraft]:
+        if not 1 <= limit <= 50:
+            raise ValueError("Skill draft limit must be between 1 and 50.")
+        query = _SKILL_DRAFT_SELECT + " WHERE session_id = ?"
+        parameters: list[object] = [session_id]
+        if status is not None:
+            if status not in {"draft", "saved"}:
+                raise ValueError("Unknown Skill draft status.")
+            query += " AND status = ?"
+            parameters.append(status)
+        query += " ORDER BY created_at DESC, id ASC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_skill_draft_from_row(row) for row in rows]
+
+    def find_skill_drafts(self, session_id: str, *, id_prefix: str, status: str = "draft") -> list[SkillDraft]:
+        if not id_prefix:
+            return self.list_skill_drafts(session_id, status=status)
+        with self._connect() as connection:
+            rows = connection.execute(
+                _SKILL_DRAFT_SELECT
+                + " WHERE session_id = ? AND status = ? AND id LIKE ? ORDER BY created_at DESC, id ASC",
+                (session_id, status, f"{id_prefix}%"),
+            ).fetchall()
+        return [_skill_draft_from_row(row) for row in rows]
+
+    def mark_skill_draft_saved(self, draft_id: str, *, saved_path: str) -> SkillDraft:
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE skill_drafts
+                SET status = 'saved', saved_at = ?, saved_path = ?
+                WHERE id = ? AND status = 'draft'
+                """,
+                (timestamp, saved_path, draft_id),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(_SKILL_DRAFT_SELECT + " WHERE id = ? LIMIT 1", (draft_id,)).fetchone()
+                if row is None:
+                    raise KeyError(draft_id)
+                return _skill_draft_from_row(row)
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = (SELECT session_id FROM skill_drafts WHERE id = ?)",
+                (timestamp, draft_id),
+            )
+            row = connection.execute(_SKILL_DRAFT_SELECT + " WHERE id = ? LIMIT 1", (draft_id,)).fetchone()
+        assert row is not None
+        return _skill_draft_from_row(row)
+
+    def _append_skill_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task: TaskState,
+        event_type: str,
+        source: str,
+        payload: dict,
+        trace_type: str,
+        trace_payload: dict,
+        timestamp: str,
+    ) -> TaskState:
+        sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_events WHERE task_id = ?", (task.id,)
+            ).fetchone()[0]
+        )
+        next_version = task.version + 1
+        cursor = connection.execute(
+            "UPDATE tasks SET version = ?, updated_at = ? WHERE id = ? AND version = ?",
+            (next_version, timestamp, task.id, task.version),
+        )
+        if cursor.rowcount != 1:
+            raise TaskVersionConflict(f"Task '{task.id}' was updated concurrently.")
+        event_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO task_events (
+                id, task_id, session_id, event_type, source, payload_json,
+                correlation_id, causation_id, sequence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (event_id, task.id, task.session_id, event_type, source, _json_dumps(payload), task.id, sequence, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_traces (task_id, session_id, trace_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task.id, task.session_id, trace_type, _json_dumps({**trace_payload, "event_id": event_id, "version": next_version}), timestamp),
+        )
+        updated_row = connection.execute(_TASK_SELECT + " WHERE id = ? LIMIT 1", (task.id,)).fetchone()
+        assert updated_row is not None
+        return _task_from_row(updated_row)
 
     def append_message(self, session_id: str, message: Message) -> None:
         timestamp = _utc_now()
@@ -788,23 +1346,7 @@ class SessionService:
                 (session_id,),
             ).fetchone()
 
-        if row is None:
-            return SessionContext()
-
-        todo_json = row[2]
-        todo_items: tuple[TodoItem, ...] = ()
-        if todo_json:
-            decoded = json.loads(todo_json)
-            todo_items = tuple(
-                TodoItem(content=str(item["content"]), status=str(item["status"]))
-                for item in decoded
-            )
-
-        return SessionContext(
-            summary_text=row[0],
-            summary_message_id=row[1],
-            todo_items=todo_items,
-        )
+        return _session_context_from_row(row)
 
     def upsert_session_context(
         self,
@@ -1003,6 +1545,20 @@ FROM tasks
 """
 
 
+_SKILL_ACTIVATION_SELECT = """
+SELECT id, task_id, skill_name, scope, source_path, content_hash, version,
+       activation_reason, state, activated_at
+FROM task_skill_activations
+"""
+
+
+_SKILL_DRAFT_SELECT = """
+SELECT id, session_id, scope, skill_name, content, content_hash,
+       status, created_at, saved_at, saved_path
+FROM skill_drafts
+"""
+
+
 def _task_from_row(row) -> TaskState:
     pending_raw = json.loads(row[8]) if row[8] else None
     if pending_raw is not None and "id" not in pending_raw:
@@ -1028,6 +1584,79 @@ def _task_from_row(row) -> TaskState:
         created_at=row[15],
         updated_at=row[16],
     )
+
+
+def _session_context_from_row(row) -> SessionContext:
+    if row is None:
+        return SessionContext()
+    todo_json = row[2]
+    todo_items: tuple[TodoItem, ...] = ()
+    if todo_json:
+        decoded = json.loads(todo_json)
+        todo_items = tuple(
+            TodoItem(content=str(item["content"]), status=str(item["status"]))
+            for item in decoded
+        )
+    return SessionContext(
+        summary_text=row[0],
+        summary_message_id=row[1],
+        todo_items=todo_items,
+    )
+
+
+def _skill_activation_from_row(row) -> SkillActivation:
+    return SkillActivation(
+        task_id=row[1],
+        skill_name=row[2],
+        scope=row[3],
+        source_path=row[4],
+        content_hash=row[5],
+        version=row[6],
+        activation_reason=row[7],
+        state=row[8],
+        activated_at=row[9],
+    )
+
+
+def _skill_draft_from_row(row) -> SkillDraft:
+    return SkillDraft(
+        id=row[0],
+        session_id=row[1],
+        scope=row[2],
+        skill_name=row[3],
+        content=row[4],
+        content_hash=row[5],
+        status=row[6],
+        created_at=row[7],
+        saved_at=row[8],
+        saved_path=row[9],
+    )
+
+
+def _compact_handoff_summary(
+    summary_text: str | None,
+    *,
+    source_task: TaskState,
+    evidence_refs: tuple[str, ...],
+) -> str:
+    source_summary = " ".join((summary_text or source_task.reflection or "").split())[:3000]
+    lines = [
+        f"Handoff from task {source_task.id}.",
+        f"Goal: {source_task.goal}",
+    ]
+    if source_summary:
+        lines.append(f"Previous compact summary: {source_summary}")
+    if evidence_refs:
+        lines.append("Evidence references: " + ", ".join(evidence_refs[:8]))
+    return "\n".join(lines)
+
+
+def _unique_active_skills(activations: tuple[SkillActivation, ...]) -> tuple[SkillActivation, ...]:
+    selected: dict[str, SkillActivation] = {}
+    for activation in activations:
+        if activation.state == "active":
+            selected[activation.skill_name] = activation
+    return tuple(selected[name] for name in sorted(selected))
 
 
 def _default_task_plan(goal: str) -> tuple[TodoItem, ...]:

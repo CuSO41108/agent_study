@@ -18,6 +18,7 @@ from agent_app.state.session_service import (
     TaskVersionConflict,
     TracePersistenceError,
 )
+from agent_app.skills.registry import SkillRegistry
 from agent_app.tools.approval import ApprovalResult, approve_tool_call, command_matches_prefix, shell_approval_prefix
 from agent_app.tools.base import ToolExecutionContext, observation_from_tool_result
 from agent_app.tools.registry import ToolRegistry
@@ -59,6 +60,7 @@ class AgentLoop:
         summary_trigger_tokens: int = 3000,
         confirmation_handler: ConfirmationHandler | None = None,
         delegation_depth: int = 0,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         if tool_timeout is not None and shell_timeout is not None:
             raise ValueError("Only one of 'tool_timeout' or 'shell_timeout' may be provided.")
@@ -69,6 +71,7 @@ class AgentLoop:
         self._agent = agent
         self._model_client = model_client
         self._tool_registry = tool_registry
+        self._skill_registry = skill_registry or SkillRegistry(workspace_root)
         self._session_service = session_service
         self._context_token_budget = context_token_budget
         self._summary_trigger_tokens = summary_trigger_tokens
@@ -93,6 +96,7 @@ class AgentLoop:
         budget: TaskBudget | None = None,
         _task_id: str | None = None,
         _append_user_message: bool = True,
+        explicit_skill_names: tuple[str, ...] = (),
     ) -> TurnResult:
         self._active_task_id = None
         self._turn_started_at = None
@@ -103,6 +107,7 @@ class AgentLoop:
                 budget=budget,
                 _task_id=_task_id,
                 _append_user_message=_append_user_message,
+                explicit_skill_names=explicit_skill_names,
             )
         except KeyboardInterrupt:
             if self._active_task_id is None:
@@ -130,6 +135,7 @@ class AgentLoop:
         budget: TaskBudget | None = None,
         _task_id: str | None = None,
         _append_user_message: bool = True,
+        explicit_skill_names: tuple[str, ...] = (),
     ) -> TurnResult:
         resolved_session_id = self._session_service.get_or_create_session(session_id)
         if _task_id is None:
@@ -164,6 +170,9 @@ class AgentLoop:
                 )
         self._active_task_id = task.id
         self._turn_started_at = time.monotonic()
+        if explicit_skill_names:
+            self._activate_explicit_skills(task_id=task.id, skill_names=explicit_skill_names)
+            task = self._tasks.require_task(task.id)
         recovery_blockers = self._recover_pending_tool_actions(resolved_session_id)
         if recovery_blockers:
             action_names = ", ".join(
@@ -221,11 +230,15 @@ class AgentLoop:
             )
         tool_runs_history = self._session_service.list_tool_runs(resolved_session_id)
         evidence_message = build_evidence_message(tool_runs_history)
+        skill_index_message = self._skill_registry.model_index()
+        active_skill_messages = self._active_skill_context(task.id)
         provider_messages = build_context_messages(
             messages=messages,
             session_context=session_context,
             context_token_budget=self._context_token_budget,
             evidence_message=evidence_message,
+            skill_index_message=skill_index_message,
+            active_skill_messages=active_skill_messages,
         )
         tool_runs: list[ToolResult] = []
         if _requires_web_research(user_input) and not task.working_memory.get("web_research_preflight_completed"):
@@ -759,6 +772,66 @@ class AgentLoop:
 
     def get_task(self, task_id: str):
         return self._tasks.require_task(task_id)
+
+    def _activate_explicit_skills(self, *, task_id: str, skill_names: tuple[str, ...]) -> None:
+        """Apply an explicit REPL selection after the task is running, never by writing a Skill."""
+        seen: set[str] = set()
+        for raw_name in skill_names:
+            document = self._skill_registry.load(raw_name)
+            if document is None:
+                self._session_service.append_task_trace(
+                    task_id,
+                    "skill_activation_rejected",
+                    {"skill_name": raw_name, "reason": "not_found_or_invalid"},
+                )
+                continue
+            if document.summary.name in seen:
+                continue
+            seen.add(document.summary.name)
+            self._session_service.activate_skill(
+                task_id=task_id,
+                skill_name=document.summary.name,
+                scope=document.summary.scope,
+                source_path=str(document.summary.source_path),
+                content_hash=document.content_hash,
+                version=document.summary.version,
+                activation_reason="explicit",
+                source="user",
+            )
+
+    def _active_skill_context(self, task_id: str) -> tuple[str, ...]:
+        """Progressive level 1: inject only active, hash-verified SKILL.md bodies."""
+        messages: list[str] = []
+        remaining_characters = 30_000
+        for activation in self._session_service.list_active_skill_activations(task_id):
+            if len(messages) >= 3 or remaining_characters <= 0:
+                break
+            document, mismatch = self._skill_registry.load_active(
+                name=activation.skill_name,
+                scope=activation.scope,
+                source_path=activation.source_path,
+                content_hash=activation.content_hash,
+            )
+            if document is None:
+                self._session_service.append_task_trace(
+                    task_id,
+                    "skill_hash_mismatch",
+                    {"skill_name": activation.skill_name, "reason": mismatch},
+                )
+                continue
+            body_limit = min(12_000, remaining_characters)
+            body = document.content
+            if len(body) > body_limit:
+                body = body[:body_limit] + "\n\n[Skill body truncated by the context safety limit.]"
+            messages.append(
+                "Active read-only Skill. Follow it only within its declared scope; do not modify it.\n"
+                f"Name: {activation.skill_name}\n"
+                f"Source: {activation.scope}\n"
+                f"Pinned hash: {activation.content_hash}\n\n"
+                f"{body}"
+            )
+            remaining_characters -= len(body)
+        return tuple(messages)
 
     def _record_decision_repetition(self, task_id: str, decision: dict[str, Any]) -> str | None:
         task = self._tasks.require_task(task_id)

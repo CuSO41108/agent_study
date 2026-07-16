@@ -7,7 +7,11 @@ name = "agent-study"
 version = "0.1.0"
 description = "Single-agent CLI harness for coding workflows."
 requires-python = ">=3.13"
-dependencies = ["jsonschema>=4.23,<5"]
+dependencies = [
+    "jsonschema>=4.23,<5",
+    "prompt_toolkit>=3.0.52,<4",
+    "rich>=13.9,<15",
+]
 
 [project.optional-dependencies]
 dev = ["coverage[toml]"]
