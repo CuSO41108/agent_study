@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from agent_app.config import load_config
+from agent_app.config import global_config_path, load_config, save_global_model_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -13,13 +13,16 @@ class ConfigTests(unittest.TestCase):
         self.workspace_root = Path(__file__).resolve().parents[2] / ".test_tmp" / f"config_{uuid4().hex}"
         self.workspace_root.mkdir(parents=True)
         (self.workspace_root / ".agent_app").mkdir()
+        self.global_home = self.workspace_root / "global-home"
 
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_root, ignore_errors=True)
 
+    def load(self, *, env: dict[str, str]):
+        return load_config(workspace_root=self.workspace_root, env=env, home_dir=self.global_home)
+
     def test_load_config_reads_generic_openai_compatible_settings(self) -> None:
-        config = load_config(
-            workspace_root=self.workspace_root,
+        config = self.load(
             env={
                 "MODEL_BASE_URL": "https://example.invalid/v1",
                 "MODEL_API_KEY": "secret",
@@ -43,8 +46,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.search_max_results, 5)
 
     def test_load_config_reads_search_settings_and_bounds_result_count(self) -> None:
-        config = load_config(
-            workspace_root=self.workspace_root,
+        config = self.load(
             env={
                 "SEARCH_BASE_URL": "https://search.example.invalid/",
                 "SEARCH_API_KEY": "search-secret",
@@ -68,7 +70,7 @@ class ConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        config = load_config(workspace_root=self.workspace_root, env={})
+        config = self.load(env={})
 
         self.assertEqual(config.base_url, "https://example.invalid/v1")
         self.assertEqual(config.api_key, "from-local")
@@ -86,8 +88,7 @@ class ConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        config = load_config(
-            workspace_root=self.workspace_root,
+        config = self.load(
             env={
                 "MODEL_BASE_URL": "https://env.invalid/v1",
                 "MODEL_API_KEY": "from-env",
@@ -117,7 +118,7 @@ class ConfigTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        config = load_config(workspace_root=self.workspace_root, env={})
+        config = self.load(env={})
 
         self.assertEqual(config.model_timeout, 18.0)
         self.assertEqual(config.tool_timeout, 600.0)
@@ -136,17 +137,71 @@ class ConfigTests(unittest.TestCase):
 
         for env in invalid_envs:
             with self.assertRaisesRegex(ValueError, "must be a positive"):
-                load_config(workspace_root=self.workspace_root, env=env)
+                self.load(env=env)
 
         with self.assertRaisesRegex(ValueError, "less than or equal to 10"):
-            load_config(workspace_root=self.workspace_root, env={"SEARCH_MAX_RESULTS": "11"})
+            self.load(env={"SEARCH_MAX_RESULTS": "11"})
 
     def test_database_path_lives_under_workspace(self) -> None:
-        config = load_config(workspace_root=self.workspace_root, env={})
+        config = self.load(env={})
         self.assertEqual(
             config.database_path,
             self.workspace_root.resolve() / ".agent_app" / "agent.db",
         )
+
+    def test_load_config_reads_user_global_config_when_local_config_is_absent(self) -> None:
+        config_path = self.global_home / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            "[model]\n"
+            "base_url = 'https://global.example.invalid/v1'\n"
+            "api_key = 'global-key'\n"
+            "name = 'global-model'\n"
+            "timeout = 20\n"
+            "\n[agent]\n"
+            "tool_timeout = 45\n",
+            encoding="utf-8",
+        )
+
+        config = self.load(env={})
+
+        self.assertEqual(config.base_url, "https://global.example.invalid/v1")
+        self.assertEqual(config.api_key, "global-key")
+        self.assertEqual(config.model, "global-model")
+        self.assertEqual(config.model_timeout, 20.0)
+        self.assertEqual(config.tool_timeout, 45.0)
+
+    def test_local_and_environment_values_override_user_global_config(self) -> None:
+        save_global_model_config(
+            base_url="https://global.example.invalid/v1",
+            api_key="global-key",
+            model="global-model",
+            home_dir=self.global_home,
+        )
+        local_env = self.workspace_root / ".agent_app" / ".env.local"
+        local_env.write_text(
+            "MODEL_BASE_URL=https://local.example.invalid/v1\n"
+            "MODEL_API_KEY=local-key\n"
+            "MODEL_NAME=local-model\n",
+            encoding="utf-8",
+        )
+
+        config = self.load(env={"MODEL_NAME": "env-model"})
+
+        self.assertEqual(config.base_url, "https://local.example.invalid/v1")
+        self.assertEqual(config.api_key, "local-key")
+        self.assertEqual(config.model, "env-model")
+
+    def test_save_global_model_config_uses_requested_home(self) -> None:
+        path = save_global_model_config(
+            base_url="https://global.example.invalid/v1",
+            api_key="global-key",
+            model="global-model",
+            home_dir=self.global_home,
+        )
+
+        self.assertEqual(path, global_config_path(home_dir=self.global_home))
+        self.assertIn("[model]", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

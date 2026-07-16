@@ -5,7 +5,7 @@
 ```
 src/agent_app/
 ├── cli.py                    CLI 入口、session 解析与交互循环
-├── config.py                 配置加载（环境变量 → .env.local）
+├── config.py                 配置加载（环境变量 → 项目 .env.local → 用户全局 config.toml）
 ├── types.py                  核心数据类型（Message, TaskState, Observation 等）
 ├── agent/
 │   ├── definition.py          Agent 定义：工具集、规则、角色
@@ -53,7 +53,7 @@ evals/
 ## 核心运行流程
 
 ```
-用户输入 → CLI(argparse) → load_config(.env.local)
+用户输入 → CLI(argparse) → load_config(环境变量 / 项目配置 / 用户全局配置)
                                  │
     AgentLoop.run_turn()  ◄──────┘
          │
