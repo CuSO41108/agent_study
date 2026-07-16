@@ -9,6 +9,7 @@ from agent_app.tools.file_read import FileReadTool
 from agent_app.tools.replace_in_file import ReplaceInFileTool
 from agent_app.tools.file_write import FileWriteTool
 from agent_app.tools.shell import ShellTool
+from agent_app.tools.skill import SkillListTool, SkillLoadTool, SkillReadResourceTool
 from agent_app.tools.todo import TodoReadTool, TodoWriteTool
 from agent_app.tools.web_search import WebSearchTool
 
@@ -36,11 +37,14 @@ def build_root_registry(
     shell_runtime=None,
     runner=None,
     web_search_tool: WebSearchTool | None = None,
+    skill_registry=None,
 ) -> ToolRegistry:
     tools = _build_shared_tools(shell_runtime=shell_runtime, runner=runner)
     tools.insert(2, web_search_tool or WebSearchTool())
     if subagent_runner is not None:
         tools.insert(2, DelegateTaskTool(runner=subagent_runner))
+    if skill_registry is not None:
+        tools.extend(_build_skill_tools(skill_registry))
     return ToolRegistry(tools)
 
 
@@ -48,8 +52,12 @@ def build_worker_registry(
     *,
     shell_runtime=None,
     runner=None,
+    skill_registry=None,
 ) -> ToolRegistry:
-    return ToolRegistry(_build_shared_tools(shell_runtime=shell_runtime, runner=runner))
+    tools = _build_shared_tools(shell_runtime=shell_runtime, runner=runner)
+    if skill_registry is not None:
+        tools.extend(_build_skill_tools(skill_registry))
+    return ToolRegistry(tools)
 
 
 def build_default_registry(
@@ -58,12 +66,14 @@ def build_default_registry(
     shell_runtime=None,
     runner=None,
     web_search_tool: WebSearchTool | None = None,
+    skill_registry=None,
 ) -> ToolRegistry:
     return build_root_registry(
         subagent_runner=subagent_runner,
         shell_runtime=shell_runtime,
         runner=runner,
         web_search_tool=web_search_tool,
+        skill_registry=skill_registry,
     )
 
 
@@ -76,4 +86,12 @@ def _build_shared_tools(*, shell_runtime=None, runner=None) -> list[Tool]:
         ReplaceInFileTool(),
         FileWriteTool(),
         ShellTool(runtime=shell_runtime, runner=runner),
+    ]
+
+
+def _build_skill_tools(skill_registry) -> list[Tool]:
+    return [
+        SkillListTool(skill_registry),
+        SkillLoadTool(skill_registry),
+        SkillReadResourceTool(skill_registry),
     ]

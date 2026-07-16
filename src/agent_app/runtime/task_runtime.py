@@ -7,18 +7,19 @@ from uuid import uuid4
 from agent_app.state.session_service import ActiveTaskConflict, SessionService
 from agent_app.types import AgentEvent, Observation, PendingAction, TaskBudget, TaskState, TaskStatus, TodoItem
 
-TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled", "expired"})
+TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled", "expired", "handed_off"})
 _KEEP = object()
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     "created": frozenset({"running", "cancelled"}),
-    "running": frozenset({"waiting_user", "waiting_tool", "paused", "completed", "failed", "cancelled", "expired"}),
+    "running": frozenset({"waiting_user", "waiting_tool", "paused", "completed", "failed", "cancelled", "expired", "handed_off"}),
     "waiting_user": frozenset({"running", "cancelled", "expired"}),
     "waiting_tool": frozenset({"running", "failed", "cancelled", "expired"}),
-    "paused": frozenset({"running", "cancelled"}),
-    "completed": frozenset(),
+    "paused": frozenset({"running", "cancelled", "handed_off"}),
+    "completed": frozenset({"handed_off"}),
     "failed": frozenset(),
     "cancelled": frozenset(),
     "expired": frozenset(),
+    "handed_off": frozenset(),
 }
 
 
@@ -39,6 +40,16 @@ class TaskRuntime:
         event: AgentEvent | None = None,
     ) -> TaskState:
         active = self._sessions.get_active_task(session_id)
+        if active is not None and active.status == "created":
+            return self.transition(
+                active.id,
+                target_status="running",
+                event_type="user_message",
+                source="user",
+                payload={"content": user_input, "handoff_continuation": True},
+                reason="handoff_continuation",
+                event=event,
+            )
         if active is not None and active.status == "waiting_user":
             return self.resume_with_user_message(active.id, user_input, event=event)
         if active is not None:

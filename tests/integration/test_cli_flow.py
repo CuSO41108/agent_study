@@ -11,6 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
+
 from agent_app import cli
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.orchestrator.loop import AgentLoop
@@ -467,10 +470,30 @@ class CliIntegrationTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertEqual(exit_code, 0)
-        self.assertIn("Interactive mode. Session:", output)
-        self.assertIn("Type /help for commands", output)
+        self.assertIn("Agent Study", output)
+        self.assertIn("Interactive REPL", output)
+        self.assertIn("Type / to browse commands", output)
         session_id = (self.workspace_root / ".agent_app" / "current_session.txt").read_text(encoding="utf-8").strip()
         self.assertIn(session_id, output)
+
+    def test_slash_command_completer_lists_and_filters_repl_commands(self) -> None:
+        completer = cli._SlashCommandCompleter()
+        event = CompleteEvent(completion_requested=False)
+
+        all_commands = [
+            completion.text
+            for completion in completer.get_completions(Document("/"), event)
+        ]
+        trace_commands = [
+            completion.text
+            for completion in completer.get_completions(Document("/tr"), event)
+        ]
+        argument_commands = list(completer.get_completions(Document("/trace abc"), event))
+
+        self.assertIn("/task", all_commands)
+        self.assertIn("/trace", all_commands)
+        self.assertEqual(trace_commands, ["/trace"])
+        self.assertEqual(argument_commands, [])
 
     @patch("builtins.input", side_effect=["", "hello", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
@@ -487,7 +510,7 @@ class CliIntegrationTests(unittest.TestCase):
             ])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("Interactive mode.", stdout.getvalue())
+        self.assertIn("Interactive REPL", stdout.getvalue())
         self.assertIn("interactive turn", stdout.getvalue())
         self.assertIn("[task:", stdout.getvalue())
         self.assertIn("| completed]", stdout.getvalue())

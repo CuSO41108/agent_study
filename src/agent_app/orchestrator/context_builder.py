@@ -16,6 +16,8 @@ def build_context_messages(
     session_context: SessionContext,
     context_token_budget: int,
     evidence_message: str | None = None,
+    skill_index_message: str | None = None,
+    active_skill_messages: tuple[str, ...] = (),
 ) -> list[dict[str, str | None]]:
     if not messages:
         return []
@@ -28,6 +30,10 @@ def build_context_messages(
     ]
 
     synthetic_messages: list[dict[str, str]] = []
+    if skill_index_message:
+        synthetic_messages.append({"role": "system", "content": skill_index_message})
+    for active_skill_message in active_skill_messages:
+        synthetic_messages.append({"role": "system", "content": active_skill_message})
     if session_context.summary_text:
         synthetic_messages.append({"role": "assistant", "content": f"Session summary:\n{session_context.summary_text}"})
     if session_context.todo_items:

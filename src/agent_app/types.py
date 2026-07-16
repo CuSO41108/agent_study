@@ -86,6 +86,7 @@ TaskStatus = Literal[
     "failed",
     "cancelled",
     "expired",
+    "handed_off",
 ]
 EventType = Literal[
     "task_created",
@@ -99,6 +100,9 @@ EventType = Literal[
     "state_transition",
     "observation_recorded",
     "budget_updated",
+    "skill_activated",
+    "skill_dropped",
+    "task_handed_off",
 ]
 ObservationErrorType = Literal[
     "timeout",
@@ -193,6 +197,17 @@ class TaskState:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionOverview:
+    id: str
+    created_at: str
+    updated_at: str
+    task_count: int
+    latest_task: TaskState | None
+    active_task: TaskState | None
+    context: SessionContext
+
+
+@dataclass(slots=True, frozen=True)
 class TaskEvent:
     id: str
     task_id: str
@@ -214,6 +229,43 @@ class TaskTrace:
     trace_type: str
     payload: dict[str, Any]
     created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class SkillActivation:
+    task_id: str
+    skill_name: str
+    scope: Literal["project", "user"]
+    source_path: str
+    content_hash: str
+    version: str | None
+    activation_reason: Literal["explicit", "model_match", "inherited_handoff"]
+    state: Literal["active", "dropped"]
+    activated_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class TaskHandoff:
+    source_task_id: str
+    target_task_id: str
+    target_session_id: str
+    summary_text: str | None
+    evidence_refs: tuple[str, ...]
+    created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class SkillDraft:
+    id: str
+    session_id: str
+    scope: Literal["project", "user"]
+    skill_name: str
+    content: str
+    content_hash: str
+    status: Literal["draft", "saved"]
+    created_at: str
+    saved_at: str | None = None
+    saved_path: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
