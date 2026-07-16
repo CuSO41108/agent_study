@@ -25,7 +25,7 @@ agent-app "src/agent_app/state/ 目录下有哪些文件，各自负责什么"
 
 ## 核心亮点
 
-**TaskState 持久化状态机** — 每个用户目标都有独立的生命周期（created → running → waiting_user → completed/failed/cancelled），状态迁移以事务和乐观锁保证一致性。任务可以在一个进程中暂停、在另一个进程中恢复审批，所有中间状态落 SQLite。
+**TaskState 持久化状态机** — 每个用户目标都有独立的生命周期（created → running → waiting_user → completed/failed/cancelled），状态迁移以事务和乐观锁保证一致性。文件编辑审批可跨进程恢复；待审批 Shell 命令在重启后自动失效，所有中间状态落 SQLite。
 
 **通用 Shell 审批** — Agent 可从 workspace 根目录执行 PowerShell 命令；默认逐条人工审批，也可仅在当前 session 内对用户明确选择的命令前缀免审批。递归/批量删除保持硬拒绝，重启后待审批 Shell 命令自动失效。
 
@@ -37,7 +37,7 @@ agent-app "src/agent_app/state/ 目录下有哪些文件，各自负责什么"
 
 **Eval 评测闭环** — 20 个固定任务覆盖文件编辑、shell 边界、工具预算等场景。支持 dry-run 和 live-model 两种模式，保留工作区快照，输出 JSONL 报告。
 
-**完整 Trace 可观测** — 模型调用、审批决策、工具执行、预算快照和状态迁移按 task_id 持久化关联。`--task-trace` 提供任务结束后的可回放时间线，REPL `/trace` 自动查看当前活跃任务（无活跃任务时查看最新任务）；`--watch-trace` 以本地轮询方式持续输出新增事件，提供接近 SSE 的终端跟随体验；`--task-trace-json` 用于程序化导出。251 项测试，核心代码覆盖率 90%。
+**任务过程可回放** — 模型调用、审批决策、工具执行、预算快照和状态迁移按任务关联持久化。命令行支持查看时间线、持续跟随新增事件和导出结构化记录，便于定位一次任务为什么失败或停止。254 项测试通过，总覆盖率 90.28%。
 
 ## 日常使用
 
@@ -47,13 +47,15 @@ agent-app "帮我分析项目结构"   # 单轮执行
 agent-app "hello" --new-session  # 开启新 session
 ```
 
+交互式 REPL 启动时会显示 ASCII 标志、当前模型、工作区和 session 信息。在空提示符输入 `/` 会弹出命令候选，可用方向键选择并按 Enter 确认；单轮执行与跨进程 task 控制保持机器可读输出，不显示启动界面。
+
 **REPL 命令：**
 
 | 命令 | 说明 |
 |---|---|
 | `/task` | 查看当前 session 最新 task |
 | `/tasks` | 列出当前 session 所有 task |
-| `/trace [task-id前缀]` | 查看 task 的持久化 Trace 时间线 |
+| `/trace [task-id前缀]` | 查看任务执行时间线 |
 | `/approve [task-id前缀]` | 批准待审批的工具动作 |
 | `/reject [task-id前缀]` | 拒绝待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态 task |
@@ -65,10 +67,10 @@ agent-app "hello" --new-session  # 开启新 session
 
 ```powershell
 agent-app --task-status TASK_ID     # 查看 task 状态
-agent-app --task-trace TASK_ID      # 查看可回放 Trace 时间线
-agent-app --task-trace-json TASK_ID # 导出结构化 Trace JSON
-agent-app --watch-trace             # 跟随当前活跃/最新 task 的新增事件
-agent-app --watch-trace TASK_ID     # 跟随指定 task 的新增事件
+agent-app --task-trace TASK_ID      # 查看任务执行时间线
+agent-app --task-trace-json TASK_ID # 导出结构化任务记录
+agent-app --watch-trace             # 跟随当前活跃/最新任务的新增事件（本地轮询）
+agent-app --watch-trace TASK_ID     # 跟随指定任务的新增事件（本地轮询）
 agent-app --approve-task TASK_ID    # 批准
 agent-app --reject-task TASK_ID     # 拒绝
 agent-app --cancel-task TASK_ID     # 取消
@@ -86,7 +88,7 @@ python -m coverage report --precision=2 --fail-under=90
 
 - 本地 CLI harness，不做服务化、Web UI 或托管运行
 - ReAct 循环由项目内 `AgentLoop` 实现，不引入 LangChain/LangGraph 等外部编排框架
-- 工具路径约束在工作区内；shell 以 PowerShell 为中心
+- 文件类工具的路径约束在工作区内；Shell 以工作区为启动目录、按当前用户权限运行 PowerShell
 - `replace_in_file` 不是通用 patch 系统，不支持模糊匹配、正则或多文件编辑
 - `waiting_tool` 保留状态契约但工具仍为同步执行
 - 上下文策略以 summary、todo 和 recent tool evidence replay 为主，不做重型上下文检索
