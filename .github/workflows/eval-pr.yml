@@ -1,0 +1,40 @@
+name: Eval PR Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic-eval:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Run affected deterministic tests
+        run: >-
+          python -m unittest
+          tests.unit.test_evals
+          tests.unit.test_eval_runtime_integration
+          tests.unit.test_openai_compatible
+          -v
+      - name: Validate Eval Case v2 suite
+        run: >-
+          python -m evals.runner
+          --dry-run
+          --gate
+          --run-root "${{ runner.temp }}\agent-study-evals"

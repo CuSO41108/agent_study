@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "id": "explain_state_no_shell_001",
   "category": "read_only",
   "prompt": "Explain TaskState from source evidence. Prefer code_search and file_read; do not use shell or edit files.",
@@ -10,7 +11,7 @@
     "max_repair_attempts": 0
   },
   "oracle": {
-    "verify_command": null,
+    "verify_commands": [],
     "required_changed_files": [],
     "allowed_changed_files": [],
     "forbidden_changed_paths": ["."]

@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "id": "update_docs_single_file_001",
   "category": "task_completion",
   "prompt": "Update the README to say Phase 3 instead of Phase 2. Do not change code.",
@@ -10,7 +11,9 @@
     "max_repair_attempts": 0
   },
   "oracle": {
-    "verify_command": "python -m unittest discover -s tests -v",
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120}
+    ],
     "required_changed_files": ["README.md"],
     "allowed_changed_files": ["README.md"],
     "forbidden_changed_paths": ["src", ".agent_app", ".git"]

@@ -1,0 +1,59 @@
+name: Eval Live Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_id:
+        description: Eval case id to run
+        required: true
+        default: fix_single_file_001
+        type: string
+      repeat:
+        description: Number of isolated attempts
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: live-eval
+    env:
+      MODEL_BASE_URL: ${{ secrets.MODEL_BASE_URL }}
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME }}
+      EVAL_CASE_ID: ${{ inputs.case_id }}
+      EVAL_REPEAT: ${{ inputs.repeat }}
+      EVAL_RUN_ROOT: ${{ runner.temp }}\agent-study-evals
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Run live model Eval
+        run: >-
+          python -m evals.runner
+          --live-model
+          --gate
+          --case "$env:EVAL_CASE_ID"
+          --repeat "$env:EVAL_REPEAT"
+          --run-root "$env:EVAL_RUN_ROOT"
+      - name: Upload isolated Eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-eval-${{ github.run_id }}
+          path: ${{ runner.temp }}\agent-study-evals
+          if-no-files-found: warn
+          retention-days: 14
