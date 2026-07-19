@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "id": "create_changelog_001",
+  "category": "task_completion",
+  "prompt": "Create CHANGELOG.md with a '# Changelog' heading and one bullet saying 'Phase 2 baseline'. Do not modify existing files, then verify the new file.",
+  "fixture": "phase_banner",
+  "budget": {
+    "max_model_calls": 7,
+    "max_tool_calls": 7,
+    "max_tokens": 24000,
+    "max_retries": 1
+  },
+  "oracle": {
+    "verify_commands": [
+      {
+        "argv": [
+          "python",
+          "-c",
+          "from pathlib import Path; text=Path('CHANGELOG.md').read_text(encoding='utf-8'); assert '# Changelog' in text and 'Phase 2 baseline' in text"
+        ],
+        "timeout_seconds": 30
+      }
+    ],
+    "final_output_contains": ["CHANGELOG.md"],
+    "required_changed_files": ["CHANGELOG.md"],
+    "allowed_changed_files": ["CHANGELOG.md"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_tools": ["file_write"],
+    "required_any_tools": [["file_read", "shell"]],
+    "ordered_tools": ["file_write"],
+    "forbidden_tools": ["replace_in_file"],
+    "max_identical_tool_calls": 1
+  }
+}

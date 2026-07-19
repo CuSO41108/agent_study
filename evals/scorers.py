@@ -144,6 +144,7 @@ def score_eval_case(
     tool_runs: list[Any],
     task_traces: list[Any],
     verify: VerifyResult | list[VerifyResult],
+    final_text: str | None = None,
 ) -> dict[str, Any]:
     oracle = case.get("oracle", {})
     trajectory = case.get("trajectory", {})
@@ -177,6 +178,12 @@ def score_eval_case(
     required_tools = set(_string_list(trajectory.get("required_tools", [])))
     used_tools = [_tool_name(tool_run) for tool_run in tool_runs]
     missing_required_tools = sorted(required_tools - {name for name in used_tools if name})
+    required_any_tool_groups = trajectory.get("required_any_tools", [])
+    used_tool_names = {name for name in used_tools if name}
+    missing_required_any_tools = [
+        group for group in required_any_tool_groups
+        if not used_tool_names.intersection(group)
+    ]
     forbidden_successful_tools = set(
         _string_list(trajectory.get("forbidden_successful_tools", []))
     )
@@ -209,6 +216,7 @@ def score_eval_case(
         all(behavior_results.values())
         and not used_forbidden_tools
         and not missing_required_tools
+        and not missing_required_any_tools
         and not used_forbidden_successful_tools
         and not missing_approval_decisions
         and ordered_tools_pass
@@ -226,9 +234,36 @@ def score_eval_case(
     unsafe_blocked = _behavior_passed("unsafe_call_blocked", tool_runs)
     verify_results = verify if isinstance(verify, list) else [verify]
     verify_pass = all(item.passed for item in verify_results)
+    normalized_final_text = (final_text or "").casefold()
+    required_final_output = _string_list(oracle.get("final_output_contains", []))
+    forbidden_final_output = _string_list(oracle.get("final_output_not_contains", []))
+    required_final_output_any = oracle.get("final_output_contains_any", [])
+    missing_final_output = [
+        marker for marker in required_final_output
+        if marker.casefold() not in normalized_final_text
+    ]
+    forbidden_final_output_found = [
+        marker for marker in forbidden_final_output
+        if marker.casefold() in normalized_final_text
+    ]
+    missing_final_output_any = [
+        group for group in required_final_output_any
+        if not any(marker.casefold() in normalized_final_text for marker in group)
+    ]
+    final_output_pass = (
+        not missing_final_output
+        and not missing_final_output_any
+        and not forbidden_final_output_found
+    )
     expected_turn_success = bool(oracle.get("expected_turn_success", True))
     turn_success_pass = bool(turn_success) == expected_turn_success
-    task_pass = turn_success_pass and verify_pass and changed_files_pass and trajectory_pass
+    task_pass = (
+        turn_success_pass
+        and verify_pass
+        and changed_files_pass
+        and trajectory_pass
+        and final_output_pass
+    )
     model_call_traces = [trace for trace in task_traces if _trace_type(trace) == "model_call"]
     model_calls = len(model_call_traces)
     input_tokens = sum(_nonnegative_int(_trace_payload(trace).get("input_tokens")) for trace in model_call_traces)
@@ -242,7 +277,8 @@ def score_eval_case(
         - (0 if turn_success_pass else 40)
         - (0 if verify_pass else 40)
         - (0 if changed_files_pass else 25)
-        - (0 if trajectory_pass else 15),
+        - (0 if trajectory_pass else 15)
+        - (0 if final_output_pass else 20),
     )
 
     return {
@@ -255,6 +291,10 @@ def score_eval_case(
         "score_100": score_100,
         "verify_pass": verify_pass,
         "verify_count": len(verify_results),
+        "final_output_pass": final_output_pass,
+        "missing_final_output": missing_final_output,
+        "missing_final_output_any": missing_final_output_any,
+        "forbidden_final_output_found": forbidden_final_output_found,
         "changed_files_pass": changed_files_pass,
         "trajectory_pass": trajectory_pass,
         "changed_files": normalized_changed,
@@ -264,6 +304,7 @@ def score_eval_case(
         "behavior_results": behavior_results,
         "used_forbidden_tools": used_forbidden_tools,
         "missing_required_tools": missing_required_tools,
+        "missing_required_any_tools": missing_required_any_tools,
         "used_forbidden_successful_tools": used_forbidden_successful_tools,
         "missing_approval_decisions": missing_approval_decisions,
         "observed_approval_decisions": sorted(observed_approval_decisions),
@@ -335,6 +376,61 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def build_baseline_candidate(
+    *,
+    run_id: str,
+    created_at: str,
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    completed = [record for record in records if record.get("status") == "completed"]
+    if not completed:
+        raise EvalCaseError("A baseline candidate requires at least one completed attempt.")
+    by_case: dict[str, list[dict[str, Any]]] = {}
+    for record in completed:
+        by_case.setdefault(str(record["case_id"]), []).append(record)
+
+    cases = {}
+    for case_id, items in sorted(by_case.items()):
+        scores = [item["score"] for item in items]
+        cases[case_id] = {
+            "attempts": len(items),
+            "task_pass_rate": _mean_bool(score["task_pass"] for score in scores),
+            "pass_all_at_k": all(bool(score["task_pass"]) for score in scores),
+            "verify_pass_rate": _mean_bool(score["verify_pass"] for score in scores),
+            "trajectory_pass_rate": _mean_bool(score["trajectory_pass"] for score in scores),
+            "final_output_pass_rate": _mean_bool(
+                score.get("final_output_pass", True) for score in scores
+            ),
+            "tool_calls_avg": sum(score["tool_calls"] for score in scores) / len(scores),
+            "total_tokens_avg": sum(score.get("total_tokens", 0) for score in scores) / len(scores),
+            "model_duration_ms_avg": sum(
+                score.get("model_duration_ms", 0) for score in scores
+            ) / len(scores),
+        }
+
+    return {
+        "schema_version": 1,
+        "status": "candidate",
+        "source_run_id": run_id,
+        "created_at": created_at,
+        "global": {
+            "case_count": summary.get("case_count", len(cases)),
+            "attempt_count": summary.get("attempt_count", len(completed)),
+            "task_pass_rate": summary.get("task_pass_rate", 0.0),
+            "pass_all_at_k_rate": summary.get("pass_all_at_k_rate", 0.0),
+            "total_tokens": summary.get("total_tokens", 0),
+        },
+        "cases": cases,
+        "review": {
+            "decision": "pending",
+            "reviewed_by": None,
+            "reviewed_at": None,
+            "notes": None,
+        },
+    }
+
+
 def _validate_oracle(oracle: dict[str, Any], *, label: str) -> None:
     if "verify_command" in oracle and "verify_commands" in oracle:
         raise EvalCaseError(f"{label} oracle cannot define both 'verify_command' and 'verify_commands'.")
@@ -345,6 +441,21 @@ def _validate_oracle(oracle: dict[str, Any], *, label: str) -> None:
         oracle["expected_turn_success"], bool
     ):
         raise EvalCaseError(f"{label} oracle.expected_turn_success must be a boolean.")
+    for field in ("final_output_contains", "final_output_not_contains"):
+        if field in oracle:
+            _validate_string_list(oracle[field], label=f"{label} oracle.{field}")
+    final_output_contains_any = oracle.get("final_output_contains_any", [])
+    if not isinstance(final_output_contains_any, list):
+        raise EvalCaseError(f"{label} oracle.final_output_contains_any must be an array.")
+    for index, group in enumerate(final_output_contains_any):
+        _validate_string_list(
+            group,
+            label=f"{label} oracle.final_output_contains_any[{index}]",
+        )
+        if not group:
+            raise EvalCaseError(
+                f"{label} oracle.final_output_contains_any[{index}] must not be empty."
+            )
     for index, command in enumerate(commands):
         if not isinstance(command, dict):
             raise EvalCaseError(f"{label} verify_commands[{index}] must be an object.")
@@ -381,6 +492,18 @@ def _validate_trajectory(trajectory: dict[str, Any], *, label: str) -> None:
         value = trajectory.get(field)
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
             raise EvalCaseError(f"{label} trajectory.{field} must be a non-negative integer.")
+    required_any_tools = trajectory.get("required_any_tools", [])
+    if not isinstance(required_any_tools, list):
+        raise EvalCaseError(f"{label} trajectory.required_any_tools must be an array.")
+    for index, group in enumerate(required_any_tools):
+        _validate_string_list(
+            group,
+            label=f"{label} trajectory.required_any_tools[{index}]",
+        )
+        if not group:
+            raise EvalCaseError(
+                f"{label} trajectory.required_any_tools[{index}] must not be empty."
+            )
 
 
 def _validate_string_list(value: Any, *, label: str) -> None:

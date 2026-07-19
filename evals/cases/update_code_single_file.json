@@ -14,6 +14,7 @@
     "verify_commands": [
       {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120}
     ],
+    "final_output_contains": ["Phase 3", "banner.py"],
     "required_changed_files": ["src/banner.py"],
     "allowed_changed_files": ["src/banner.py"],
     "forbidden_changed_paths": ["README.md", ".agent_app", ".git"]

@@ -12,6 +12,7 @@
   },
   "oracle": {
     "verify_commands": [],
+    "final_output_contains": ["state.py", "TaskState", "id", "status", "step", "stop_reason"],
     "required_changed_files": [],
     "allowed_changed_files": [],
     "forbidden_changed_paths": ["."]
