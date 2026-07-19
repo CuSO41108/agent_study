@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "id": "run_existing_tests_read_only_001",
+  "category": "task_completion",
+  "prompt": "Run the existing unit tests and report whether they pass. Do not edit any files.",
+  "fixture": "string_tools",
+  "budget": {
+    "max_model_calls": 4,
+    "max_tool_calls": 6,
+    "max_tokens": 12000,
+    "max_retries": 0
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120}
+    ],
+    "final_output_contains_any": [["pass", "ok", "success"]],
+    "required_changed_files": [],
+    "allowed_changed_files": [],
+    "forbidden_changed_paths": ["."]
+  },
+  "trajectory": {
+    "required_tools": ["shell"],
+    "forbidden_tools": ["file_write", "replace_in_file"],
+    "max_identical_tool_calls": 2
+  }
+}
