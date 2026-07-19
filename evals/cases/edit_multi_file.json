@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "id": "edit_multi_file_001",
   "category": "task_completion",
   "prompt": "Update the project phase label from Phase 2 to Phase 3 in both code and README, then run the unit tests.",
@@ -10,7 +11,9 @@
     "max_retries": 1
   },
   "oracle": {
-    "verify_command": "python -m unittest discover -s tests -v",
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120}
+    ],
     "required_changed_files": ["src/banner.py", "README.md"],
     "allowed_changed_files": ["src/banner.py", "README.md"],
     "forbidden_changed_paths": [".agent_app", ".git"]

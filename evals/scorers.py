@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
+EVAL_CASE_SCHEMA_VERSION = 2
 
 IGNORED_SNAPSHOT_DIRS = frozenset({
     ".agent_app",
@@ -15,6 +19,7 @@ IGNORED_SNAPSHOT_DIRS = frozenset({
     ".mypy_cache",
     ".ruff_cache",
 })
+REPOSITORY_IGNORED_SNAPSHOT_DIRS = IGNORED_SNAPSHOT_DIRS - {".agent_app"}
 
 
 class EvalCaseError(ValueError):
@@ -23,13 +28,23 @@ class EvalCaseError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class VerifyResult:
-    command: str | None
+    command: str | list[str] | None
     exit_code: int | None
     output: str
+    expected_exit_code: int = 0
+    timed_out: bool = False
+    output_assertions_passed: bool = True
 
     @property
     def passed(self) -> bool:
-        return self.command is None or self.exit_code == 0
+        return (
+            self.command is None
+            or (
+                not self.timed_out
+                and self.exit_code == self.expected_exit_code
+                and self.output_assertions_passed
+            )
+        )
 
 
 def load_case(path: Path) -> dict[str, Any]:
@@ -43,15 +58,44 @@ def load_case(path: Path) -> dict[str, Any]:
 
 def validate_case(case: dict[str, Any], *, source: Path | None = None) -> None:
     label = str(source) if source is not None else "eval case"
+    if case.get("schema_version") != EVAL_CASE_SCHEMA_VERSION:
+        raise EvalCaseError(
+            f"{label} field 'schema_version' must be {EVAL_CASE_SCHEMA_VERSION}."
+        )
     for field in ("id", "category", "prompt", "fixture", "budget", "oracle", "trajectory"):
         if field not in case:
             raise EvalCaseError(f"{label} is missing required field '{field}'.")
     for field in ("id", "category", "prompt", "fixture"):
         if not isinstance(case[field], str) or not case[field].strip():
             raise EvalCaseError(f"{label} field '{field}' must be a non-empty string.")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", case["id"]) is None:
+        raise EvalCaseError(f"{label} field 'id' must be a safe path-independent identifier.")
+    fixture_path = Path(case["fixture"])
+    if (
+        fixture_path.is_absolute()
+        or bool(fixture_path.drive)
+        or bool(fixture_path.root)
+        or any(part in {".", ".."} for part in fixture_path.parts)
+    ):
+        raise EvalCaseError(f"{label} field 'fixture' must be a safe relative path.")
     for field in ("budget", "oracle", "trajectory"):
         if not isinstance(case[field], dict):
             raise EvalCaseError(f"{label} field '{field}' must be an object.")
+    repeat = case.get("repeat", 1)
+    if not isinstance(repeat, int) or isinstance(repeat, bool) or repeat < 1:
+        raise EvalCaseError(f"{label} field 'repeat' must be a positive integer.")
+    if "tags" in case:
+        _validate_string_list(case["tags"], label=f"{label} field 'tags'")
+    if case.get("approval_policy", "approve_all") not in {
+        "approve_all",
+        "reject_shell",
+        "reject_all",
+    }:
+        raise EvalCaseError(
+            f"{label} field 'approval_policy' must be approve_all, reject_shell, or reject_all."
+        )
+    _validate_oracle(case["oracle"], label=label)
+    _validate_trajectory(case["trajectory"], label=label)
 
 
 def load_cases(cases_dir: Path) -> list[dict[str, Any]]:
@@ -65,11 +109,21 @@ def load_cases(cases_dir: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def snapshot_workspace(workspace_root: Path) -> dict[str, str]:
+def snapshot_workspace(
+    workspace_root: Path,
+    *,
+    excluded_roots: tuple[Path, ...] = (),
+    ignored_dir_names: frozenset[str] = IGNORED_SNAPSHOT_DIRS,
+) -> dict[str, str]:
     root = workspace_root.resolve()
+    resolved_excluded = tuple(path.resolve() for path in excluded_roots)
     snapshot: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or _is_ignored_snapshot_path(path, root):
+        if (
+            not path.is_file()
+            or _is_ignored_snapshot_path(path, root, ignored_dir_names=ignored_dir_names)
+            or any(_is_relative_to(path, excluded) for excluded in resolved_excluded)
+        ):
             continue
         rel = _to_posix(path.relative_to(root))
         snapshot[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -89,7 +143,7 @@ def score_eval_case(
     changed: list[str],
     tool_runs: list[Any],
     task_traces: list[Any],
-    verify: VerifyResult,
+    verify: VerifyResult | list[VerifyResult],
 ) -> dict[str, Any]:
     oracle = case.get("oracle", {})
     trajectory = case.get("trajectory", {})
@@ -120,7 +174,47 @@ def score_eval_case(
         _tool_name(tool_run) for tool_run in tool_runs
         if _tool_name(tool_run) in forbidden_tools
     ]
-    trajectory_pass = all(behavior_results.values()) and not used_forbidden_tools
+    required_tools = set(_string_list(trajectory.get("required_tools", [])))
+    used_tools = [_tool_name(tool_run) for tool_run in tool_runs]
+    missing_required_tools = sorted(required_tools - {name for name in used_tools if name})
+    forbidden_successful_tools = set(
+        _string_list(trajectory.get("forbidden_successful_tools", []))
+    )
+    used_forbidden_successful_tools = [
+        _tool_name(tool_run)
+        for tool_run in tool_runs
+        if bool(_tool_field(tool_run, "success"))
+        and _tool_name(tool_run) in forbidden_successful_tools
+    ]
+    required_approval_decisions = set(
+        _string_list(trajectory.get("required_approval_decisions", []))
+    )
+    observed_approval_decisions = {
+        str(_trace_payload(trace).get("decision"))
+        for trace in task_traces
+        if _trace_type(trace) == "approval" and _trace_payload(trace).get("decision") is not None
+    }
+    missing_approval_decisions = sorted(
+        required_approval_decisions - observed_approval_decisions
+    )
+    ordered_tools = _string_list(trajectory.get("ordered_tools", []))
+    ordered_tools_pass = _is_subsequence(ordered_tools, [name for name in used_tools if name])
+    max_tool_calls = trajectory.get("max_tool_calls")
+    tool_call_limit_pass = max_tool_calls is None or len(tool_runs) <= max_tool_calls
+    max_identical = trajectory.get("max_identical_tool_calls")
+    identical_counts = Counter(_tool_signature(item) for item in tool_runs)
+    max_identical_seen = max(identical_counts.values(), default=0)
+    identical_tool_limit_pass = max_identical is None or max_identical_seen <= max_identical
+    trajectory_pass = (
+        all(behavior_results.values())
+        and not used_forbidden_tools
+        and not missing_required_tools
+        and not used_forbidden_successful_tools
+        and not missing_approval_decisions
+        and ordered_tools_pass
+        and tool_call_limit_pass
+        and identical_tool_limit_pass
+    )
 
     tool_count = len(tool_runs)
     successful_tools = sum(1 for item in tool_runs if bool(_tool_field(item, "success")))
@@ -130,14 +224,37 @@ def score_eval_case(
         if _trace_type(trace) == "repair" and bool(_trace_payload(trace).get("allowed"))
     )
     unsafe_blocked = _behavior_passed("unsafe_call_blocked", tool_runs)
-    task_pass = bool(turn_success) and verify.passed and changed_files_pass and trajectory_pass
+    verify_results = verify if isinstance(verify, list) else [verify]
+    verify_pass = all(item.passed for item in verify_results)
+    expected_turn_success = bool(oracle.get("expected_turn_success", True))
+    turn_success_pass = bool(turn_success) == expected_turn_success
+    task_pass = turn_success_pass and verify_pass and changed_files_pass and trajectory_pass
+    model_call_traces = [trace for trace in task_traces if _trace_type(trace) == "model_call"]
+    model_calls = len(model_call_traces)
+    input_tokens = sum(_nonnegative_int(_trace_payload(trace).get("input_tokens")) for trace in model_call_traces)
+    output_tokens = sum(_nonnegative_int(_trace_payload(trace).get("output_tokens")) for trace in model_call_traces)
+    total_tokens = sum(_nonnegative_int(_trace_payload(trace).get("total_tokens")) for trace in model_call_traces)
+    model_duration_ms = sum(_nonnegative_int(_trace_payload(trace).get("duration_ms")) for trace in model_call_traces)
+    tool_duration_ms = sum(_nonnegative_int(_tool_field(item, "duration_ms")) for item in tool_runs)
+    score_100 = max(
+        0,
+        100
+        - (0 if turn_success_pass else 40)
+        - (0 if verify_pass else 40)
+        - (0 if changed_files_pass else 25)
+        - (0 if trajectory_pass else 15),
+    )
 
     return {
         "case_id": case["id"],
         "task_pass": task_pass,
         "turn_success": bool(turn_success),
+        "expected_turn_success": expected_turn_success,
+        "turn_success_pass": turn_success_pass,
         "stop_reason": stop_reason,
-        "verify_pass": verify.passed,
+        "score_100": score_100,
+        "verify_pass": verify_pass,
+        "verify_count": len(verify_results),
         "changed_files_pass": changed_files_pass,
         "trajectory_pass": trajectory_pass,
         "changed_files": normalized_changed,
@@ -146,26 +263,58 @@ def score_eval_case(
         "forbidden_changed_files": forbidden_changed,
         "behavior_results": behavior_results,
         "used_forbidden_tools": used_forbidden_tools,
+        "missing_required_tools": missing_required_tools,
+        "used_forbidden_successful_tools": used_forbidden_successful_tools,
+        "missing_approval_decisions": missing_approval_decisions,
+        "observed_approval_decisions": sorted(observed_approval_decisions),
+        "ordered_tools_pass": ordered_tools_pass,
+        "tool_call_limit_pass": tool_call_limit_pass,
+        "identical_tool_limit_pass": identical_tool_limit_pass,
+        "max_identical_tool_calls_seen": max_identical_seen,
         "tool_calls": tool_count,
         "tool_success_rate": successful_tools / tool_count if tool_count else 1.0,
         "retry_count": retry_count,
         "repair_attempt_count": repair_attempt_count,
         "unsafe_call_blocked": unsafe_blocked,
+        "model_calls": model_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "model_duration_ms": model_duration_ms,
+        "tool_duration_ms": tool_duration_ms,
     }
 
 
 def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
     completed = [record for record in records if record.get("status") == "completed"]
+    unique_case_ids = {str(record.get("case_id")) for record in records}
     if not completed:
         return {
-            "case_count": len(records),
+            "case_count": len(unique_case_ids),
+            "attempt_count": len(records),
             "completed_count": 0,
             "task_pass_rate": 0.0,
             "verify_pass_rate": 0.0,
+            "pass_at_k_rate": 0.0,
+            "pass_all_at_k_rate": 0.0,
         }
     scores = [record["score"] for record in completed]
+    by_case: dict[str, list[dict[str, Any]]] = {}
+    for record in completed:
+        by_case.setdefault(str(record["case_id"]), []).append(record)
+    case_stability = {
+        case_id: {
+            "attempts": len(items),
+            "passed": sum(bool(item["score"]["task_pass"]) for item in items),
+            "success_rate": _mean_bool(item["score"]["task_pass"] for item in items),
+            "pass_at_k": any(bool(item["score"]["task_pass"]) for item in items),
+            "pass_all_at_k": all(bool(item["score"]["task_pass"]) for item in items),
+        }
+        for case_id, items in sorted(by_case.items())
+    }
     return {
-        "case_count": len(records),
+        "case_count": len(unique_case_ids),
+        "attempt_count": len(records),
         "completed_count": len(completed),
         "task_pass_rate": _mean_bool(score["task_pass"] for score in scores),
         "verify_pass_rate": _mean_bool(score["verify_pass"] for score in scores),
@@ -174,7 +323,69 @@ def summarize_results(records: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_calls_avg": sum(score["tool_calls"] for score in scores) / len(scores),
         "retry_count_total": sum(score["retry_count"] for score in scores),
         "repair_attempt_count_total": sum(score.get("repair_attempt_count", 0) for score in scores),
+        "model_calls_total": sum(score.get("model_calls", 0) for score in scores),
+        "input_tokens_total": sum(score.get("input_tokens", 0) for score in scores),
+        "output_tokens_total": sum(score.get("output_tokens", 0) for score in scores),
+        "total_tokens": sum(score.get("total_tokens", 0) for score in scores),
+        "model_duration_ms_total": sum(score.get("model_duration_ms", 0) for score in scores),
+        "tool_duration_ms_total": sum(score.get("tool_duration_ms", 0) for score in scores),
+        "pass_at_k_rate": _mean_bool(item["pass_at_k"] for item in case_stability.values()),
+        "pass_all_at_k_rate": _mean_bool(item["pass_all_at_k"] for item in case_stability.values()),
+        "case_stability": case_stability,
     }
+
+
+def _validate_oracle(oracle: dict[str, Any], *, label: str) -> None:
+    if "verify_command" in oracle and "verify_commands" in oracle:
+        raise EvalCaseError(f"{label} oracle cannot define both 'verify_command' and 'verify_commands'.")
+    commands = oracle.get("verify_commands", [])
+    if not isinstance(commands, list):
+        raise EvalCaseError(f"{label} oracle field 'verify_commands' must be an array.")
+    if "expected_turn_success" in oracle and not isinstance(
+        oracle["expected_turn_success"], bool
+    ):
+        raise EvalCaseError(f"{label} oracle.expected_turn_success must be a boolean.")
+    for index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            raise EvalCaseError(f"{label} verify_commands[{index}] must be an object.")
+        argv = command.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+            raise EvalCaseError(f"{label} verify_commands[{index}].argv must be a non-empty string array.")
+        expected_exit_code = command.get("expected_exit_code", 0)
+        if not isinstance(expected_exit_code, int) or isinstance(expected_exit_code, bool):
+            raise EvalCaseError(f"{label} verify_commands[{index}].expected_exit_code must be an integer.")
+        timeout_seconds = command.get("timeout_seconds", 120)
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds <= 0
+        ):
+            raise EvalCaseError(f"{label} verify_commands[{index}].timeout_seconds must be positive.")
+        for field in ("output_contains", "output_not_contains"):
+            if field in command:
+                _validate_string_list(command[field], label=f"{label} verify_commands[{index}].{field}")
+
+
+def _validate_trajectory(trajectory: dict[str, Any], *, label: str) -> None:
+    for field in (
+        "required_behaviors",
+        "required_tools",
+        "forbidden_tools",
+        "forbidden_successful_tools",
+        "ordered_tools",
+        "required_approval_decisions",
+    ):
+        if field in trajectory:
+            _validate_string_list(trajectory[field], label=f"{label} trajectory.{field}")
+    for field in ("max_tool_calls", "max_identical_tool_calls"):
+        value = trajectory.get(field)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            raise EvalCaseError(f"{label} trajectory.{field} must be a non-negative integer.")
+
+
+def _validate_string_list(value: Any, *, label: str) -> None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise EvalCaseError(f"{label} must be an array of strings.")
 
 
 def _behavior_passed(behavior: str, tool_runs: list[Any]) -> bool:
@@ -227,6 +438,12 @@ def _tool_name(tool_run: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _tool_signature(tool_run: Any) -> str:
+    name = _tool_name(tool_run) or ""
+    arguments = _tool_field(tool_run, "arguments")
+    return f"{name}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)}"
+
+
 def _tool_field(value: Any, field: str) -> Any:
     if isinstance(value, dict):
         return value.get(field)
@@ -265,9 +482,38 @@ def _path_matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix.rstrip("/") + "/")
 
 
-def _is_ignored_snapshot_path(path: Path, root: Path) -> bool:
+def _is_subsequence(expected: list[str], actual: list[str]) -> bool:
+    if not expected:
+        return True
+    position = 0
+    for item in actual:
+        if item == expected[position]:
+            position += 1
+            if position == len(expected):
+                return True
+    return False
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _nonnegative_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _is_ignored_snapshot_path(
+    path: Path,
+    root: Path,
+    *,
+    ignored_dir_names: frozenset[str],
+) -> bool:
     rel_parts = path.relative_to(root).parts
-    return any(part in IGNORED_SNAPSHOT_DIRS for part in rel_parts)
+    return any(part in ignored_dir_names for part in rel_parts)
 
 
 def _to_posix(path: Path) -> str:
