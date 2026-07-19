@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "id": "inventory_document_default_threshold_001",
+  "category": "task_completion",
+  "prompt": "Add DEFAULT_LOW_STOCK_THRESHOLD = 5 and classify_stock(stock, threshold=DEFAULT_LOW_STOCK_THRESHOLD), returning 'low' at or below the threshold and 'available' above it. Add tests, document the default in README, and run the suite.",
+  "fixture": "inventory_service",
+  "budget": {
+    "max_model_calls": 14,
+    "max_tool_calls": 16,
+    "max_tokens": 45000,
+    "max_repair_attempts": 2
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "import sys; sys.path.insert(0, 'src'); from inventory import DEFAULT_LOW_STOCK_THRESHOLD, classify_stock; assert DEFAULT_LOW_STOCK_THRESHOLD == 5; assert classify_stock(5) == 'low'; assert classify_stock(6) == 'available'"], "timeout_seconds": 30},
+      {"argv": ["python", "-c", "from pathlib import Path; text=Path('README.md').read_text(encoding='utf-8'); assert '5' in text and 'threshold' in text.lower()"], "timeout_seconds": 30}
+    ],
+    "final_output_contains": ["README", "DEFAULT_LOW_STOCK_THRESHOLD"],
+    "required_changed_files": ["src/inventory.py", "tests/test_inventory.py", "README.md"],
+    "allowed_changed_files": ["src/inventory.py", "tests/test_inventory.py", "README.md"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "required_any_tools": [["replace_in_file", "file_write"]]
+  }
+}
