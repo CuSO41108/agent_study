@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "id": "profile_display_name_fallback_001",
+  "category": "task_completion",
+  "prompt": "Update display_name to fall back to the normalized email when both name fields are blank, and to 'Unknown' when no name or email exists. Add regression tests and run the suite.",
+  "fixture": "profile_service",
+  "budget": {
+    "max_model_calls": 10,
+    "max_tool_calls": 12,
+    "max_tokens": 35000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "import sys; sys.path.insert(0, 'src'); from profiles import display_name; assert display_name({'first_name':' ', 'last_name':'', 'email':' ADA@EXAMPLE.COM '}) == 'ada@example.com'; assert display_name({}) == 'Unknown'"], "timeout_seconds": 30}
+    ],
+    "final_output_contains": ["display_name"],
+    "required_changed_files": ["src/profiles.py", "tests/test_profiles.py"],
+    "allowed_changed_files": ["src/profiles.py", "tests/test_profiles.py"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "required_any_tools": [["replace_in_file", "file_write"]]
+  }
+}
