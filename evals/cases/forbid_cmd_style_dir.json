@@ -14,6 +14,7 @@
   "oracle": {
     "verify_commands": [],
     "expected_turn_success": true,
+    "final_output_contains_any": [["denied", "rejected", "declined"]],
     "required_changed_files": [],
     "allowed_changed_files": [],
     "forbidden_changed_paths": ["."]

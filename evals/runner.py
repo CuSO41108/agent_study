@@ -32,6 +32,7 @@ from agent_app.types import TaskBudget
 from evals.scorers import (
     REPOSITORY_IGNORED_SNAPSHOT_DIRS,
     VerifyResult,
+    build_baseline_candidate,
     changed_files,
     load_cases,
     score_eval_case,
@@ -50,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, help="Run at most this many cases after filtering.")
     parser.add_argument("--repeat", type=int, help="Override the per-case repeat count.")
     parser.add_argument("--gate", action="store_true", help="Return a non-zero exit code when a completed attempt fails.")
+    parser.add_argument(
+        "--write-baseline-candidate",
+        action="store_true",
+        help="Write a review-pending baseline candidate for completed attempts.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate cases and emit skipped records without calling a model.")
     parser.add_argument("--live-model", action="store_true", help="Actually call the configured model. Omit for non-network reporting.")
     return parser
@@ -138,6 +144,23 @@ def main(argv: list[str] | None = None) -> int:
     if quota_exhausted:
         summary["action_required"] = "Model quota is exhausted. Please top up the configured provider account and run the suite again."
         print(summary["action_required"], file=sys.stderr)
+    baseline_candidate_path = None
+    if args.write_baseline_candidate and not quota_exhausted and not repository_changes:
+        completed_records = [record for record in records if record.get("status") == "completed"]
+        if completed_records:
+            baseline_candidate_path = run_dir / "baseline-candidate.json"
+            _write_json(
+                baseline_candidate_path,
+                build_baseline_candidate(
+                    run_id=run_id,
+                    created_at=datetime.now(UTC).isoformat(),
+                    records=records,
+                    summary=summary,
+                ),
+            )
+    summary["baseline_candidate_path"] = (
+        str(baseline_candidate_path) if baseline_candidate_path is not None else None
+    )
     _write_json(summary_path, summary)
     print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "result_path": str(result_path), "summary_path": str(summary_path), "summary": summary}, ensure_ascii=False))
     if quota_exhausted:
@@ -240,6 +263,7 @@ def run_eval_case(
         tool_runs=result.tool_runs,
         task_traces=task_traces,
         verify=verify,
+        final_text=result.final_text,
     )
     status = "quota_exhausted" if _quota_exhausted(task_traces) else "completed"
     record = {

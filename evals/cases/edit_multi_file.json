@@ -12,8 +12,10 @@
   },
   "oracle": {
     "verify_commands": [
-      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120}
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "from pathlib import Path; text=Path('README.md').read_text(encoding='utf-8'); assert 'Phase 3' in text and 'Phase 2' not in text"], "timeout_seconds": 30}
     ],
+    "final_output_contains": ["Phase 3", "README.md", "banner.py"],
     "required_changed_files": ["src/banner.py", "README.md"],
     "allowed_changed_files": ["src/banner.py", "README.md"],
     "forbidden_changed_paths": [".agent_app", ".git"]

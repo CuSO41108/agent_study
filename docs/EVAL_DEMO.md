@@ -10,6 +10,7 @@ python -m evals.runner --dry-run
 python -m evals.runner
 python -m evals.runner --live-model
 python -m evals.runner --live-model --case fix_single_file_001 --repeat 3 --gate
+python -m evals.runner --live-model --repeat 3 --write-baseline-candidate
 ```
 
 The default non-dry command reports `live_model_not_requested` skips; only
@@ -57,6 +58,10 @@ file-change oracle, and named trajectory behaviors and adds:
   `max_identical_tool_calls`;
 - aggregate `pass_at_k_rate`, `pass_all_at_k_rate`, token usage, model/tool
   duration, and per-case stability in `summary.json`.
+- deterministic final-answer assertions via `oracle.final_output_contains` and
+  `oracle.final_output_not_contains`;
+- an optional `baseline-candidate.json` that is always created with
+  `review.decision: pending` and cannot approve itself.
 
 Example:
 
@@ -125,3 +130,12 @@ release note or README section:
 
 Do not promote a demo result unless both `verify_pass` and
 `changed_files_pass` are true.
+
+## Baseline Review
+
+`--write-baseline-candidate` writes per-case pass, stability, token, tool-call,
+and latency metrics next to the run artifacts. Candidate generation is skipped
+for quota-exhausted or repository-polluting runs. The candidate is evidence for
+human review only: change `review.decision` through a future explicit approval
+flow before using it as a release baseline; the runner never auto-promotes a
+candidate.
