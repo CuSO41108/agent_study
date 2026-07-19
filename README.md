@@ -34,7 +34,7 @@ agent-app --configure
 
 **持久化 TaskState 状态机** — 每个目标都有独立生命周期（`created → running → waiting_user → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
 
-**CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
+**CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。提交任务后会持续追加执行事件：规划状态、准备调用的工具与命令、Shell 的标准输出/错误输出（逐行）和模型文本分片都会立即显示，不再等待整个回合结束；空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
 
 **跨 Session 进度与接力** — `/sessions`（`/progress` 别名）在终端直接浏览最近 Session 的任务、未完成计划、todo、摘要和等待项。`/handoff` 可把安全 checkpoint 接力到新 Session，只复制目标、剩余计划、摘要、证据引用和哈希校验后的 active Skill，不复制原始历史或待审批动作。
 
