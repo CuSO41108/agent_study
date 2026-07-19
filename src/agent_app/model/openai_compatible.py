@@ -77,7 +77,11 @@ class OpenAICompatibleModelClient:
             return ModelResponse(
                 assistant_text=None,
                 raw_response={"status": exc.code, "body": response_body},
-                error_type="http_error",
+                error_type=(
+                    "quota_exhausted"
+                    if _looks_like_quota_exhaustion(status=exc.code, body=response_body)
+                    else "http_error"
+                ),
                 model_name=self.model,
                 input_tokens=estimated_input_tokens,
                 total_tokens=estimated_input_tokens,
@@ -219,3 +223,17 @@ def _usage_int(usage: dict[str, Any], *keys: str) -> int:
         if isinstance(value, int) and value >= 0:
             return value
     return 0
+
+
+def _looks_like_quota_exhaustion(*, status: int, body: str) -> bool:
+    normalized = body.lower()
+    return status == 402 or any(
+        marker in normalized
+        for marker in (
+            "insufficient_quota",
+            "quota exceeded",
+            "quota_exceeded",
+            "billing hard limit",
+            "credit balance",
+        )
+    )

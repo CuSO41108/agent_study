@@ -4,10 +4,10 @@
 
 ## Summary
 
-Upgrade the existing PowerShell tool from a read-only whitelist to a controlled
-command capability. Read-only commands remain automatic. Strictly parsed
-workspace directory creation, file moves and file copies enter the existing
-approval lifecycle and persist their outcome through the task trace.
+Upgrade the existing PowerShell tool from a read-only whitelist to an
+approval-controlled command capability. Recursive and batch deletion remain a
+hard deny. Other commands require explicit user approval (or a Session-scoped
+approved prefix), and persist their approval and outcome through the task trace.
 
 ## Technical Context
 
@@ -18,11 +18,10 @@ approval lifecycle and persist their outcome through the task trace.
 
 ## Design
 
-- `approval.py` parses one command only; operators and unrecognized commands
-  are denied.
-- `ShellTool.inspect()` resolves every affected path within the workspace and
-  rejects hidden/internal paths, missing sources, missing destination parents,
-  and target conflicts.
+- `approval.py` rejects empty commands and forbidden recursive/batch deletion;
+  arbitrary commands, operators, and unrecognized commands require user review.
+- `ShellTool` starts approved commands from the workspace root. Approval does
+  not claim to sandbox arbitrary command side effects to the workspace.
 - The orchestrator uses per-invocation side-effect and idempotency methods so
   read-only shell actions retain existing recovery behavior while controlled
   mutations are not automatically retried.
@@ -31,7 +30,8 @@ approval lifecycle and persist their outcome through the task trace.
 ## Constitution Check
 
 - Persistent state: PASS — approved shell mutations use ToolAction/trace.
-- Structured contracts: PASS — only parsed command forms proceed.
+- Structured contracts: PASS — forbidden deletion is denied and every other
+  Shell command requires explicit approval or a Session-scoped prefix.
 - Crash consistency: PASS — controlled mutations are not retried automatically.
 - Observable execution: PASS — approval, command and result are traced.
 - Compatibility/tests: PASS — existing read-only shell behavior is regression tested.

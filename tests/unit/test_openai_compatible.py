@@ -198,6 +198,30 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("rate limited", response.raw_response["body"])
 
     @patch("agent_app.model.openai_compatible.request.urlopen")
+    def test_generate_classifies_insufficient_quota_for_manual_top_up(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = error.HTTPError(
+            url="https://example.invalid/v1/chat/completions",
+            code=429,
+            msg="too many requests",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":{"code":"insufficient_quota"}}'),
+        )
+        client = OpenAICompatibleModelClient(
+            base_url="https://example.invalid/v1",
+            api_key="secret",
+            model="qwen-plus",
+            timeout=15,
+        )
+
+        response = client.generate(
+            system_prompt="sys",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+        )
+
+        self.assertEqual(response.error_type, "quota_exhausted")
+
+    @patch("agent_app.model.openai_compatible.request.urlopen")
     def test_generate_returns_request_error_for_transport_failure(self, mock_urlopen) -> None:
         mock_urlopen.side_effect = error.URLError("boom")
         client = OpenAICompatibleModelClient(
