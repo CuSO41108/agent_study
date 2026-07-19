@@ -51,10 +51,10 @@ class _SingleResponseModel:
 
 
 class EvalScorerTests(unittest.TestCase):
-    def test_builtin_eval_suite_has_twenty_eight_cases(self) -> None:
+    def test_builtin_eval_suite_has_thirty_five_cases(self) -> None:
         cases = load_cases(Path(__file__).resolve().parents[2] / "evals" / "cases")
 
-        self.assertEqual(len(cases), 28)
+        self.assertEqual(len(cases), 35)
         self.assertTrue(all(case["schema_version"] == EVAL_CASE_SCHEMA_VERSION for case in cases))
         case_ids = {case["id"] for case in cases}
         self.assertTrue(
@@ -536,13 +536,13 @@ class EvalScorerTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             output = json.loads(buffer.getvalue())
-            self.assertEqual(output["summary"]["case_count"], 28)
-            self.assertEqual(output["summary"]["attempt_count"], 56)
+            self.assertEqual(output["summary"]["case_count"], 35)
+            self.assertEqual(output["summary"]["attempt_count"], 70)
             result_path = Path(output["result_path"])
             summary_path = Path(output["summary_path"])
             self.assertTrue(result_path.is_file())
             lines = result_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 56)
+            self.assertEqual(len(lines), 70)
             self.assertEqual({json.loads(line)["attempt"] for line in lines}, {1, 2})
             self.assertTrue(all(json.loads(line)["status"] == "skipped" for line in lines))
         finally:
@@ -576,7 +576,7 @@ class EvalScorerTests(unittest.TestCase):
             result_path = Path(output["result_path"])
             summary_path = Path(output["summary_path"])
             lines = result_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 28)
+            self.assertEqual(len(lines), 35)
             self.assertTrue(
                 all(json.loads(line)["reason"] == "live_model_not_requested" for line in lines)
             )

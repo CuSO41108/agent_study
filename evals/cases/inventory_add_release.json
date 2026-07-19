@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "id": "inventory_add_release_001",
+  "category": "task_completion",
+  "prompt": "Add release(stock, quantity), which returns increased stock and rejects negative quantities. Add unit tests for both paths and run the suite.",
+  "fixture": "inventory_service",
+  "budget": {
+    "max_model_calls": 10,
+    "max_tool_calls": 12,
+    "max_tokens": 35000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "import sys; sys.path.insert(0, 'src'); from inventory import release; assert release(5, 2) == 7;\ntry:\n release(5, -1)\nexcept ValueError:\n pass\nelse:\n raise AssertionError('negative quantity accepted')"], "timeout_seconds": 30}
+    ],
+    "final_output_contains": ["release"],
+    "final_output_contains_any": [["test", "pass", "verified"]],
+    "required_changed_files": ["src/inventory.py", "tests/test_inventory.py"],
+    "allowed_changed_files": ["src/inventory.py", "tests/test_inventory.py"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "required_any_tools": [["replace_in_file", "file_write"]]
+  }
+}
