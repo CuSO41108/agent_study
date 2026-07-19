@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import socket
 from math import ceil
-from typing import Any
+from typing import Any, Callable
 from urllib import error, request
 
 from agent_app.config import AppConfig
@@ -105,6 +105,131 @@ class OpenAICompatibleModelClient:
                 total_tokens=estimated_input_tokens,
             )
 
+        return self._parse_response(raw_response, estimated_input_tokens=estimated_input_tokens)
+
+    def generate_stream(
+        self,
+        *,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str], None],
+    ) -> ModelResponse:
+        """Generate a response while forwarding OpenAI-compatible SSE text deltas."""
+        if not self.base_url or not self.api_key or not self.model:
+            return ModelResponse(assistant_text=None, raw_response=None, error_type="configuration_error")
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system_prompt}, *messages],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        estimated_input_tokens = ceil(len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) / 4)
+        http_request = request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(http_request, timeout=self.timeout) as response:
+                return self._parse_stream(response, estimated_input_tokens=estimated_input_tokens, on_delta=on_delta)
+        except error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            return ModelResponse(
+                assistant_text=None,
+                raw_response={"status": exc.code, "body": response_body},
+                error_type="quota_exhausted" if _looks_like_quota_exhaustion(status=exc.code, body=response_body) else "http_error",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
+            )
+        except (error.URLError, TimeoutError, socket.timeout) as exc:
+            return ModelResponse(
+                assistant_text=None,
+                raw_response={"detail": str(exc)},
+                error_type="request_error",
+                model_name=self.model,
+                input_tokens=estimated_input_tokens,
+                total_tokens=estimated_input_tokens,
+            )
+
+    def _parse_stream(self, response: Any, *, estimated_input_tokens: int, on_delta: Callable[[str], None]) -> ModelResponse:
+        text_parts: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        model_name = self.model
+        usage: dict[str, Any] | None = None
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith("event:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                return ModelResponse(
+                    assistant_text=None,
+                    raw_response={"detail": f"Invalid streaming chunk: {data[:200]}"},
+                    error_type="invalid_json",
+                    model_name=model_name,
+                    input_tokens=estimated_input_tokens,
+                    total_tokens=estimated_input_tokens,
+                )
+            if not isinstance(chunk, dict):
+                continue
+            choices = chunk.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict):
+                parsed = self._parse_response(chunk, estimated_input_tokens=estimated_input_tokens)
+                if parsed.assistant_text:
+                    on_delta(parsed.assistant_text)
+                return parsed
+            model_name = str(chunk.get("model") or model_name)
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                continue
+            finish_reason = choice.get("finish_reason") or finish_reason
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = _extract_text_content(delta.get("content"))
+            if content:
+                text_parts.append(content)
+                on_delta(content)
+            raw_calls = delta.get("tool_calls")
+            if isinstance(raw_calls, list):
+                for raw_call in raw_calls:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    index = raw_call.get("index", 0)
+                    if not isinstance(index, int):
+                        continue
+                    call = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if raw_call.get("id"):
+                        call["id"] = raw_call["id"]
+                    if isinstance(raw_call.get("function"), dict):
+                        function = raw_call["function"]
+                        if function.get("name"):
+                            call["function"]["name"] = function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            call["function"]["arguments"] += function["arguments"]
+
+        raw_response: dict[str, Any] = {
+            "model": model_name,
+            "choices": [{"message": {"role": "assistant", "content": "".join(text_parts) or None, "tool_calls": [tool_calls[index] for index in sorted(tool_calls)] or None}, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            raw_response["usage"] = usage
         return self._parse_response(raw_response, estimated_input_tokens=estimated_input_tokens)
 
     def _parse_response(self, raw_response: dict[str, Any], *, estimated_input_tokens: int = 0) -> ModelResponse:

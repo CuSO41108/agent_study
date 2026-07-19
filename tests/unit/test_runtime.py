@@ -108,3 +108,14 @@ class ShellRuntimeTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_runtime_forwards_completed_runner_output_to_output_handler(self) -> None:
+        def _runner(*args, **kwargs):
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="first\nsecond\n", stderr="warning\n")
+
+        output: list[tuple[str, str]] = []
+        runtime = ShellRuntime(runner=_runner, executable_resolver=lambda: "powershell")
+
+        runtime.run("Get-Location", workspace_root=self.workspace_root, timeout=1.0, on_output=lambda stream, line: output.append((stream, line)))
+
+        self.assertEqual(output, [("stdout", "first"), ("stdout", "second"), ("stderr", "warning")])

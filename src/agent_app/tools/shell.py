@@ -54,11 +54,16 @@ class ShellTool(Tool):
         if not approved:
             return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=False, content="", error=reason)
 
-        execution = self._runtime.run(
-            command,
-            workspace_root=context.workspace_root,
-            timeout=context.timeout,
-        )
+        runtime_kwargs: dict[str, Any] = {
+            "workspace_root": context.workspace_root,
+            "timeout": context.timeout,
+        }
+        if context.event_sink is not None:
+            runtime_kwargs["on_output"] = lambda stream, line: context.event_sink(
+                "tool_output",
+                {"tool": self.name, "stream": stream, "line": line},
+            )
+        execution = self._runtime.run(command, **runtime_kwargs)
         if execution.error_type == "timeout":
             return ToolResult(
                 tool_call_id=tool_call_id,

@@ -24,7 +24,48 @@ class _FakeResponse:
         return None
 
 
+class _FakeStreamResponse:
+    def __init__(self, chunks: list[dict]) -> None:
+        self._lines = [f"data: {json.dumps(chunk)}\n\n".encode("utf-8") for chunk in chunks]
+        self._lines.append(b"data: [DONE]\n\n")
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def __enter__(self) -> "_FakeStreamResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
 class OpenAICompatibleClientTests(unittest.TestCase):
+    @patch("agent_app.model.openai_compatible.request.urlopen")
+    def test_generate_stream_forwards_text_deltas_and_rebuilds_tool_calls(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeStreamResponse([
+            {"model": "stream-model", "choices": [{"delta": {"content": "Hel"}, "finish_reason": None}]},
+            {"model": "stream-model", "choices": [{"delta": {"content": "lo"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "file_read", "arguments": '{"path":'}}]}, "finish_reason": None}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"README.md"}'}}]}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}},
+        ])
+        client = OpenAICompatibleModelClient(
+            base_url="https://example.invalid/v1", api_key="secret", model="configured-model", timeout=15
+        )
+        deltas: list[str] = []
+
+        response = client.generate_stream(
+            system_prompt="sys",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[{"type": "function", "function": {"name": "file_read"}}],
+            on_delta=deltas.append,
+        )
+
+        self.assertEqual(deltas, ["Hel", "lo"])
+        self.assertEqual(response.assistant_text, "Hello")
+        self.assertEqual(response.finish_reason, "tool_calls")
+        self.assertEqual(response.tool_calls[0].arguments, {"path": "README.md"})
+        self.assertEqual(response.total_tokens, 7)
     def test_from_config_uses_app_config_fields(self) -> None:
         client = OpenAICompatibleModelClient.from_config(
             AppConfig(

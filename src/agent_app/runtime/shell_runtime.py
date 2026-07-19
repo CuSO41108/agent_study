@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+OutputHandler = Callable[[str, str], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +37,12 @@ class ShellRuntime:
         *,
         workspace_root: Path,
         timeout: float,
+        on_output: OutputHandler | None = None,
     ) -> RuntimeExecutionResult:
         executable = self._executable_resolver()
         if self._runner is not None:
-            return self._run_with_runner(executable, command, workspace_root, timeout)
-        return self._run_process(executable, command, workspace_root, timeout)
+            return self._run_with_runner(executable, command, workspace_root, timeout, on_output)
+        return self._run_process(executable, command, workspace_root, timeout, on_output)
 
     def _run_with_runner(
         self,
@@ -47,6 +50,7 @@ class ShellRuntime:
         command: str,
         workspace_root: Path,
         timeout: float,
+        on_output: OutputHandler | None,
     ) -> RuntimeExecutionResult:
         try:
             completed = self._runner(
@@ -79,7 +83,9 @@ class ShellRuntime:
                 error_type="runtime_error",
             )
 
-        return _completed_result(completed)
+        result = _completed_result(completed)
+        _emit_completed_output(result, on_output)
+        return result
 
     def _run_process(
         self,
@@ -87,8 +93,12 @@ class ShellRuntime:
         command: str,
         workspace_root: Path,
         timeout: float,
+        on_output: OutputHandler | None,
     ) -> RuntimeExecutionResult:
         process: subprocess.Popen[str] | None = None
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        readers: list[threading.Thread] = []
         try:
             process = subprocess.Popen(
                 [executable, "-NoProfile", "-Command", command],
@@ -98,19 +108,68 @@ class ShellRuntime:
                 text=True,
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
-            stdout, stderr = process.communicate(timeout=timeout)
+            if on_output is None:
+                stdout, stderr = process.communicate(timeout=timeout)
+                return _completed_result(subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr))
+            assert process.stdout is not None
+            assert process.stderr is not None
+            readers = [
+                _start_output_reader(process.stdout, "stdout", stdout_parts, on_output),
+                _start_output_reader(process.stderr, "stderr", stderr_parts, on_output),
+            ]
+            process.wait(timeout=timeout)
+            _join_readers(readers)
+            stdout, stderr = "".join(stdout_parts), "".join(stderr_parts)
         except subprocess.TimeoutExpired as exc:
             _terminate_process_tree(process)
-            stdout, stderr = _communicate_after_termination(process, exc.stdout, exc.stderr)
+            if on_output is None:
+                stdout, stderr = _communicate_after_termination(process, exc.stdout, exc.stderr)
+                return RuntimeExecutionResult(False, stdout, stderr, _join_output(stdout, stderr), None, "timeout")
+            _join_readers(readers)
+            stdout, stderr = "".join(stdout_parts), "".join(stderr_parts)
             return RuntimeExecutionResult(False, stdout, stderr, _join_output(stdout, stderr), None, "timeout")
         except KeyboardInterrupt:
             _terminate_process_tree(process)
-            stdout, stderr = _communicate_after_termination(process, "", "")
+            if on_output is None:
+                stdout, stderr = _communicate_after_termination(process, "", "")
+                return RuntimeExecutionResult(False, stdout, stderr, _join_output(stdout, stderr), None, "cancelled")
+            _join_readers(readers)
+            stdout, stderr = "".join(stdout_parts), "".join(stderr_parts)
             return RuntimeExecutionResult(False, stdout, stderr, _join_output(stdout, stderr), None, "cancelled")
         except OSError as exc:
             detail = str(exc)
             return RuntimeExecutionResult(False, "", detail, detail, None, "runtime_error")
         return _completed_result(subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr))
+
+
+def _start_output_reader(
+    stream: object,
+    stream_name: str,
+    output_parts: list[str],
+    on_output: OutputHandler | None,
+) -> threading.Thread:
+    def read() -> None:
+        for line in stream:  # type: ignore[union-attr]
+            output_parts.append(line)
+            if on_output is not None:
+                on_output(stream_name, line.rstrip("\r\n"))
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    return reader
+
+
+def _join_readers(readers: list[threading.Thread]) -> None:
+    for reader in readers:
+        reader.join(timeout=1)
+
+
+def _emit_completed_output(result: RuntimeExecutionResult, on_output: OutputHandler | None) -> None:
+    if on_output is None:
+        return
+    for stream_name, content in (("stdout", result.stdout), ("stderr", result.stderr)):
+        for line in content.splitlines():
+            on_output(stream_name, line)
 
 def _completed_result(completed: subprocess.CompletedProcess[str]) -> RuntimeExecutionResult:
     combined_output = _join_output(completed.stdout, completed.stderr)
