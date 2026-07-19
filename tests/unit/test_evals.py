@@ -558,20 +558,16 @@ class EvalScorerTests(unittest.TestCase):
                 dirs=[path for path in (run_dir, run_root, results_dir) if path is not None],
             )
 
-    def test_github_pr_gate_is_offline_and_live_eval_is_manual_only(self) -> None:
+    def test_github_eval_gate_is_offline_only(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         pr_workflow = (repo_root / ".github" / "workflows" / "eval-pr.yml").read_text(
             encoding="utf-8"
         )
-        live_workflow = (
-            repo_root / ".github" / "workflows" / "eval-live.yml"
-        ).read_text(encoding="utf-8")
 
         self.assertNotIn("--live-model", pr_workflow)
-        self.assertIn("workflow_dispatch:", live_workflow)
-        self.assertNotIn("pull_request:", live_workflow)
-        self.assertIn("environment: live-eval", live_workflow)
-        self.assertIn("--live-model", live_workflow)
+        self.assertFalse(
+            (repo_root / ".github" / "workflows" / "eval-live.yml").exists()
+        )
 
 
 def _make_workspace(prefix: str) -> Path:
