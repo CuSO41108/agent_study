@@ -78,4 +78,13 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
         return f"tools {budget.get('used_tool_calls', 0)}/{budget.get('max_tool_calls', '?')}, tokens {budget.get('used_tokens', 0)}/{budget.get('max_tokens', '?')}"
     if event_type == "observation":
         return f"{attributes.get('status', '?')} / {attributes.get('error_type') or 'ok'}"
+    if event_type == "stream":
+        stream_type = attributes.get("event_type", "event")
+        if stream_type == "tool_output":
+            return f"{attributes.get('tool', 'tool')} / {attributes.get('stream', 'output')}: {attributes.get('line', '')}"
+        if stream_type == "model_text_delta":
+            return f"assistant: {attributes.get('text', '')}"
+        if stream_type == "action_planned":
+            return f"planned: {attributes.get('tool', 'tool')}"
+        return stream_type
     return json.dumps(attributes, ensure_ascii=False, sort_keys=True)[:180]

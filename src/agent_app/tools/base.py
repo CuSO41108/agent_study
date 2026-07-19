@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from jsonschema import Draft202012Validator
 
@@ -25,6 +25,7 @@ class ToolExecutionContext:
     session_service: "SessionService | None" = None
     agent_id: str | None = None
     delegation_depth: int = 0
+    event_sink: Callable[[str, dict[str, Any]], None] | None = None
 
 
 class Tool(ABC):

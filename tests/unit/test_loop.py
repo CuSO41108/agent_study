@@ -108,6 +108,33 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.tool_runs[0].tool_name, "file_read")
         self.assertEqual(len(self.sessions.list_tool_runs(result.session_id)), 1)
 
+    def test_run_turn_emits_incremental_execution_events_and_persists_them(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="call-stream", name="file_read", arguments={"path": "README.md"})]),
+            _text_response("streamed answer"),
+        ])
+        events = []
+        loop = AgentLoop(
+            agent=SINGLE_MAIN_AGENT,
+            model_client=model,
+            tool_registry=self.registry,
+            session_service=self.sessions,
+            workspace_root=self.workspace_root,
+            execution_event_handler=events.append,
+        )
+
+        result = loop.run_turn(user_input="read the readme")
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            [event.type for event in events],
+            ["task_started", "model_started", "action_planned", "tool_started", "tool_finished", "model_started", "turn_finishing"],
+        )
+        self.assertEqual(
+            [trace.payload["event_type"] for trace in self.sessions.list_task_traces(result.task_id) if trace.trace_type == "stream"],
+            [event.type for event in events],
+        )
+
     def test_multiple_tool_calls_run_serially_in_model_order(self) -> None:
         model = _FakeModelClient([
             _tool_call_response(

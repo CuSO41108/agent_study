@@ -30,6 +30,16 @@ class ToolResult:
     observation: "Observation | None" = None
 
 
+@dataclass(slots=True, frozen=True)
+class ExecutionEvent:
+    """One incremental event emitted while an agent turn is executing."""
+
+    type: str
+    task_id: str
+    session_id: str
+    payload: dict[str, Any]
+
+
 ToolActionStatus = Literal["prepared", "executing", "succeeded", "failed", "uncertain"]
 
 

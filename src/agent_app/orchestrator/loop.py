@@ -24,6 +24,7 @@ from agent_app.tools.base import ToolExecutionContext, observation_from_tool_res
 from agent_app.tools.registry import ToolRegistry
 from agent_app.types import (
     AgentEvent,
+    ExecutionEvent,
     Message,
     ModelResponse,
     Observation,
@@ -39,6 +40,7 @@ from agent_app.types import (
 )
 
 ConfirmationHandler = Callable[[ToolCall, ToolExecutionContext], bool | str]
+ExecutionEventHandler = Callable[[ExecutionEvent], None]
 
 
 class InvalidTaskEvent(RuntimeError):
@@ -59,6 +61,7 @@ class AgentLoop:
         context_token_budget: int = 6000,
         summary_trigger_tokens: int = 3000,
         confirmation_handler: ConfirmationHandler | None = None,
+        execution_event_handler: ExecutionEventHandler | None = None,
         delegation_depth: int = 0,
         skill_registry: SkillRegistry | None = None,
     ) -> None:
@@ -82,11 +85,24 @@ class AgentLoop:
             delegation_depth=delegation_depth,
         )
         self._confirmation_handler = confirmation_handler
+        self._execution_event_handler = execution_event_handler
         self._tasks = TaskRuntime(session_service)
         self._process_id = str(uuid4())
         self._session_shell_prefixes: dict[str, set[str]] = {}
         self._active_task_id: str | None = None
         self._turn_started_at: float | None = None
+
+    def set_execution_event_handler(self, handler: ExecutionEventHandler | None) -> None:
+        self._execution_event_handler = handler
+
+    def _emit_execution_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self._active_task_id is None or self._execution_event_handler is None:
+            return
+        task = self._tasks.require_task(self._active_task_id)
+        self._session_service.append_task_trace(task.id, "stream", {"event_type": event_type, **payload})
+        self._execution_event_handler(
+            ExecutionEvent(type=event_type, task_id=task.id, session_id=task.session_id, payload=payload)
+        )
 
     def run_turn(
         self,
@@ -170,6 +186,7 @@ class AgentLoop:
                 )
         self._active_task_id = task.id
         self._turn_started_at = time.monotonic()
+        self._emit_execution_event("task_started", {"goal": task.goal})
         if explicit_skill_names:
             self._activate_explicit_skills(task_id=task.id, skill_names=explicit_skill_names)
             task = self._tasks.require_task(task.id)
@@ -206,6 +223,7 @@ class AgentLoop:
             session_id=resolved_session_id,
             task_id=task.id,
             session_service=self._session_service,
+            event_sink=self._emit_execution_event if self._execution_event_handler is not None else None,
         )
         if len(task.plan) > 1 and not task.working_memory.get("planner_initialized"):
             self._session_service.append_task_trace(
@@ -311,7 +329,8 @@ class AgentLoop:
                     success=False,
                 )
             model_started = time.monotonic()
-            response = self._model_client.generate(
+            self._emit_execution_event("model_started", {"phase": "policy"})
+            response = self._generate_model_response(
                 system_prompt=system_prompt,
                 messages=provider_messages,
                 tools=self._available_tool_specs(),
@@ -335,6 +354,11 @@ class AgentLoop:
                 },
             )
             self._session_service.append_task_trace(task.id, "decision", decision_payload)
+            for tool_call in response.tool_calls:
+                self._emit_execution_event(
+                    "action_planned",
+                    {"tool": tool_call.name, "tool_call_id": tool_call.id, "arguments": tool_call.arguments},
+                )
             repeated_reason = self._record_decision_repetition(task.id, decision_payload)
             if repeated_reason is not None:
                 self._tasks.reflect(task.id, repeated_reason)
@@ -1199,6 +1223,10 @@ class AgentLoop:
             else:
                 action = self._session_service.mark_tool_action_executing(action.id)
                 started = time.monotonic()
+                self._emit_execution_event(
+                    "tool_started",
+                    {"tool": tool_call.name, "tool_call_id": tool_call.id, "arguments": tool_call.arguments, "attempt": attempt},
+                )
                 try:
                     tool_result = tool.execute(
                         tool_call_id=tool_call.id,
@@ -1226,6 +1254,16 @@ class AgentLoop:
                 )
                 assert completed.result is not None
                 tool_result = completed.result
+                self._emit_execution_event(
+                    "tool_finished",
+                    {
+                        "tool": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "attempt": attempt,
+                        "success": tool_result.success,
+                        "error": tool_result.error,
+                    },
+                )
 
             observation = observation_from_tool_result(
                 tool_result,
@@ -1585,6 +1623,10 @@ class AgentLoop:
         success: bool,
     ) -> TurnResult:
         task = self._tasks.require_task(self._require_active_task_id())
+        self._emit_execution_event(
+            "turn_finishing",
+            {"success": success, "stop_reason": stop_reason, "final_text": final_text},
+        )
         if self._turn_started_at is not None and task.status not in {"completed", "failed", "cancelled", "expired"}:
             task = self._tasks.add_active_time(task.id, time.monotonic() - self._turn_started_at)
         try:
@@ -1707,6 +1749,23 @@ class AgentLoop:
             )
 
         return None
+
+    def _generate_model_response(
+        self,
+        *,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ModelResponse:
+        generate_stream = getattr(self._model_client, "generate_stream", None)
+        if self._execution_event_handler is not None and callable(generate_stream):
+            return generate_stream(
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tools,
+                on_delta=lambda text: self._emit_execution_event("model_text_delta", {"text": text}),
+            )
+        return self._model_client.generate(system_prompt=system_prompt, messages=messages, tools=tools)
 
     def _record_repair_attempt_if_needed(
         self,
