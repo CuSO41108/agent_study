@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "id": "profile_add_initials_001",
+  "category": "task_completion",
+  "prompt": "Add initials(profile), returning the uppercase first character of each non-blank first and last name with no separator. Add tests for two, one, and zero name parts, then run them.",
+  "fixture": "profile_service",
+  "budget": {
+    "max_model_calls": 10,
+    "max_tool_calls": 12,
+    "max_tokens": 35000,
+    "max_repair_attempts": 1
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "import sys; sys.path.insert(0, 'src'); from profiles import initials; assert initials({'first_name':' ada ', 'last_name':'lovelace'}) == 'AL'; assert initials({'last_name':'hopper'}) == 'H'; assert initials({}) == ''"], "timeout_seconds": 30}
+    ],
+    "final_output_contains": ["initials"],
+    "required_changed_files": ["src/profiles.py", "tests/test_profiles.py"],
+    "allowed_changed_files": ["src/profiles.py", "tests/test_profiles.py"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "required_any_tools": [["replace_in_file", "file_write"]]
+  }
+}

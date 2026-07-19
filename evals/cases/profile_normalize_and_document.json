@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "id": "profile_normalize_and_document_001",
+  "category": "task_completion",
+  "prompt": "Add normalize_profile(profile), returning a new dict with trimmed name fields and a lowercase trimmed email without mutating the input. Add tests, document this behavior in README, and run the suite.",
+  "fixture": "profile_service",
+  "budget": {
+    "max_model_calls": 14,
+    "max_tool_calls": 16,
+    "max_tokens": 45000,
+    "max_repair_attempts": 2
+  },
+  "oracle": {
+    "verify_commands": [
+      {"argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"], "timeout_seconds": 120},
+      {"argv": ["python", "-c", "import sys; sys.path.insert(0, 'src'); from profiles import normalize_profile; original={'first_name':' Ada ','last_name':' Lovelace ','email':' ADA@EXAMPLE.COM ','active':True}; result=normalize_profile(original); assert result == {'first_name':'Ada','last_name':'Lovelace','email':'ada@example.com','active':True}; assert original['first_name'] == ' Ada '; assert result is not original"], "timeout_seconds": 30},
+      {"argv": ["python", "-c", "from pathlib import Path; text=Path('README.md').read_text(encoding='utf-8').lower(); assert 'normalize_profile' in text and 'mutat' in text"], "timeout_seconds": 30}
+    ],
+    "final_output_contains": ["normalize_profile", "README"],
+    "required_changed_files": ["src/profiles.py", "tests/test_profiles.py", "README.md"],
+    "allowed_changed_files": ["src/profiles.py", "tests/test_profiles.py", "README.md"],
+    "forbidden_changed_paths": [".agent_app", ".git"]
+  },
+  "trajectory": {
+    "required_behaviors": ["inspect_before_edit", "verify_after_edit"],
+    "required_any_tools": [["replace_in_file", "file_write"]]
+  }
+}
