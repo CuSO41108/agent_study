@@ -41,7 +41,7 @@ from agent_app.tools.replace_in_file import ReplaceInFileInspection, inspect_rep
 from agent_app.tools.file_write import inspect_file_write_request
 from agent_app.tools.registry import build_root_registry, build_worker_registry
 from agent_app.tools.web_search import WebSearchTool
-from agent_app.types import AgentEvent, SessionOverview, SkillDraft, TaskState, ToolCall, TurnResult
+from agent_app.types import AgentEvent, ExecutionEvent, SessionOverview, SkillDraft, TaskState, ToolCall, TurnResult
 
 
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "expired", "handed_off"}
@@ -124,6 +124,85 @@ _COMMAND_MENU_STYLE = Style.from_dict(
 )
 
 
+class _LiveExecutionRenderer:
+    """Append agent execution events to the REPL as they arrive."""
+
+    def __init__(self) -> None:
+        self._model_text = ""
+        self._model_line_open = False
+        self._streamed_final = False
+
+    def reset(self) -> None:
+        if self._model_line_open:
+            print()
+        self._model_text = ""
+        self._model_line_open = False
+        self._streamed_final = False
+
+    def __call__(self, event: ExecutionEvent) -> None:
+        if event.type == "task_started":
+            print(f"[task] Started: {event.payload.get('goal', '')}")
+        elif event.type == "model_started":
+            self._close_model_line()
+            self._model_text = ""
+            print("[agent] Planning next step…")
+        elif event.type == "model_text_delta":
+            if not self._model_line_open:
+                print("[agent] ", end="", flush=True)
+                self._model_line_open = True
+            text = str(event.payload.get("text", ""))
+            print(text, end="", flush=True)
+            self._model_text += text
+        elif event.type == "action_planned":
+            self._close_model_line()
+            tool = event.payload.get("tool", "tool")
+            print(_format_live_action(tool, event.payload.get("arguments", {})))
+        elif event.type == "tool_started":
+            self._close_model_line()
+            print(f"[tool] Running {event.payload.get('tool', 'tool')}…")
+        elif event.type == "tool_output":
+            line = str(event.payload.get("line", ""))
+            if line:
+                print(f"  [{event.payload.get('tool', 'tool')}/{event.payload.get('stream', 'output')}] {line}")
+        elif event.type == "tool_finished":
+            status = "completed" if event.payload.get("success") else "failed"
+            detail = event.payload.get("error")
+            print(f"[tool] {event.payload.get('tool', 'tool')} {status}" + (f": {detail}" if detail else ""))
+        elif event.type == "turn_finishing":
+            final_text = event.payload.get("final_text")
+            self._streamed_final = bool(final_text and final_text == self._model_text)
+            self._close_model_line()
+
+    def consume_streamed_final(self) -> bool:
+        streamed_final = self._streamed_final
+        self._streamed_final = False
+        return streamed_final
+
+    def _close_model_line(self) -> None:
+        if self._model_line_open:
+            print()
+            self._model_line_open = False
+
+
+def _format_live_action(tool: object, arguments: object) -> str:
+    """Render a useful action summary without echoing generated file contents."""
+    tool_name = str(tool)
+    if not isinstance(arguments, dict):
+        return f"[action] {tool_name}"
+
+    if tool_name == "file_write":
+        path = str(arguments.get("path", "<unknown path>"))
+        content = arguments.get("content")
+        if isinstance(content, str):
+            byte_count = len(content.encode("utf-8"))
+            line_count = content.count("\n") + 1 if content else 0
+            return f"[action] file_write: {path}\n         write · {byte_count:,} bytes · {line_count:,} lines"
+        return f"[action] file_write: {path}"
+
+    rendered_arguments = json.dumps(arguments, ensure_ascii=False)
+    return f"[action] {tool_name}: {rendered_arguments}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase 5 CLI-first coordinator with worker subagents.")
     parser.add_argument("prompt", nargs="?", help="User prompt to process.")
@@ -199,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_state_path=session_state_path,
     )
     model_client = OpenAICompatibleModelClient.from_config(config)
+    live_renderer = _LiveExecutionRenderer() if interactive else None
     skill_registry = SkillRegistry(config.workspace_root)
     subagent_runner = SubagentRunner(
         model_client=model_client,
@@ -231,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_trigger_tokens=config.summary_trigger_tokens,
         confirmation_handler=prompt_for_tool_confirmation,
         skill_registry=skill_registry,
+        execution_event_handler=live_renderer,
     )
     if control is not None:
         action, task_id = control
@@ -300,6 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             session_state_path=session_state_path,
             config=config,
             skill_registry=skill_registry,
+            live_renderer=live_renderer,
         )
 
     try:
@@ -545,6 +627,7 @@ def _run_interactive_loop(
     session_state_path: Path,
     config: AppConfig,
     skill_registry: SkillRegistry,
+    live_renderer: _LiveExecutionRenderer | None,
 ) -> int:
     current_session_id = session_id
     continuation: list[str] = []
@@ -678,6 +761,8 @@ def _run_interactive_loop(
             continue
 
         try:
+            if live_renderer is not None:
+                live_renderer.reset()
             result = loop.run_turn(
                 user_input=stripped,
                 session_id=current_session_id,
@@ -689,7 +774,10 @@ def _run_interactive_loop(
         pending_skill_names.clear()
         current_session_id = result.session_id
         _persist_current_session(session_state_path, result.session_id)
-        _print_turn_result(result)
+        _print_turn_result(
+            result,
+            suppress_final_text=live_renderer.consume_streamed_final() if live_renderer is not None else False,
+        )
 
 
 class _SlashCommandCompleter(Completer):
@@ -1251,8 +1339,8 @@ def _print_task_summary(task: TaskState) -> None:
         print(f"  stop_reason: {task.stop_reason}")
 
 
-def _print_turn_result(result: TurnResult) -> None:
-    if result.final_text:
+def _print_turn_result(result: TurnResult, *, suppress_final_text: bool = False) -> None:
+    if result.final_text and not suppress_final_text:
         print(result.final_text)
     elif not result.success:
         print(f"Error: {result.stop_reason or 'unknown_error'}")

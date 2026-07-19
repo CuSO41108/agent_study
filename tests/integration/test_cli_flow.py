@@ -21,7 +21,7 @@ from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.registry import build_default_registry
-from agent_app.types import AgentEvent, ModelResponse, PendingAction, ToolCall
+from agent_app.types import AgentEvent, ExecutionEvent, ModelResponse, PendingAction, ToolCall
 
 
 class _FakeModelClient:
@@ -494,6 +494,26 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("/trace", all_commands)
         self.assertEqual(trace_commands, ["/trace"])
         self.assertEqual(argument_commands, [])
+
+    def test_live_renderer_summarizes_file_write_without_echoing_content(self) -> None:
+        renderer = cli._LiveExecutionRenderer()
+        html = "<html>\n<body>large generated page</body>\n</html>\n"
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={"tool": "file_write", "arguments": {"path": "lionel_messi.html", "content": html}},
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("[action] file_write: lionel_messi.html", output)
+        self.assertIn("write · 49 bytes · 4 lines", output)
+        self.assertNotIn("large generated page", output)
 
     @patch("builtins.input", side_effect=["", "hello", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
