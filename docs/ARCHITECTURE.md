@@ -45,7 +45,7 @@ tests/
 evals/
 ├── runner.py     Eval 执行器
 ├── scorers.py    打分逻辑
-├── cases/        24 个固定 eval 任务（JSON）
+├── cases/        28 个固定 eval 任务（JSON）
 ├── fixtures/     任务 fixture 工作区
 └── results/      JSONL 报告输出
 ```
