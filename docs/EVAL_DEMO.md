@@ -91,26 +91,15 @@ unclassified command as a hard policy denial.
 
 ## GitHub Actions
 
-Two workflows are included:
+`eval-pr.yml` runs the affected deterministic tests and validates all v2 cases
+on pull requests, pushes to `main`, and manual dispatch. It never enables
+`--live-model`, needs no model secret, and is the only Eval workflow intended
+to run on GitHub-hosted infrastructure.
 
-- `eval-pr.yml` runs the affected deterministic tests and validates all v2 cases
-  on pull requests, pushes to `main`, and manual dispatch. It never enables
-  `--live-model` and needs no model secret.
-- `eval-live.yml` is manual-dispatch only. It runs one selected case with an
-  explicit repeat count, uses the `live-eval` GitHub Environment, and uploads
-  the isolated run directory for 14 days.
-
-Configure `MODEL_BASE_URL`, `MODEL_API_KEY`, and `MODEL_NAME` as GitHub Actions
-Secrets before using the live workflow. Add required reviewers to the
-`live-eval` Environment when a human approval must precede every external model
-run. Missing live-model configuration causes `--gate` to fail instead of
-silently accepting a skipped run.
-
-Because normal coding cases simulate approval for the Shell commands they are
-measuring, use an ephemeral GitHub-hosted runner (the workflow default) and a
-dedicated low-quota model key with no unrelated privileges. The Environment
-approval authorizes the isolated Eval run as a whole; it is not a per-command
-interactive approval prompt like the local CLI.
+Real-model Eval stays local. Run it explicitly with `--live-model`; the model
+configuration remains in the existing local or user-global configuration and
+the isolated artifacts remain under `C:\tmp\agent-study-evals` by default.
+Do not copy model credentials into repository or GitHub Environment Secrets.
 
 ## Demo Tasks To Show
 
