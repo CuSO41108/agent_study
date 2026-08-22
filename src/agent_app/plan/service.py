@@ -59,6 +59,17 @@ class PlanTaskService:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
         return self._execute_and_reconcile(task_id, revision, auto_replan=True)
 
+    def is_waiting_for_user_answer(self, *, task_id: str) -> bool:
+        task = self._require_task(task_id)
+        revision = self._plan_store.get_active_revision(task.id)
+        return bool(
+            revision is not None
+            and task.status == "waiting_user"
+            and task.pending_action is not None
+            and task.pending_action.kind == "ask_user"
+            and any(node.status == "waiting_approval" for node in revision.graph.nodes)
+        )
+
     def replan(self, *, task_id: str, reason: str, automatic: bool = False) -> PlanTaskResult:
         """Create a successor revision and continue it through the same serial executor."""
 
@@ -112,6 +123,11 @@ class PlanTaskService:
         )
         if node is None:
             return None
+        if task.pending_action is not None and task.pending_action.kind != "tool_approval":
+            raise ValueError(
+                "This Plan node is waiting for a user answer; "
+                "enter a natural-language response instead of approving or rejecting it."
+            )
         context = PlanNodeContext(
             task_id=task.id,
             session_id=task.session_id,
@@ -173,6 +189,90 @@ class PlanTaskService:
         )
         return self._execute_and_reconcile(task.id, revision, auto_replan=True)
 
+    def handle_user_message(
+        self,
+        *,
+        task_id: str,
+        event: AgentEvent,
+    ) -> PlanTaskResult | None:
+        """Resume a Plan node that explicitly asked the user for information."""
+
+        task = self._require_task(task_id)
+        revision = self._plan_store.get_active_revision(task.id)
+        if revision is None:
+            return None
+        node = next(
+            (item for item in revision.graph.nodes if item.status == "waiting_approval"),
+            None,
+        )
+        pending = task.pending_action
+        if (
+            node is None
+            or task.status != "waiting_user"
+            or pending is None
+            or pending.kind != "ask_user"
+        ):
+            return None
+        context = PlanNodeContext(
+            task_id=task.id,
+            session_id=task.session_id,
+            revision=revision,
+            node=node,
+            node_results=revision.node_results,
+        )
+        turn_result = self._agent_loop.handle_event(
+            event,
+            resume_allowed_tools=node.allowed_tools,
+            resume_keep_task_open=True,
+            resume_transient_context=build_node_prompt(context),
+        )
+        task = self._require_task(task.id)
+        revision = self._plan_store.get_revision_by_id(revision.id)
+
+        if turn_result.pending_action is not None or task.status == "waiting_user":
+            return PlanTaskResult(
+                task=task,
+                revision=revision,
+                execution=PlanExecutionResult(
+                    "waiting_approval",
+                    revision,
+                    waiting_node_id=node.id,
+                ),
+            )
+
+        next_status = "completed" if turn_result.success else "failed"
+        result_record = {
+            "status": next_status,
+            "output": turn_result.final_text,
+            "error": None if next_status == "completed" else (
+                turn_result.final_text or turn_result.stop_reason or "user_message_resume_failed"
+            ),
+            "metadata": {
+                "resume_kind": "ask_user",
+                "stop_reason": turn_result.stop_reason,
+            },
+        }
+        revision = self._plan_store.update_node_status(
+            revision.id,
+            node.id,
+            next_status,
+            result=result_record,
+            expected_version=revision.version,
+        )
+        self._sessions.append_task_trace(
+            task.id,
+            "plan_node_user_message",
+            {
+                "plan_id": revision.graph.id,
+                "revision": revision.graph.revision,
+                "node_id": node.id,
+                "from_status": "waiting_approval",
+                "to_status": next_status,
+                "stop_reason": turn_result.stop_reason,
+            },
+        )
+        return self._execute_and_reconcile(task.id, revision, auto_replan=True)
+
     def _execute_and_reconcile(
         self,
         task_id: str,
@@ -200,27 +300,69 @@ class PlanTaskService:
                     )
                 except ReplanBudgetExceeded:
                     pass
+                except Exception as exc:  # noqa: BLE001 - auto recovery must close the task.
+                    return self._finalize_failed_execution(
+                        task_id,
+                        execution,
+                        replan_error=exc,
+                    )
         if execution.status == "failed":
-            current_revision = self._plan_store.get_revision_by_id(execution.revision.id)
-            if current_revision.status == "active":
-                current_revision = self._plan_store.update_revision_status(
-                    current_revision.id,
-                    "failed",
-                    expected_version=current_revision.version,
-                )
-                execution = PlanExecutionResult(
-                    "failed",
-                    current_revision,
-                    execution.executed_node_ids,
-                    execution.waiting_node_id,
-                    execution.failure_reason,
-                )
+            return self._finalize_failed_execution(task_id, execution)
         if execution.status == "completed" and task.status not in {"completed", "failed", "cancelled", "expired"}:
             task = self._tasks.complete(task.id, reason="plan_completed")
-        elif execution.status == "failed" and task.status not in {"completed", "failed", "cancelled", "expired"}:
-            task = self._tasks.fail(task.id, reason=execution.failure_reason or "plan_failed")
         latest = self._plan_store.get_revision_by_id(execution.revision.id)
         return PlanTaskResult(task=task, revision=latest, execution=execution)
+
+    def _finalize_failed_execution(
+        self,
+        task_id: str,
+        execution: PlanExecutionResult,
+        *,
+        replan_error: Exception | None = None,
+    ) -> PlanTaskResult:
+        failure_reason = execution.failure_reason or "plan_failed"
+        if replan_error is not None:
+            failure_reason = (
+                f"auto_replan_failed: {type(replan_error).__name__}: {replan_error}"
+            )
+            try:
+                self._sessions.append_task_trace(
+                    task_id,
+                    "plan_replan_failed",
+                    {
+                        "plan_id": execution.revision.graph.id,
+                        "revision": execution.revision.graph.revision,
+                        "original_failure_reason": execution.failure_reason,
+                        "error_type": type(replan_error).__name__,
+                        "error": str(replan_error),
+                    },
+                )
+            except Exception:
+                pass
+
+        current_revision = self._plan_store.get_revision_by_id(execution.revision.id)
+        if current_revision.status != "active":
+            active_revision = self._plan_store.get_active_revision(task_id)
+            if active_revision is not None:
+                current_revision = active_revision
+        if current_revision.status == "active":
+            current_revision = self._plan_store.update_revision_status(
+                current_revision.id,
+                "failed",
+                expected_version=current_revision.version,
+            )
+        finalized_execution = PlanExecutionResult(
+            "failed",
+            current_revision,
+            execution.executed_node_ids,
+            execution.waiting_node_id,
+            failure_reason,
+        )
+        task = self._require_task(task_id)
+        if task.status not in {"completed", "failed", "cancelled", "expired"}:
+            task = self._tasks.fail(task.id, reason=failure_reason)
+        latest = self._plan_store.get_revision_by_id(current_revision.id)
+        return PlanTaskResult(task=task, revision=latest, execution=finalized_execution)
 
     def _record_execution_trace(
         self,

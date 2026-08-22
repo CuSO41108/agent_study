@@ -432,6 +432,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_plan_task_result(planned)
             _persist_current_session(session_state_path, planned.task.session_id)
             return 0 if planned.execution.status in {"completed", "waiting_approval"} else 1
+        plan_continuation = _try_resume_plan_user_message(
+            plan_service=plan_service,
+            session_service=sessions,
+            session_id=resolved_session_id,
+            content=decision.goal,
+            source="cli",
+        )
+        if plan_continuation is not None:
+            _print_plan_task_result(plan_continuation)
+            _persist_current_session(session_state_path, plan_continuation.task.session_id)
+            return 0 if plan_continuation.execution.status in {"completed", "waiting_approval"} else 1
         result = loop.run_turn(user_input=decision.goal, session_id=resolved_session_id)
     except ActiveTaskConflict as exc:
         print(f"Task error: {exc}", file=sys.stderr)
@@ -844,6 +855,19 @@ def _run_interactive_loop(
                 pending_skill_names.clear()
                 _print_plan_task_result(planned)
                 continue
+            plan_continuation = _try_resume_plan_user_message(
+                plan_service=plan_service,
+                session_service=session_service,
+                session_id=current_session_id,
+                content=decision.goal,
+                source="repl",
+            )
+            if plan_continuation is not None:
+                current_session_id = plan_continuation.task.session_id
+                _persist_current_session(session_state_path, current_session_id)
+                pending_skill_names.clear()
+                _print_plan_task_result(plan_continuation)
+                continue
             result = loop.run_turn(
                 user_input=decision.goal,
                 session_id=current_session_id,
@@ -953,6 +977,32 @@ def _handle_plan_execute_command(
         print(f"Plan error: {exc}")
         return
     _print_plan_task_result(result)
+
+
+def _try_resume_plan_user_message(
+    *,
+    plan_service: PlanTaskService,
+    session_service: SessionService,
+    session_id: str | None,
+    content: str,
+    source: str,
+) -> PlanTaskResult | None:
+    if session_id is None:
+        return None
+    task = session_service.get_active_task(session_id)
+    if task is None or not plan_service.is_waiting_for_user_answer(task_id=task.id):
+        return None
+    event = AgentEvent(
+        id=str(uuid4()),
+        task_id=task.id,
+        session_id=task.session_id,
+        type="user_message",
+        source=source,
+        payload={"content": content},
+        correlation_id=task.id,
+        expected_version=task.version,
+    )
+    return plan_service.handle_user_message(task_id=task.id, event=event)
 
 
 def _handle_replan_command(
@@ -1336,10 +1386,16 @@ def _run_repl_task_control(
             for item in reversed(tasks)
             if item.status == "waiting_user"
             and item.pending_action is not None
-            and item.pending_action.kind == "tool_approval"
+            and (
+                item.pending_action.kind == "tool_approval"
+                or (
+                    plan_service is not None
+                    and plan_service.is_waiting_for_user_answer(task_id=item.id)
+                )
+            )
         ]
         if not candidates:
-            print("No task is waiting for tool approval in this session.")
+            print("No task is waiting for tool approval or a Plan user answer in this session.")
             return None
         task = _select_task_candidate(
             candidates,

@@ -83,6 +83,11 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
             f"{attributes.get('decision', 'pending')} / "
             f"{attributes.get('to_status', '?')}"
         )
+    if event_type == "plan_node_user_message":
+        return (
+            f"{attributes.get('node_id', 'node')} / "
+            f"user answer / {attributes.get('to_status', '?')}"
+        )
     if event_type == "plan_execution":
         return (
             f"revision {attributes.get('revision', '?')} / "
@@ -99,6 +104,11 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
             f"revision {attributes.get('from_revision', '?')} → "
             f"{attributes.get('to_revision', '?')} / "
             f"{attributes.get('reason', 'replan')}"
+        )
+    if event_type == "plan_replan_failed":
+        return (
+            f"{attributes.get('error_type', 'error')} / "
+            f"{attributes.get('error', 'automatic replan failed')}"
         )
     if event_type == "tool_attempt":
         outcome = "success" if attributes.get("success") else attributes.get("error_type", "failed")

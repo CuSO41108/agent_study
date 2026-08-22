@@ -21,9 +21,14 @@ Requests with explicit multi-step intent can enter Plan-and-Execute through
 - A side-effect tool can pause the node at `waiting_approval`. The approval
   command resumes that same node scope; successful approval advances the node
   and the executor continues with its dependents.
+- A node may call `ask_user` for missing information. A natural-language
+  answer resumes the same node with the same scope; `/approve` and `/reject`
+  are reserved for `tool_approval` and do not answer an `ask_user` question.
 - A failed node keeps the active revision available while the Service may ask
   for a successor revision. Completed nodes and their evidence are preserved.
   Replanning is bounded by the task budget (`max_replans`, currently 2).
+- If automatic Replan itself fails, the Service records the Planner/Revision
+  error and closes both the Task and active PlanRevision as failed.
 
 ## Execution and audit flow
 
@@ -62,9 +67,11 @@ The important state transitions are persisted in SQLite task traces:
 | `plan_created` | Initial revision and node contracts were persisted. |
 | `plan_node_transition` | A node changed status, with its kind, objective, acceptance, and bounded result preview. |
 | `plan_node_approval` | A user approval decision moved a waiting node to its next state. |
+| `plan_node_user_message` | A natural-language answer resumed an `ask_user` node. |
 | `plan_execution` | One executor invocation ended with completed, waiting, blocked, or failed status. |
 | `plan_failure` | Failed and skipped nodes plus a diagnosis reason. |
 | `plan_replan` | Old and successor revisions, reason, and preserved completed nodes. |
+| `plan_replan_failed` | Automatic Replan failed; the Task and active revision were closed. |
 
 `/trace` and `--task-trace-json` expose these events together with the normal
 AgentLoop model/tool traces, so a Plan run can be replayed without treating the
@@ -79,10 +86,14 @@ The current implementation is accepted when all of the following hold:
    session transcript remains free of the transient prompt.
 3. A pending approval pauses the task and, after approval, resumes only the
    original node's allowed tools before continuing downstream nodes.
-4. A failed node produces a failure trace; an available budget creates a new
+4. An `ask_user` node resumes from a natural-language answer, retains its
+   node scope, and can ask a second question without leaving the Plan.
+5. A failed node produces a failure trace; an available budget creates a new
    revision without deleting completed evidence; exhausted budget produces a
    terminal diagnosis.
-5. The targeted Plan, trace, and existing AgentLoop tests pass. Full-suite
+6. A failed automatic Replan produces a terminal Task and failed revision,
+   rather than leaking an active broken revision.
+7. The targeted Plan, trace, and existing AgentLoop tests pass. Full-suite
    failures must be reported separately when they are unrelated baseline
    drift.
 

@@ -11,11 +11,12 @@ from uuid import uuid4
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.orchestrator.loop import AgentLoop
 from agent_app.orchestrator.subagent_runner import SubagentRunner
+from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.file_write import FileWriteTool, inspect_file_write_request
 from agent_app.tools.registry import build_default_registry, build_root_registry
-from agent_app.types import AgentEvent, ModelResponse, ToolCall, ToolResult
+from agent_app.types import AgentEvent, ModelResponse, PendingAction, ToolCall, ToolResult
 
 
 class _FakeModelClient:
@@ -107,6 +108,54 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.task_status, "running")
         tool_names = [item["function"]["name"] for item in model.calls[0]["tools"]]
         self.assertEqual(tool_names, ["file_read", "ask_user", "give_up"])
+
+    def test_user_message_resume_forwards_plan_scope_and_keeps_task_open(self) -> None:
+        model = _FakeModelClient([_text_response("answer applied")])
+        loop = self._build_loop(model)
+        runtime = TaskRuntime(self.sessions)
+        session_id = self.sessions.create_session("plan-answer-session")
+        task = runtime.start_for_user_message(
+            session_id=session_id,
+            user_input="Need a file selection",
+        )
+        waiting = runtime.wait_for_user(
+            task.id,
+            PendingAction(kind="ask_user", prompt="Which file?"),
+        )
+        event = AgentEvent(
+            id="answer-event",
+            task_id=task.id,
+            session_id=session_id,
+            type="user_message",
+            source="test",
+            payload={"content": "README.md"},
+            expected_version=waiting.version,
+        )
+
+        result = loop.handle_event(
+            event,
+            resume_allowed_tools=("file_read",),
+            resume_keep_task_open=True,
+            resume_transient_context="Node kind: inspect\nObjective: Inspect the selected file.",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.task_status, "running")
+        tool_names = [item["function"]["name"] for item in model.calls[0]["tools"]]
+        self.assertEqual(tool_names, ["file_read", "ask_user", "give_up"])
+        self.assertTrue(
+            any(
+                message.get("role") == "system"
+                and "Inspect the selected file." in (message.get("content") or "")
+                for message in model.calls[0]["messages"]
+            )
+        )
+        self.assertTrue(
+            any(
+                message.role == "user" and message.content == "README.md"
+                for message in self.sessions.list_messages(session_id)
+            )
+        )
 
     def test_transient_plan_context_reaches_model_without_persisting_as_message(self) -> None:
         model = _FakeModelClient([_text_response("node done")])

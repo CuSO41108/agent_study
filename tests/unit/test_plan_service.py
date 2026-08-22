@@ -120,6 +120,70 @@ class _ReplanPlannerModel:
         return ModelResponse(assistant_text=content)
 
 
+class _BadReplanModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            content = (
+                '{"id":"bad-replan","revision":1,"nodes":['
+                '{"id":"inspect","kind":"inspect","objective":"Inspect source.",'
+                '"depends_on":[],"allowed_tools":["file_read"],"acceptance":["Inspected"]}]}'
+            )
+        else:
+            content = "not a JSON plan"
+        return ModelResponse(assistant_text=content)
+
+
+class _AskUserAnswerLoop:
+    def __init__(self, runtime: TaskRuntime) -> None:
+        self.runtime = runtime
+        self.calls: list[dict] = []
+
+    def handle_event(self, event: AgentEvent, **kwargs):
+        self.calls.append(kwargs)
+        task = self.runtime.resume_with_user_message(
+            event.task_id,
+            str(event.payload["content"]),
+            event=event,
+        )
+        return TurnResult(
+            session_id=task.session_id,
+            final_text="user answer applied",
+            stop_reason="final_response",
+            tool_runs=[],
+            success=True,
+            task_id=task.id,
+            task_status=task.status,
+        )
+
+
+class _AskAgainLoop(_AskUserAnswerLoop):
+    def handle_event(self, event: AgentEvent, **kwargs):
+        self.calls.append(kwargs)
+        task = self.runtime.resume_with_user_message(
+            event.task_id,
+            str(event.payload["content"]),
+            event=event,
+        )
+        task = self.runtime.wait_for_user(
+            task.id,
+            PendingAction(kind="ask_user", prompt="Please provide another detail."),
+        )
+        return TurnResult(
+            session_id=task.session_id,
+            final_text=None,
+            stop_reason="waiting_user",
+            tool_runs=[],
+            success=False,
+            task_id=task.id,
+            task_status=task.status,
+            pending_action=task.pending_action,
+        )
+
+
 class PlanTaskServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(__file__).resolve().parents[2] / ".test_tmp" / f"plan_service_{uuid4().hex}"
@@ -279,6 +343,125 @@ class PlanTaskServiceTests(unittest.TestCase):
         failures = [trace for trace in traces if trace.trace_type == "plan_failure"]
         self.assertEqual(len(failures), 1 + result.task.budget.max_replans)
         self.assertEqual(failures[-1].payload["failure_reason"], "node_failed")
+
+    def test_auto_replan_failure_closes_task_and_revision(self) -> None:
+        planner_model = _BadReplanModel()
+        loop = _AlwaysFailLoop()
+        store = PlanStore(self.db_path)
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model),
+            plan_store=store,
+            session_service=self.sessions,
+            agent_loop=loop,
+        )
+
+        result = service.start(session_id=self.session_id, goal="Inspect with invalid fallback")
+
+        self.assertEqual(result.task.status, "failed")
+        self.assertEqual(result.revision.status, "failed")
+        self.assertIsNone(store.get_active_revision(result.task.id))
+        self.assertEqual(result.task.budget.used_replans, 1)
+        self.assertIn("auto_replan_failed", result.execution.failure_reason or "")
+        trace = next(
+            item
+            for item in self.sessions.list_task_traces(result.task.id)
+            if item.trace_type == "plan_replan_failed"
+        )
+        self.assertEqual(trace.payload["error_type"], "PlanPlanningError")
+
+    def _create_waiting_ask_user_plan(self, *, loop):
+        runtime = TaskRuntime(self.sessions)
+        task = runtime.start_for_user_message(
+            session_id=self.session_id,
+            user_input="Need a plan answer",
+        )
+        pending = runtime.wait_for_user(
+            task.id,
+            PendingAction(kind="ask_user", prompt="Which file should I inspect?"),
+        )
+        graph = parse_plan_graph(
+            {
+                "id": "ask-user-plan",
+                "revision": 1,
+                "goal": "Need a plan answer",
+                "nodes": [
+                    {
+                        "id": "inspect",
+                        "kind": "inspect",
+                        "objective": "Inspect the selected file.",
+                        "depends_on": [],
+                        "allowed_tools": ["file_read"],
+                        "acceptance": ["The selected file is inspected."],
+                        "status": "waiting_approval",
+                    }
+                ],
+            }
+        )
+        store = PlanStore(self.db_path)
+        store.create_revision(task.id, graph)
+        service = PlanTaskService(
+            planner=PlanPlanner(_PlannerModel()),
+            plan_store=store,
+            session_service=self.sessions,
+            agent_loop=loop,
+        )
+        event = AgentEvent(
+            id="answer-plan-node",
+            task_id=task.id,
+            session_id=self.session_id,
+            type="user_message",
+            source="test",
+            payload={"content": "Use README.md"},
+            correlation_id=task.id,
+            expected_version=pending.version,
+        )
+        return service, task, event
+
+    def test_ask_user_answer_resumes_original_plan_node_scope(self) -> None:
+        runtime = TaskRuntime(self.sessions)
+        loop = _AskUserAnswerLoop(runtime)
+        service, task, event = self._create_waiting_ask_user_plan(loop=loop)
+
+        result = service.handle_user_message(task_id=task.id, event=event)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.execution.status, "completed")
+        self.assertEqual(result.task.status, "completed")
+        self.assertEqual(result.revision.graph.node_map()["inspect"].status, "completed")
+        self.assertEqual(loop.calls[0]["resume_allowed_tools"], ("file_read",))
+        self.assertTrue(loop.calls[0]["resume_keep_task_open"])
+        self.assertIn("Inspect the selected file.", loop.calls[0]["resume_transient_context"])
+
+    def test_ask_user_can_request_another_answer_without_leaving_plan(self) -> None:
+        runtime = TaskRuntime(self.sessions)
+        loop = _AskAgainLoop(runtime)
+        service, task, event = self._create_waiting_ask_user_plan(loop=loop)
+
+        result = service.handle_user_message(task_id=task.id, event=event)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.execution.status, "waiting_approval")
+        self.assertEqual(result.task.status, "waiting_user")
+        self.assertEqual(result.revision.graph.node_map()["inspect"].status, "waiting_approval")
+        self.assertEqual(result.task.pending_action.kind, "ask_user")
+        self.assertIsNotNone(self.sessions.get_task(task.id))
+
+    def test_ask_user_pending_action_rejects_approval_commands(self) -> None:
+        runtime = TaskRuntime(self.sessions)
+        loop = _AskUserAnswerLoop(runtime)
+        service, task, event = self._create_waiting_ask_user_plan(loop=loop)
+        approval_event = AgentEvent(
+            id="wrong-approval-event",
+            task_id=task.id,
+            session_id=self.session_id,
+            type="user_approved",
+            source="test",
+            payload={},
+            expected_version=event.expected_version,
+        )
+
+        with self.assertRaisesRegex(ValueError, "natural-language response"):
+            service.handle_approval(task_id=task.id, event=approval_event, approved=True)
 
 
 if __name__ == "__main__":

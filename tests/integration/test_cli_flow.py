@@ -156,6 +156,63 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("plan_execution", trace_types)
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_resumes_plan_ask_user_with_natural_language_answer(self, mock_from_config) -> None:
+        plan = (
+            '{"id":"ask-cli-plan","revision":1,"nodes":['
+            '{"id":"inspect","kind":"inspect","objective":"Inspect the selected file.",'
+            '"depends_on":[],"allowed_tools":["file_read"],'
+            '"acceptance":["The selected file is inspected"]}]}'
+        )
+        first_model = _FakeModelClient(
+            [
+                _text_response(plan),
+                _tool_call_response([
+                    ToolCall(
+                        id="ask-file",
+                        name="ask_user",
+                        arguments={"question": "Which file should I inspect?"},
+                    ),
+                ]),
+            ]
+        )
+        second_model = _FakeModelClient([_text_response("README inspected")])
+        mock_from_config.side_effect = [first_model, second_model]
+
+        first_stdout = io.StringIO()
+        with redirect_stdout(first_stdout):
+            first_exit_code = cli.main([
+                "/plan-and-execute inspect a selected file",
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        first_output = json.loads(first_stdout.getvalue().strip())
+        self.assertEqual(first_exit_code, 0)
+        self.assertEqual(first_output["execution"]["status"], "waiting_approval")
+
+        second_stdout = io.StringIO()
+        with redirect_stdout(second_stdout):
+            second_exit_code = cli.main([
+                "README.md",
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        second_output = json.loads(second_stdout.getvalue().strip())
+        self.assertEqual(second_exit_code, 0)
+        self.assertEqual(second_output["execution"]["status"], "completed")
+        self.assertEqual(second_output["task"]["status"], "completed")
+        tool_names = [item["function"]["name"] for item in second_model.calls[0]["tools"]]
+        self.assertEqual(tool_names, ["file_read", "ask_user", "give_up"])
+        self.assertTrue(
+            any(
+                message.get("role") == "system"
+                and "Inspect the selected file." in (message.get("content") or "")
+                for message in second_model.calls[0]["messages"]
+            )
+        )
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_delegates_to_worker_and_keeps_turn_result_shape(self, mock_from_config) -> None:
         fake_model = _FakeModelClient(
             [

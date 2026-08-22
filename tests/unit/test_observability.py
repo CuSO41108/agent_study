@@ -30,6 +30,8 @@ class ObservabilityTests(unittest.TestCase):
         self.sessions.append_task_trace(task.id, "plan_node_transition", {"node_id": "inspect", "from_status": "pending", "to_status": "completed"})
         self.sessions.append_task_trace(task.id, "plan_execution", {"revision": 1, "status": "completed", "executed_node_ids": ["inspect"]})
         self.sessions.append_task_trace(task.id, "plan_replan", {"from_revision": 1, "to_revision": 2, "reason": "new evidence"})
+        self.sessions.append_task_trace(task.id, "plan_node_user_message", {"node_id": "inspect", "to_status": "completed"})
+        self.sessions.append_task_trace(task.id, "plan_replan_failed", {"error_type": "PlanPlanningError", "error": "invalid plan"})
 
         trace = export_task_trace(self.sessions, task.id)
         rendered = render_task_timeline(trace)
@@ -43,6 +45,8 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("inspect / pending → completed", rendered)
         self.assertIn("revision 1 / completed / nodes: 1", rendered)
         self.assertIn("revision 1 → 2 / new evidence", rendered)
+        self.assertIn("inspect / user answer / completed", rendered)
+        self.assertIn("PlanPlanningError / invalid plan", rendered)
 
     def test_export_rejects_unknown_task(self) -> None:
         with self.assertRaises(KeyError):

@@ -721,6 +721,9 @@ class AgentLoop:
                     session_id=resolved_session_id,
                     _task_id=task.id,
                     _append_user_message=True,
+                    allowed_tools=resume_allowed_tools,
+                    keep_task_open=resume_keep_task_open,
+                    transient_context=resume_transient_context,
                 )
             task = self._tasks.require_task(event.task_id)
             if task.status == "waiting_user":
@@ -732,6 +735,9 @@ class AgentLoop:
                 session_id=event.session_id,
                 _task_id=task.id,
                 _append_user_message=True,
+                allowed_tools=resume_allowed_tools,
+                keep_task_open=resume_keep_task_open,
+                transient_context=resume_transient_context,
             )
 
         if event.task_id is None:
