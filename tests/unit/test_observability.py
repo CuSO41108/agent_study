@@ -27,6 +27,9 @@ class ObservabilityTests(unittest.TestCase):
         self.sessions.append_task_trace(task.id, "model_call", {"phase": "policy", "model": "test", "total_tokens": 42, "duration_ms": 12})
         self.sessions.append_task_trace(task.id, "approval", {"tool": "shell", "decision": "approve"})
         self.sessions.append_task_trace(task.id, "tool_attempt", {"tool": "shell", "success": True, "duration_ms": 25})
+        self.sessions.append_task_trace(task.id, "plan_node_transition", {"node_id": "inspect", "from_status": "pending", "to_status": "completed"})
+        self.sessions.append_task_trace(task.id, "plan_execution", {"revision": 1, "status": "completed", "executed_node_ids": ["inspect"]})
+        self.sessions.append_task_trace(task.id, "plan_replan", {"from_revision": 1, "to_revision": 2, "reason": "new evidence"})
 
         trace = export_task_trace(self.sessions, task.id)
         rendered = render_task_timeline(trace)
@@ -37,6 +40,9 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("Trace:", rendered)
         self.assertIn("model_call", rendered)
         self.assertIn("shell / success / 25 ms", rendered)
+        self.assertIn("inspect / pending → completed", rendered)
+        self.assertIn("revision 1 / completed / nodes: 1", rendered)
+        self.assertIn("revision 1 → 2 / new evidence", rendered)
 
     def test_export_rejects_unknown_task(self) -> None:
         with self.assertRaises(KeyError):

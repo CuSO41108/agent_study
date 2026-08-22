@@ -9,7 +9,7 @@ from agent_app.plan.planner import PlanPlanner
 from agent_app.plan.store import PlanRevision, PlanStore
 from agent_app.runtime.task_runtime import ReplanBudgetExceeded, TaskRuntime
 from agent_app.state.session_service import SessionService
-from agent_app.types import AgentEvent, Message, TaskState, TurnResult
+from agent_app.types import AgentEvent, Message, TaskState
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +45,11 @@ class PlanTaskService:
         except Exception:
             task = self._tasks.fail(task.id, reason="planner_failed")
             raise
+        self._sessions.append_task_trace(
+            task.id,
+            "plan_created",
+            _plan_revision_payload(revision),
+        )
         return self._execute_and_reconcile(task.id, revision, auto_replan=True)
 
     def continue_task(self, *, task_id: str) -> PlanTaskResult:
@@ -70,6 +75,21 @@ class PlanTaskService:
             candidate,
             reason=reason,
             expected_revision=current.graph.revision,
+        )
+        self._sessions.append_task_trace(
+            task.id,
+            "plan_replan",
+            {
+                "plan_id": revision.graph.id,
+                "from_revision": current.graph.revision,
+                "to_revision": revision.graph.revision,
+                "reason": reason,
+                "preserved_completed_nodes": [
+                    node.id
+                    for node in revision.graph.nodes
+                    if node.status == "completed"
+                ],
+            },
         )
         return self._execute_and_reconcile(task.id, revision, auto_replan=automatic)
 
@@ -138,6 +158,19 @@ class PlanTaskService:
             result=result_record,
             expected_version=revision.version,
         )
+        self._sessions.append_task_trace(
+            task.id,
+            "plan_node_approval",
+            {
+                "plan_id": revision.graph.id,
+                "revision": revision.graph.revision,
+                "node_id": node.id,
+                "decision": "approve" if approved else "reject",
+                "from_status": "waiting_approval",
+                "to_status": next_status,
+                "stop_reason": turn_result.stop_reason,
+            },
+        )
         return self._execute_and_reconcile(task.id, revision, auto_replan=True)
 
     def _execute_and_reconcile(
@@ -147,12 +180,18 @@ class PlanTaskService:
         *,
         auto_replan: bool,
     ) -> PlanTaskResult:
+        before = self._plan_store.get_revision_by_id(revision.id)
         executor = PlanExecutor(self._plan_store, PlanAgentNodeRunner(self._agent_loop))
         execution = executor.execute(task_id=task_id, revision=revision.graph.revision)
+        after = self._plan_store.get_revision_by_id(execution.revision.id)
+        self._record_execution_trace(task_id, before=before, after=after, execution=execution)
         task = self._require_task(task_id)
         if execution.status == "failed" and auto_replan:
             reason = execution.failure_reason or "A plan node failed."
-            if task.budget.used_replans < task.budget.max_replans:
+            if (
+                task.status not in {"completed", "failed", "cancelled", "expired"}
+                and task.budget.used_replans < task.budget.max_replans
+            ):
                 try:
                     return self.replan(
                         task_id=task.id,
@@ -183,8 +222,102 @@ class PlanTaskService:
         latest = self._plan_store.get_revision_by_id(execution.revision.id)
         return PlanTaskResult(task=task, revision=latest, execution=execution)
 
+    def _record_execution_trace(
+        self,
+        task_id: str,
+        *,
+        before: PlanRevision,
+        after: PlanRevision,
+        execution: PlanExecutionResult,
+    ) -> None:
+        before_nodes = before.graph.node_map()
+        for node in after.graph.nodes:
+            previous = before_nodes.get(node.id)
+            if previous is None or previous.status == node.status:
+                continue
+            result = after.node_results.get(node.id, {})
+            self._sessions.append_task_trace(
+                task_id,
+                "plan_node_transition",
+                {
+                    "plan_id": after.graph.id,
+                    "revision": after.graph.revision,
+                    "node_id": node.id,
+                    "kind": node.kind,
+                    "objective": node.objective,
+                    "acceptance": list(node.acceptance),
+                    "from_status": previous.status,
+                    "to_status": node.status,
+                    "executed": node.id in execution.executed_node_ids,
+                    "result": _node_result_payload(result),
+                },
+            )
+        self._sessions.append_task_trace(
+            task_id,
+            "plan_execution",
+            {
+                "plan_id": after.graph.id,
+                "revision": after.graph.revision,
+                "status": execution.status,
+                "executed_node_ids": list(execution.executed_node_ids),
+                "waiting_node_id": execution.waiting_node_id,
+                "failure_reason": execution.failure_reason,
+            },
+        )
+        if execution.status == "failed":
+            failed_nodes = [
+                node.id for node in after.graph.nodes if node.status == "failed"
+            ]
+            skipped_nodes = [
+                node.id for node in after.graph.nodes if node.status == "skipped"
+            ]
+            self._sessions.append_task_trace(
+                task_id,
+                "plan_failure",
+                {
+                    "plan_id": after.graph.id,
+                    "revision": after.graph.revision,
+                    "failure_reason": execution.failure_reason,
+                    "failed_node_ids": failed_nodes,
+                    "skipped_node_ids": skipped_nodes,
+                    "executed_node_ids": list(execution.executed_node_ids),
+                },
+            )
+
     def _require_task(self, task_id: str) -> TaskState:
         task = self._sessions.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
         return task
+
+
+def _plan_revision_payload(revision: PlanRevision) -> dict[str, Any]:
+    return {
+        "plan_id": revision.graph.id,
+        "revision": revision.graph.revision,
+        "goal": revision.graph.goal,
+        "nodes": [
+            {
+                "id": node.id,
+                "kind": node.kind,
+                "depends_on": list(node.depends_on),
+                "allowed_tools": list(node.allowed_tools),
+                "objective": node.objective,
+                "acceptance": list(node.acceptance),
+            }
+            for node in revision.graph.nodes
+        ],
+    }
+
+
+def _node_result_payload(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    output = result.get("output")
+    return {
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "evidence_refs": list(result.get("evidence_refs", [])),
+        "output_preview": str(output)[:500] if output is not None else None,
+        "metadata": result.get("metadata", {}),
+    }

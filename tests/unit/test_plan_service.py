@@ -84,6 +84,21 @@ class _FailThenSuccessLoop(_AgentLoop):
         )
 
 
+class _AlwaysFailLoop(_AgentLoop):
+    def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        task_id = kwargs["_task_id"]
+        return TurnResult(
+            session_id=kwargs["session_id"],
+            final_text=None,
+            stop_reason="node_failed",
+            tool_runs=[],
+            success=False,
+            task_id=task_id,
+            task_status="running",
+        )
+
+
 class _ReplanPlannerModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -133,6 +148,20 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual([call["allowed_tools"] for call in self.loop.calls], [("file_read",), ("shell",)])
         self.assertTrue(all(call["keep_task_open"] for call in self.loop.calls))
         self.assertEqual(self.sessions.list_messages(self.session_id)[0].content, "Inspect and verify the source")
+        traces = self.sessions.list_task_traces(result.task.id)
+        trace_types = [trace.trace_type for trace in traces]
+        self.assertLess(trace_types.index("state_transition"), trace_types.index("plan_created"))
+        self.assertIn("plan_node_transition", trace_types)
+        self.assertIn("plan_execution", trace_types)
+        transitions = [
+            trace.payload
+            for trace in traces
+            if trace.trace_type == "plan_node_transition"
+        ]
+        self.assertEqual(
+            [(item["node_id"], item["from_status"], item["to_status"]) for item in transitions],
+            [("inspect", "pending", "completed"), ("verify", "pending", "completed")],
+        )
 
     def test_approval_resumes_plan_node_with_its_scope_and_completes_plan(self) -> None:
         runtime = TaskRuntime(self.sessions)
@@ -191,6 +220,13 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual(approval_loop.calls[0]["resume_allowed_tools"], ("file_write",))
         self.assertTrue(approval_loop.calls[0]["resume_keep_task_open"])
         self.assertIn("Apply the approved edit.", approval_loop.calls[0]["resume_transient_context"])
+        approval_traces = [
+            trace.payload
+            for trace in self.sessions.list_task_traces(task.id)
+            if trace.trace_type == "plan_node_approval"
+        ]
+        self.assertEqual(approval_traces[-1]["decision"], "approve")
+        self.assertEqual(approval_traces[-1]["to_status"], "completed")
 
     def test_failed_node_enters_automatic_replan_and_resumes_with_new_revision(self) -> None:
         planner_model = _ReplanPlannerModel()
@@ -210,6 +246,39 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual(result.task.budget.used_replans, 1)
         self.assertEqual(planner_model.calls, 2)
         self.assertEqual(len(loop.calls), 2)
+        traces = self.sessions.list_task_traces(result.task.id)
+        failure = next(trace for trace in traces if trace.trace_type == "plan_failure")
+        replan = next(trace for trace in traces if trace.trace_type == "plan_replan")
+        self.assertEqual(failure.payload["failure_reason"], "node_failed")
+        self.assertEqual(replan.payload["from_revision"], 1)
+        self.assertEqual(replan.payload["to_revision"], 2)
+        self.assertEqual(replan.payload["preserved_completed_nodes"], [])
+
+    def test_replan_budget_exhaustion_returns_diagnosis_and_terminal_trace(self) -> None:
+        planner_model = _ReplanPlannerModel()
+        loop = _AlwaysFailLoop()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=loop,
+        )
+
+        result = service.start(session_id=self.session_id, goal="Inspect with no successful fallback")
+
+        self.assertEqual(result.execution.status, "failed")
+        self.assertEqual(result.task.status, "failed")
+        self.assertEqual(result.task.budget.used_replans, result.task.budget.max_replans)
+        self.assertEqual(result.revision.status, "failed")
+        self.assertEqual(len(loop.calls), 1 + result.task.budget.max_replans)
+        traces = self.sessions.list_task_traces(result.task.id)
+        self.assertEqual(
+            len([trace for trace in traces if trace.trace_type == "plan_replan"]),
+            result.task.budget.max_replans,
+        )
+        failures = [trace for trace in traces if trace.trace_type == "plan_failure"]
+        self.assertEqual(len(failures), 1 + result.task.budget.max_replans)
+        self.assertEqual(failures[-1].payload["failure_reason"], "node_failed")
 
 
 if __name__ == "__main__":

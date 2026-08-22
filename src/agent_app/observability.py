@@ -70,6 +70,36 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
         return f"tool calls: {len(attributes.get('tool_calls', []))}"
     if event_type == "approval":
         return f"{attributes.get('tool', 'action')} / {attributes.get('decision', 'pending')}"
+    if event_type == "plan_created":
+        return f"revision {attributes.get('revision', '?')} / {len(attributes.get('nodes', []))} nodes"
+    if event_type == "plan_node_transition":
+        return (
+            f"{attributes.get('node_id', 'node')} / "
+            f"{attributes.get('from_status', '?')} → {attributes.get('to_status', '?')}"
+        )
+    if event_type == "plan_node_approval":
+        return (
+            f"{attributes.get('node_id', 'node')} / "
+            f"{attributes.get('decision', 'pending')} / "
+            f"{attributes.get('to_status', '?')}"
+        )
+    if event_type == "plan_execution":
+        return (
+            f"revision {attributes.get('revision', '?')} / "
+            f"{attributes.get('status', '?')} / "
+            f"nodes: {len(attributes.get('executed_node_ids', []))}"
+        )
+    if event_type == "plan_failure":
+        return (
+            f"{attributes.get('failure_reason', 'unknown failure')} / "
+            f"failed: {', '.join(attributes.get('failed_node_ids', [])) or 'none'}"
+        )
+    if event_type == "plan_replan":
+        return (
+            f"revision {attributes.get('from_revision', '?')} → "
+            f"{attributes.get('to_revision', '?')} / "
+            f"{attributes.get('reason', 'replan')}"
+        )
     if event_type == "tool_attempt":
         outcome = "success" if attributes.get("success") else attributes.get("error_type", "failed")
         return f"{attributes.get('tool', 'tool')} / {outcome} / {attributes.get('duration_ms', 0)} ms"

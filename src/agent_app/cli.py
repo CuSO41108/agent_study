@@ -427,7 +427,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(plan_graph_to_dict(graph), ensure_ascii=False, indent=2))
             return 0
         if decision.mode == "plan_and_execute":
-            planned = plan_service.start(session_id=resolved_session_id, goal=decision.goal)
+            plan_session_id = sessions.get_or_create_session(resolved_session_id)
+            planned = plan_service.start(session_id=plan_session_id, goal=decision.goal)
             _print_plan_task_result(planned)
             _persist_current_session(session_state_path, planned.task.session_id)
             return 0 if planned.execution.status in {"completed", "waiting_approval"} else 1

@@ -110,6 +110,52 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(tool_runs[0].tool_name, "file_read")
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_runs_plan_and_execute_and_exports_plan_trace(self, mock_from_config) -> None:
+        plan = (
+            '{"id":"cli-plan","revision":1,"nodes":['
+            '{"id":"inspect","kind":"inspect","objective":"Read README.md.",'
+            '"depends_on":[],"allowed_tools":["file_read"],'
+            '"acceptance":["README is read"]},'
+            '{"id":"verify","kind":"verify","objective":"Confirm the README is available.",'
+            '"depends_on":["inspect"],"allowed_tools":["file_read"],'
+            '"acceptance":["The file remains available"]}]}'
+        )
+        mock_from_config.return_value = _FakeModelClient(
+            [
+                _text_response(plan),
+                _tool_call_response([
+                    ToolCall(id="plan-read", name="file_read", arguments={"path": "README.md"}),
+                ]),
+                _text_response("README inspected"),
+                _text_response("README verified"),
+            ]
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "/plan-and-execute inspect and verify README.md",
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue().strip())
+        self.assertEqual(output["execution"]["status"], "completed")
+        self.assertEqual(output["revision"]["graph"]["revision"], 1)
+        self.assertEqual(
+            [node["status"] for node in output["revision"]["graph"]["nodes"]],
+            ["completed", "completed"],
+        )
+
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        sessions = SessionService(database_path)
+        trace_types = [trace.trace_type for trace in sessions.list_task_traces(output["task"]["id"])]
+        self.assertIn("plan_created", trace_types)
+        self.assertIn("plan_node_transition", trace_types)
+        self.assertIn("plan_execution", trace_types)
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_delegates_to_worker_and_keeps_turn_result_shape(self, mock_from_config) -> None:
         fake_model = _FakeModelClient(
             [
