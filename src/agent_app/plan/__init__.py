@@ -21,8 +21,10 @@ from agent_app.plan.executor import (
     PlanExecutor,
     PlanNodeContext,
 )
+from agent_app.plan.agent_runner import PlanAgentNodeRunner
 from agent_app.plan.planner import PlanPlanner, PlanPlanningError
 from agent_app.plan.routing import ExecutionMode, RouteDecision, route_request
+from agent_app.plan.service import PlanTaskResult, PlanTaskService
 from agent_app.plan.store import (
     InvalidPlanNodeTransition,
     PlanRevision,
@@ -50,11 +52,14 @@ __all__ = [
     "PlanExecutionResult",
     "PlanExecutor",
     "PlanNodeContext",
+    "PlanAgentNodeRunner",
     "PlanPlanner",
     "PlanPlanningError",
     "ExecutionMode",
     "RouteDecision",
     "route_request",
+    "PlanTaskResult",
+    "PlanTaskService",
     "InvalidPlanNodeTransition",
     "PlanRevision",
     "PlanRevisionConflict",

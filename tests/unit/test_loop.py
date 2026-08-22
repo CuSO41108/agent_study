@@ -93,6 +93,21 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "final_response")
         self.assertEqual(len(model.calls), 1)
 
+    def test_plan_node_turn_can_restrict_tools_and_keep_task_open(self) -> None:
+        model = _FakeModelClient([_text_response("node done")])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(
+            user_input="execute one plan node",
+            allowed_tools=("file_read",),
+            keep_task_open=True,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.task_status, "running")
+        tool_names = [item["function"]["name"] for item in model.calls[0]["tools"]]
+        self.assertEqual(tool_names, ["file_read", "ask_user", "give_up"])
+
     def test_run_turn_executes_read_tool_and_returns_final_answer(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"})]),

@@ -37,6 +37,7 @@ class PlanNodeContext:
     """Read-only input supplied to a runner for one serial node."""
 
     task_id: str
+    session_id: str
     revision: PlanRevision
     node: PlanNode
     node_results: Mapping[str, Mapping[str, Any]]
@@ -108,6 +109,7 @@ class PlanExecutor:
                 node = running_plan.graph.node_map()[node_id]
                 context = PlanNodeContext(
                     task_id=task_id,
+                    session_id=self._store.get_task_session_id(task_id),
                     revision=running_plan,
                     node=node,
                     node_results=running_plan.node_results,

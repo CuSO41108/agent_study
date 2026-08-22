@@ -31,7 +31,15 @@ from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
 from agent_app.observability import export_task_trace, render_task_timeline, render_trace_events
 from agent_app.orchestrator.loop import AgentLoop
-from agent_app.plan import PlanPlanner, PlanPlanningError, plan_graph_to_dict
+from agent_app.plan import (
+    PlanPlanner,
+    PlanPlanningError,
+    PlanStore,
+    PlanTaskResult,
+    PlanTaskService,
+    plan_graph_to_dict,
+    route_request,
+)
 from agent_app.skills.learning import build_learning_reference, normalize_generated_skill
 from agent_app.skills.registry import SkillRegistry
 from agent_app.state.db import initialize_database
@@ -79,6 +87,8 @@ _REPL_HELP = """Commands:
               Shortcut for /skill <name>.
   /plan <goal>
               Generate and display a validated PlanGraph without executing it.
+  /plan-and-execute <goal>
+              Generate a PlanGraph and execute its nodes serially.
   /new        Start a new session.
   /help       Show this help.
   exit        Leave interactive mode."""
@@ -105,6 +115,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/skills", "List read-only Skills from both sources."),
     CommandSpec("/skill", "Select a Skill for the next task turn."),
     CommandSpec("/plan", "Generate and display a validated plan without executing it."),
+    CommandSpec("/plan-and-execute", "Generate and execute a validated plan serially."),
     CommandSpec("/new", "Start a new session."),
     CommandSpec("/help", "Show all REPL commands."),
 )
@@ -317,6 +328,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         skill_registry=skill_registry,
         execution_event_handler=live_renderer,
     )
+    plan_service = PlanTaskService(
+        planner=PlanPlanner(model_client),
+        plan_store=PlanStore(config.database_path),
+        session_service=sessions,
+        agent_loop=loop,
+    )
     if control is not None:
         action, task_id = control
         if task_id == "latest":
@@ -386,12 +403,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             config=config,
             skill_registry=skill_registry,
             live_renderer=live_renderer,
+            plan_service=plan_service,
         )
 
     try:
-        result = loop.run_turn(user_input=args.prompt, session_id=resolved_session_id)
+        decision = route_request(args.prompt)
+        if decision.mode == "plan_only":
+            graph = PlanPlanner(model_client).create_plan(decision.goal)
+            print(json.dumps(plan_graph_to_dict(graph), ensure_ascii=False, indent=2))
+            return 0
+        if decision.mode == "plan_and_execute":
+            planned = plan_service.start(session_id=resolved_session_id, goal=decision.goal)
+            _print_plan_task_result(planned)
+            _persist_current_session(session_state_path, planned.task.session_id)
+            return 0 if planned.execution.status in {"completed", "waiting_approval"} else 1
+        result = loop.run_turn(user_input=decision.goal, session_id=resolved_session_id)
     except ActiveTaskConflict as exc:
         print(f"Task error: {exc}", file=sys.stderr)
+        return 1
+    except (PlanPlanningError, ValueError) as exc:
+        print(f"Plan error: {exc}", file=sys.stderr)
         return 1
     _persist_current_session(session_state_path, result.session_id)
     print(json.dumps(result, default=_serialize, ensure_ascii=False))
@@ -632,6 +663,7 @@ def _run_interactive_loop(
     config: AppConfig,
     skill_registry: SkillRegistry,
     live_renderer: _LiveExecutionRenderer | None,
+    plan_service: PlanTaskService,
 ) -> int:
     current_session_id = session_id
     continuation: list[str] = []
@@ -704,6 +736,13 @@ def _run_interactive_loop(
         if command == "/plan":
             _handle_plan_command(raw_target=raw_target, model_client=model_client)
             continue
+        if command == "/plan-and-execute":
+            _handle_plan_execute_command(
+                raw_target=raw_target,
+                plan_service=plan_service,
+                session_id=current_session_id,
+            )
+            continue
         if lowered == "/skills":
             _print_skills(skill_registry, session_service=session_service, session_id=current_session_id)
             continue
@@ -770,13 +809,24 @@ def _run_interactive_loop(
         try:
             if live_renderer is not None:
                 live_renderer.reset()
+            decision = route_request(stripped)
+            if decision.mode == "plan_and_execute":
+                planned = plan_service.start(session_id=current_session_id, goal=decision.goal)
+                current_session_id = planned.task.session_id
+                _persist_current_session(session_state_path, current_session_id)
+                pending_skill_names.clear()
+                _print_plan_task_result(planned)
+                continue
             result = loop.run_turn(
-                user_input=stripped,
+                user_input=decision.goal,
                 session_id=current_session_id,
                 explicit_skill_names=tuple(pending_skill_names),
             )
         except ActiveTaskConflict as exc:
             print(f"Task error: {exc}")
+            continue
+        except (PlanPlanningError, ValueError) as exc:
+            print(f"Plan error: {exc}")
             continue
         pending_skill_names.clear()
         current_session_id = result.session_id
@@ -858,6 +908,38 @@ def _handle_plan_command(*, raw_target: str, model_client: object) -> None:
         print(f"Plan error: {exc}")
         return
     print(json.dumps(plan_graph_to_dict(graph), ensure_ascii=False, indent=2))
+
+
+def _handle_plan_execute_command(
+    *,
+    raw_target: str,
+    plan_service: PlanTaskService,
+    session_id: str,
+) -> None:
+    goal = raw_target.strip()
+    if not goal:
+        print("Plan error: /plan-and-execute requires a goal.")
+        return
+    try:
+        result = plan_service.start(session_id=session_id, goal=goal)
+    except (ActiveTaskConflict, PlanPlanningError, ValueError, RuntimeError) as exc:
+        print(f"Plan error: {exc}")
+        return
+    _print_plan_task_result(result)
+
+
+def _print_plan_task_result(result: PlanTaskResult) -> None:
+    print(
+        json.dumps(
+            {
+                "task": result.task,
+                "revision": result.revision,
+                "execution": result.execution,
+            },
+            default=_serialize,
+            ensure_ascii=False,
+        )
+    )
 
 
 def _print_skills(skill_registry: SkillRegistry, *, session_service: SessionService, session_id: str) -> None:

@@ -131,6 +131,15 @@ class PlanStore:
             raise PlanRevisionNotFound(revision_id)
         return _revision_from_row(row)
 
+    def get_task_session_id(self, task_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT session_id FROM tasks WHERE id = ? LIMIT 1", (task_id,)
+            ).fetchone()
+        if row is None:
+            raise PlanRevisionNotFound(f"task '{task_id}'")
+        return str(row[0])
+
     def get_active_revision(self, task_id: str) -> PlanRevision | None:
         with self._connect() as connection:
             row = connection.execute(

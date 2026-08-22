@@ -91,6 +91,8 @@ class AgentLoop:
         self._session_shell_prefixes: dict[str, set[str]] = {}
         self._active_task_id: str | None = None
         self._turn_started_at: float | None = None
+        self._turn_allowed_tools: tuple[str, ...] = tuple(agent.allowed_tools)
+        self._keep_task_open = False
 
     def set_execution_event_handler(self, handler: ExecutionEventHandler | None) -> None:
         self._execution_event_handler = handler
@@ -113,9 +115,13 @@ class AgentLoop:
         _task_id: str | None = None,
         _append_user_message: bool = True,
         explicit_skill_names: tuple[str, ...] = (),
+        allowed_tools: tuple[str, ...] | None = None,
+        keep_task_open: bool = False,
     ) -> TurnResult:
         self._active_task_id = None
         self._turn_started_at = None
+        self._turn_allowed_tools = tuple(self._agent.allowed_tools)
+        self._keep_task_open = False
         try:
             return self._run_turn_impl(
                 user_input=user_input,
@@ -124,6 +130,8 @@ class AgentLoop:
                 _task_id=_task_id,
                 _append_user_message=_append_user_message,
                 explicit_skill_names=explicit_skill_names,
+                allowed_tools=allowed_tools,
+                keep_task_open=keep_task_open,
             )
         except KeyboardInterrupt:
             if self._active_task_id is None:
@@ -152,7 +160,18 @@ class AgentLoop:
         _task_id: str | None = None,
         _append_user_message: bool = True,
         explicit_skill_names: tuple[str, ...] = (),
+        allowed_tools: tuple[str, ...] | None = None,
+        keep_task_open: bool = False,
     ) -> TurnResult:
+        resolved_allowed_tools = tuple(self._agent.allowed_tools if allowed_tools is None else allowed_tools)
+        unknown_tools = sorted(set(resolved_allowed_tools) - set(self._agent.allowed_tools))
+        if unknown_tools:
+            raise ValueError(
+                "Plan node requested tools unavailable to this agent: "
+                + ", ".join(unknown_tools)
+            )
+        self._turn_allowed_tools = resolved_allowed_tools
+        self._keep_task_open = keep_task_open
         resolved_session_id = self._session_service.get_or_create_session(session_id)
         if _task_id is None:
             latest = self._session_service.get_latest_task(resolved_session_id)
@@ -975,7 +994,7 @@ class AgentLoop:
                 content="",
                 error=reason,
             )
-        if tool_call.name not in self._agent.allowed_tools:
+        if tool_call.name not in self._allowed_tools_for_turn():
             return self._record_untracked_tool_result(ToolResult(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
@@ -1367,7 +1386,7 @@ class AgentLoop:
 
     def _available_tool_specs(self) -> list[dict[str, Any]]:
         return [
-            *self._tool_registry.get_specs(self._agent.allowed_tools),
+            *self._tool_registry.get_specs(list(self._allowed_tools_for_turn())),
             {
                 "type": "function",
                 "function": {
@@ -1395,6 +1414,9 @@ class AgentLoop:
                 },
             },
         ]
+
+    def _allowed_tools_for_turn(self) -> tuple[str, ...]:
+        return self._turn_allowed_tools or tuple(self._agent.allowed_tools)
 
     def _recover_pending_tool_actions(self, session_id: str) -> list[ToolResult]:
         for action in self._session_service.list_recoverable_tool_actions(session_id):
@@ -1673,7 +1695,11 @@ class AgentLoop:
                 pending_action=task.pending_action,
             )
 
-        if task.status != "waiting_user" and task.status not in {"completed", "failed", "cancelled", "expired"}:
+        if (
+            not self._keep_task_open
+            and task.status != "waiting_user"
+            and task.status not in {"completed", "failed", "cancelled", "expired"}
+        ):
             task = (
                 self._tasks.complete(task.id, reason=stop_reason or "completed")
                 if success
@@ -1699,7 +1725,7 @@ class AgentLoop:
         tool_runs: list[ToolResult],
     ) -> str | None:
         if _looks_like_tool_inventory_question(user_input):
-            return _extract_tool_inventory_answer(tool_runs, self._agent.allowed_tools)
+            return _extract_tool_inventory_answer(tool_runs, self._allowed_tools_for_turn())
         if _looks_like_config_question(user_input):
             return _extract_config_answer(tool_runs)
 
@@ -1727,7 +1753,7 @@ class AgentLoop:
         allow_file_read_excerpt: bool,
     ) -> str | None:
         if _looks_like_tool_inventory_question(user_input):
-            return _extract_tool_inventory_answer(tool_runs, self._agent.allowed_tools)
+            return _extract_tool_inventory_answer(tool_runs, self._allowed_tools_for_turn())
         if _looks_like_config_question(user_input):
             return _extract_config_answer(tool_runs)
 
