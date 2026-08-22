@@ -211,6 +211,23 @@ SCHEMA_STATEMENTS = (
         FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS plan_revisions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        graph_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'failed', 'superseded')),
+        graph_json TEXT NOT NULL,
+        node_results_json TEXT NOT NULL,
+        replan_reason TEXT,
+        version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
+        UNIQUE(task_id, revision)
+    )
+    """,
 )
 
 
@@ -272,6 +289,19 @@ def initialize_database(db_path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_task_traces_task_id
             ON task_traces(task_id, id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_plan_revisions_task_revision
+            ON plan_revisions(task_id, revision)
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revisions_one_active_per_task
+            ON plan_revisions(task_id)
+            WHERE status = 'active'
             """
         )
         connection.commit()

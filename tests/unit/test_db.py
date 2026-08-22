@@ -36,7 +36,8 @@ class DatabaseTests(unittest.TestCase):
                           'subagent_runs',
                           'tasks',
                           'task_events',
-                          'task_traces'
+                          'task_traces',
+                          'plan_revisions'
                       )
                     ORDER BY name
                     """
@@ -50,6 +51,7 @@ class DatabaseTests(unittest.TestCase):
             [row[0] for row in rows],
             [
                 "messages",
+                "plan_revisions",
                 "session_context",
                 "sessions",
                 "subagent_runs",

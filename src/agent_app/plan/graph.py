@@ -235,6 +235,30 @@ def plan_graph_to_dict(graph: PlanGraph) -> dict[str, Any]:
     }
 
 
+def with_node_status(graph: PlanGraph, node_id: str, status: PlanNodeStatus) -> PlanGraph:
+    """Return a graph snapshot with one node status changed."""
+
+    if node_id not in graph.node_map():
+        raise KeyError(node_id)
+    return PlanGraph(
+        id=graph.id,
+        revision=graph.revision,
+        goal=graph.goal,
+        nodes=tuple(
+            PlanNode(
+                id=node.id,
+                kind=node.kind,
+                objective=node.objective,
+                depends_on=node.depends_on,
+                allowed_tools=node.allowed_tools,
+                acceptance=node.acceptance,
+                status=status if node.id == node_id else node.status,
+            )
+            for node in graph.nodes
+        ),
+    )
+
+
 def ready_node_ids(graph: PlanGraph) -> tuple[str, ...]:
     """Return pending nodes whose dependencies are all completed.
 
