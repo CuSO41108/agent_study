@@ -80,6 +80,17 @@ class PlanExecutor:
 
         while True:
             plan = self._store.get_revision_by_id(plan.id)
+            failed_node = _first_node_with_status(plan, "failed")
+            if failed_node is not None:
+                return PlanExecutionResult(
+                    "failed",
+                    plan,
+                    tuple(executed),
+                    failure_reason=(
+                        str(plan.node_results.get(failed_node.id, {}).get("error"))
+                        or f"node '{failed_node.id}' failed"
+                    ),
+                )
             waiting_node = _first_node_with_status(plan, "waiting_approval")
             if waiting_node is not None:
                 return PlanExecutionResult(
@@ -132,11 +143,6 @@ class PlanExecutor:
                     )
                 if outcome.status == "failed":
                     plan = self._skip_dependents(plan, failed_node_id=node_id)
-                    plan = self._store.update_revision_status(
-                        plan.id,
-                        "failed",
-                        expected_version=plan.version,
-                    )
                     return PlanExecutionResult(
                         "failed",
                         plan,

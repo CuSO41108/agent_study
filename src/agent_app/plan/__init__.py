@@ -21,7 +21,7 @@ from agent_app.plan.executor import (
     PlanExecutor,
     PlanNodeContext,
 )
-from agent_app.plan.agent_runner import PlanAgentNodeRunner
+from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
 from agent_app.plan.planner import PlanPlanner, PlanPlanningError
 from agent_app.plan.routing import ExecutionMode, RouteDecision, route_request
 from agent_app.plan.service import PlanTaskResult, PlanTaskService
@@ -53,6 +53,7 @@ __all__ = [
     "PlanExecutor",
     "PlanNodeContext",
     "PlanAgentNodeRunner",
+    "build_node_prompt",
     "PlanPlanner",
     "PlanPlanningError",
     "ExecutionMode",

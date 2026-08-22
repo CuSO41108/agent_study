@@ -276,6 +276,20 @@ class PlanStore:
             if graph.revision <= current.graph.revision:
                 raise ValueError("A replan must increase the plan revision number.")
 
+            current_nodes = current.graph.node_map()
+            candidate_nodes = graph.node_map()
+            removed_completed = sorted(
+                node_id
+                for node_id, node in current_nodes.items()
+                if node.status == "completed" and node_id not in candidate_nodes
+            )
+            if removed_completed:
+                raise ValueError(
+                    "A replan cannot remove completed nodes: "
+                    + ", ".join(removed_completed)
+                )
+            graph = _preserve_completed_nodes(current.graph, graph)
+
             preserved = {
                 node.id: current.node_results[node.id]
                 for node in graph.nodes
@@ -433,6 +447,22 @@ def _normalise_result(result: Mapping[str, Any]) -> dict[str, Any]:
         raise TypeError("A node result must contain JSON-compatible values.") from exc
     assert isinstance(decoded, dict)
     return decoded
+
+
+def _preserve_completed_nodes(current: PlanGraph, candidate: PlanGraph) -> PlanGraph:
+    current_nodes = current.node_map()
+    nodes = tuple(
+        current_nodes[node.id] if node.id in current_nodes and current_nodes[node.id].status == "completed" else node
+        for node in candidate.nodes
+    )
+    preserved = PlanGraph(
+        id=candidate.id,
+        revision=candidate.revision,
+        goal=candidate.goal,
+        nodes=nodes,
+    )
+    parse_plan_graph(plan_graph_to_dict(preserved))
+    return preserved
 
 
 def _json_dumps(value: Any) -> str:

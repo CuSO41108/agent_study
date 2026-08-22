@@ -27,6 +27,10 @@ class InvalidTaskTransition(RuntimeError):
     pass
 
 
+class ReplanBudgetExceeded(RuntimeError):
+    pass
+
+
 class TaskRuntime:
     def __init__(self, session_service: SessionService) -> None:
         self._sessions = session_service
@@ -290,6 +294,25 @@ class TaskRuntime:
             budget=budget,
         )
         self._sessions.append_task_trace(task_id, "reflection", {"summary": summary})
+        return updated
+
+    def consume_replan(self, task_id: str, *, reason: str) -> TaskState:
+        task = self.require_task(task_id)
+        self._ensure_mutable(task)
+        if task.budget.used_replans >= task.budget.max_replans:
+            raise ReplanBudgetExceeded(
+                f"Task '{task_id}' has exhausted its {task.budget.max_replans} replan attempts."
+            )
+        budget = replace(task.budget, used_replans=task.budget.used_replans + 1)
+        updated = self._sessions.apply_task_event(
+            _event(task, event_type="state_transition", source="planner", payload={"reason": reason}),
+            budget=budget,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "replan",
+            {"reason": reason, "attempt": budget.used_replans, "max_replans": budget.max_replans},
+        )
         return updated
 
     def consume_model_call(self, task_id: str, *, tokens: int) -> TaskState:

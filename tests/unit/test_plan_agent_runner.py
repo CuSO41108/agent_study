@@ -70,7 +70,8 @@ class PlanAgentRunnerTests(unittest.TestCase):
         self.assertEqual(outcome.output, "lines identified")
         self.assertEqual(loop.kwargs["allowed_tools"], ("file_read",))
         self.assertTrue(loop.kwargs["keep_task_open"])
-        self.assertIn("Read the target file", loop.kwargs["user_input"])
+        self.assertEqual(loop.kwargs["user_input"], "")
+        self.assertIn("Read the target file", loop.kwargs["transient_context"])
 
     def test_runner_turns_pending_user_action_into_waiting_approval(self) -> None:
         loop = _FakeLoop(

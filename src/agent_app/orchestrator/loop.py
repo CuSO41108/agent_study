@@ -117,6 +117,7 @@ class AgentLoop:
         explicit_skill_names: tuple[str, ...] = (),
         allowed_tools: tuple[str, ...] | None = None,
         keep_task_open: bool = False,
+        transient_context: str | None = None,
     ) -> TurnResult:
         self._active_task_id = None
         self._turn_started_at = None
@@ -132,6 +133,7 @@ class AgentLoop:
                 explicit_skill_names=explicit_skill_names,
                 allowed_tools=allowed_tools,
                 keep_task_open=keep_task_open,
+                transient_context=transient_context,
             )
         except KeyboardInterrupt:
             if self._active_task_id is None:
@@ -162,6 +164,7 @@ class AgentLoop:
         explicit_skill_names: tuple[str, ...] = (),
         allowed_tools: tuple[str, ...] | None = None,
         keep_task_open: bool = False,
+        transient_context: str | None = None,
     ) -> TurnResult:
         resolved_allowed_tools = tuple(self._agent.allowed_tools if allowed_tools is None else allowed_tools)
         unknown_tools = sorted(set(resolved_allowed_tools) - set(self._agent.allowed_tools))
@@ -277,6 +280,11 @@ class AgentLoop:
             skill_index_message=skill_index_message,
             active_skill_messages=active_skill_messages,
         )
+        if transient_context:
+            provider_messages.append({
+                "role": "system",
+                "content": transient_context,
+            })
         tool_runs: list[ToolResult] = []
         if _requires_web_research(user_input) and not task.working_memory.get("web_research_preflight_completed"):
             research_call = ToolCall(
@@ -662,10 +670,22 @@ class AgentLoop:
                             success=False,
                         )
 
-    def handle_event(self, event: AgentEvent) -> TurnResult:
+    def handle_event(
+        self,
+        event: AgentEvent,
+        *,
+        resume_allowed_tools: tuple[str, ...] | None = None,
+        resume_keep_task_open: bool = False,
+        resume_transient_context: str | None = None,
+    ) -> TurnResult:
         self._active_task_id = event.task_id
         try:
-            return self._handle_event_impl(event)
+            return self._handle_event_impl(
+                event,
+                resume_allowed_tools=resume_allowed_tools,
+                resume_keep_task_open=resume_keep_task_open,
+                resume_transient_context=resume_transient_context,
+            )
         except (InvalidTaskEvent, InvalidTaskTransition, TaskVersionConflict, KeyError, ValueError):
             raise
         except TracePersistenceError:
@@ -679,7 +699,14 @@ class AgentLoop:
                 stop_reason="internal_exception",
             )
 
-    def _handle_event_impl(self, event: AgentEvent) -> TurnResult:
+    def _handle_event_impl(
+        self,
+        event: AgentEvent,
+        *,
+        resume_allowed_tools: tuple[str, ...] | None = None,
+        resume_keep_task_open: bool = False,
+        resume_transient_context: str | None = None,
+    ) -> TurnResult:
         if event.type == "user_message":
             content = str(event.payload.get("content", ""))
             if event.task_id is None:
@@ -766,6 +793,21 @@ class AgentLoop:
         )
         self._active_task_id = task.id
         self._turn_started_at = time.monotonic()
+        resolved_resume_tools = tuple(
+            self._agent.allowed_tools
+            if resume_allowed_tools is None
+            else resume_allowed_tools
+        )
+        unknown_resume_tools = sorted(
+            set(resolved_resume_tools) - set(self._agent.allowed_tools)
+        )
+        if unknown_resume_tools:
+            raise ValueError(
+                "Resume requested tools unavailable to this agent: "
+                + ", ".join(unknown_resume_tools)
+            )
+        self._turn_allowed_tools = resolved_resume_tools
+        self._keep_task_open = resume_keep_task_open
         self._tool_context = replace(
             self._tool_context,
             prepared_edits={},
@@ -809,6 +851,9 @@ class AgentLoop:
             session_id=task.session_id,
             _task_id=task.id,
             _append_user_message=False,
+            allowed_tools=resolved_resume_tools,
+            keep_task_open=resume_keep_task_open,
+            transient_context=resume_transient_context,
         )
         result.tool_runs.insert(0, tool_result)
         return result

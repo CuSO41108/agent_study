@@ -14,12 +14,13 @@ class PlanAgentNodeRunner:
 
     def __call__(self, context: PlanNodeContext) -> NodeExecutionResult:
         result = self._agent_loop.run_turn(
-            user_input=_node_prompt(context),
+            user_input="",
             session_id=context.session_id,
             _task_id=context.task_id,
             _append_user_message=False,
             allowed_tools=context.node.allowed_tools,
             keep_task_open=True,
+            transient_context=build_node_prompt(context),
         )
         if result.pending_action is not None or result.task_status == "waiting_user":
             pending = result.pending_action
@@ -43,7 +44,7 @@ class PlanAgentNodeRunner:
         )
 
 
-def _node_prompt(context: PlanNodeContext) -> str:
+def build_node_prompt(context: PlanNodeContext) -> str:
     prior_results = json.dumps(context.node_results, ensure_ascii=False, sort_keys=True)
     acceptance = "\n".join(f"- {item}" for item in context.node.acceptance)
     return (

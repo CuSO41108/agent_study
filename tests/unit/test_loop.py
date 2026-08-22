@@ -108,6 +108,32 @@ class AgentLoopTests(unittest.TestCase):
         tool_names = [item["function"]["name"] for item in model.calls[0]["tools"]]
         self.assertEqual(tool_names, ["file_read", "ask_user", "give_up"])
 
+    def test_transient_plan_context_reaches_model_without_persisting_as_message(self) -> None:
+        model = _FakeModelClient([_text_response("node done")])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(
+            user_input="",
+            _append_user_message=False,
+            transient_context="Node kind: inspect\nObjective: Read only the target file.",
+            keep_task_open=True,
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(
+            any(
+                message.get("role") == "system"
+                and "Objective: Read only the target file." in (message.get("content") or "")
+                for message in model.calls[0]["messages"]
+            )
+        )
+        self.assertFalse(
+            any(
+                "Objective: Read only the target file." in (message.content or "")
+                for message in self.sessions.list_messages(result.session_id)
+            )
+        )
+
     def test_run_turn_executes_read_tool_and_returns_final_answer(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="file_read", arguments={"path": "README.md"})]),

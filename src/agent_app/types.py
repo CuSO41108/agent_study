@@ -138,7 +138,7 @@ class TaskBudget:
     max_retries: int = 2
     max_repair_attempts: int = 2
     repeat_decision_limit: int = 3
-    max_replans: int = 1
+    max_replans: int = 2
     used_model_calls: int = 0
     used_tool_calls: int = 0
     used_tokens: int = 0

@@ -4,7 +4,8 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from agent_app.plan.graph import PlanGraph, parse_plan_graph
+from agent_app.plan.graph import PlanGraph, parse_plan_graph, plan_graph_to_dict
+from agent_app.plan.store import PlanRevision
 
 
 class PlanPlanningError(ValueError):
@@ -46,6 +47,53 @@ class PlanPlanner:
         payload.setdefault("id", f"plan-{uuid4().hex}")
         payload.setdefault("revision", 1)
         payload["goal"] = goal.strip()
+        nodes = payload.get("nodes")
+        if isinstance(nodes, list):
+            for node in nodes:
+                if isinstance(node, dict):
+                    node.setdefault("status", "pending")
+        try:
+            return parse_plan_graph(payload)
+        except (TypeError, KeyError, ValueError) as exc:
+            raise PlanPlanningError(str(exc)) from exc
+
+    def create_replan(self, *, current: PlanRevision, reason: str) -> PlanGraph:
+        """Ask the model for only a successor graph; completed nodes are preserved by PlanStore."""
+
+        response = self._model_client.generate(
+            system_prompt=(
+                "You are revising a failed coding-task plan. Return only one JSON object. "
+                "Keep completed nodes unchanged, repair or replace only unfinished work, "
+                "and use a static acyclic graph with the same plan id and a higher revision. "
+                "Use only node kinds inspect, edit, run, verify and their allowed tool boundaries."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "goal": current.graph.goal,
+                            "current_plan": plan_graph_to_dict(current.graph),
+                            "node_results": current.node_results,
+                            "reason": reason,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+            tools=[],
+        )
+        if getattr(response, "error_type", None):
+            raise PlanPlanningError(f"Replanner model failed: {response.error_type}")
+        if getattr(response, "tool_calls", None):
+            raise PlanPlanningError("Replanner must return JSON without tool calls.")
+        text = getattr(response, "assistant_text", None)
+        if not isinstance(text, str) or not text.strip():
+            raise PlanPlanningError("Replanner returned no JSON plan.")
+        payload = _decode_json_object(text)
+        payload["id"] = current.graph.id
+        payload["revision"] = current.graph.revision + 1
+        payload["goal"] = current.graph.goal
         nodes = payload.get("nodes")
         if isinstance(nodes, list):
             for node in nodes:

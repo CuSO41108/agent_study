@@ -179,6 +179,29 @@ class PlanExecutionTests(unittest.TestCase):
         self.assertGreater(second.version, 0)
         self.assertEqual(completed.graph.node_map()["inspect"].status, "completed")
 
+    def test_replan_forces_completed_nodes_to_remain_completed(self) -> None:
+        first = self.store.create_revision(self.task.id, _graph())
+        running = self.store.update_node_status(first.id, "inspect", "running", expected_version=first.version)
+        completed = self.store.update_node_status(
+            running.id,
+            "inspect",
+            "completed",
+            result={"output": "located"},
+            expected_version=running.version,
+        )
+
+        second = self.store.create_replan(
+            self.task.id,
+            _graph(revision=2),
+            reason="Replan the unfinished portion.",
+            expected_revision=1,
+        )
+
+        self.assertEqual(second.graph.node_map()["inspect"].status, "completed")
+        self.assertEqual(second.graph.node_map()["edit"].status, "pending")
+        self.assertEqual(second.node_results["inspect"]["output"], "located")
+        self.assertEqual(self.store.get_revision_by_id(completed.id).status, "superseded")
+
 
 if __name__ == "__main__":
     unittest.main()

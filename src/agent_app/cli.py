@@ -89,6 +89,8 @@ _REPL_HELP = """Commands:
               Generate and display a validated PlanGraph without executing it.
   /plan-and-execute <goal>
               Generate a PlanGraph and execute its nodes serially.
+  /replan <reason>
+              Replan the latest active PlanGraph after a failure or new evidence.
   /new        Start a new session.
   /help       Show this help.
   exit        Leave interactive mode."""
@@ -116,6 +118,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/skill", "Select a Skill for the next task turn."),
     CommandSpec("/plan", "Generate and display a validated plan without executing it."),
     CommandSpec("/plan-and-execute", "Generate and execute a validated plan serially."),
+    CommandSpec("/replan", "Create a successor PlanGraph for the latest active plan."),
     CommandSpec("/new", "Start a new session."),
     CommandSpec("/help", "Show all REPL commands."),
 )
@@ -374,21 +377,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             event_payload = {}
             if action in {"approve", "reject"} and task.pending_action is not None:
                 event_payload["pending_action_id"] = task.pending_action.id
-            result = loop.handle_event(
-                AgentEvent(
-                    id=str(uuid4()),
-                    task_id=task.id,
-                    session_id=task.session_id,
-                    type=event_type,
-                    source="cli",
-                    payload=event_payload,
-                    correlation_id=task.id,
-                    expected_version=task.version,
-                )
+            event = AgentEvent(
+                id=str(uuid4()),
+                task_id=task.id,
+                session_id=task.session_id,
+                type=event_type,
+                source="cli",
+                payload=event_payload,
+                correlation_id=task.id,
+                expected_version=task.version,
             )
+            plan_result = (
+                plan_service.handle_approval(
+                    task_id=task.id,
+                    event=event,
+                    approved=action == "approve",
+                )
+                if action in {"approve", "reject"}
+                else None
+            )
+            result = plan_result if plan_result is not None else loop.handle_event(event)
         except (RuntimeError, ValueError) as exc:
             print(f"Task error: {exc}", file=sys.stderr)
             return 1
+        if isinstance(result, PlanTaskResult):
+            print(json.dumps(result, default=_serialize, ensure_ascii=False))
+            return 0 if result.execution.status in {"completed", "waiting_approval"} else 1
         print(json.dumps(result, default=_serialize, ensure_ascii=False))
         return 0 if result.success or result.task_status in {"paused", "cancelled", "waiting_user"} else 1
     if interactive:
@@ -743,6 +757,14 @@ def _run_interactive_loop(
                 session_id=current_session_id,
             )
             continue
+        if command == "/replan":
+            _handle_replan_command(
+                raw_target=raw_target,
+                plan_service=plan_service,
+                session_service=session_service,
+                session_id=current_session_id,
+            )
+            continue
         if lowered == "/skills":
             _print_skills(skill_registry, session_service=session_service, session_id=current_session_id)
             continue
@@ -760,13 +782,17 @@ def _run_interactive_loop(
         if command in {"/approve", "/reject", "/cancel", "/pause", "/resume"}:
             result = _run_repl_task_control(
                 loop=loop,
+                plan_service=plan_service,
                 session_service=session_service,
                 session_id=current_session_id,
                 command=command,
                 task_prefix=raw_target.strip() or None,
             )
             if result is not None:
-                _print_turn_result(result)
+                if isinstance(result, PlanTaskResult):
+                    _print_plan_task_result(result)
+                else:
+                    _print_turn_result(result)
             continue
         if command == "/handoff":
             task = _select_handoff_task(
@@ -923,6 +949,26 @@ def _handle_plan_execute_command(
     try:
         result = plan_service.start(session_id=session_id, goal=goal)
     except (ActiveTaskConflict, PlanPlanningError, ValueError, RuntimeError) as exc:
+        print(f"Plan error: {exc}")
+        return
+    _print_plan_task_result(result)
+
+
+def _handle_replan_command(
+    *,
+    raw_target: str,
+    plan_service: PlanTaskService,
+    session_service: SessionService,
+    session_id: str,
+) -> None:
+    reason = raw_target.strip() or "User requested a new plan after reviewing the current execution state."
+    active = session_service.get_active_task(session_id)
+    if active is None:
+        print("Plan error: no active task exists in this session.")
+        return
+    try:
+        result = plan_service.replan(task_id=active.id, reason=reason)
+    except (KeyError, PlanPlanningError, RuntimeError, ValueError) as exc:
         print(f"Plan error: {exc}")
         return
     _print_plan_task_result(result)
@@ -1276,11 +1322,12 @@ def _needs_input_continuation(value: str) -> bool:
 def _run_repl_task_control(
     *,
     loop: AgentLoop,
+    plan_service: PlanTaskService | None = None,
     session_service: SessionService,
     session_id: str,
     command: str,
     task_prefix: str | None = None,
-) -> TurnResult | None:
+) -> TurnResult | PlanTaskResult | None:
     tasks = session_service.list_tasks(session_id)
     if command in {"/approve", "/reject"}:
         candidates = [
@@ -1338,18 +1385,26 @@ def _run_repl_task_control(
         event_payload = {}
         if command in {"/approve", "/reject"} and task.pending_action is not None:
             event_payload["pending_action_id"] = task.pending_action.id
-        return loop.handle_event(
-            AgentEvent(
-                id=str(uuid4()),
-                task_id=task.id,
-                session_id=task.session_id,
-                type=event_type,
-                source="repl",
-                payload=event_payload,
-                correlation_id=task.id,
-                expected_version=task.version,
-            )
+        event = AgentEvent(
+            id=str(uuid4()),
+            task_id=task.id,
+            session_id=task.session_id,
+            type=event_type,
+            source="repl",
+            payload=event_payload,
+            correlation_id=task.id,
+            expected_version=task.version,
         )
+        plan_result = (
+            plan_service.handle_approval(
+                task_id=task.id,
+                event=event,
+                approved=command == "/approve",
+            )
+            if plan_service is not None and command in {"/approve", "/reject"}
+            else None
+        )
+        return plan_result if plan_result is not None else loop.handle_event(event)
     except (RuntimeError, ValueError) as exc:
         print(f"Task error: {exc}")
         return None
