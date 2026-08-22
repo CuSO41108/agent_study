@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
+from uuid import uuid4
 
 from agent_app.plan.graph import PlanNode, ready_node_ids
-from agent_app.plan.store import PlanRevision, PlanStore
+from agent_app.plan.store import PlanRevision, PlanRevisionLeaseConflict, PlanStore
 
 
 NodeExecutionStatus = Literal["completed", "failed", "waiting_approval"]
@@ -63,14 +64,21 @@ class PlanExecutor:
     ReAct loop or changing the existing AgentLoop entry point.
     """
 
-    def __init__(self, store: PlanStore, runner: NodeRunner) -> None:
+    def __init__(
+        self,
+        store: PlanStore,
+        runner: NodeRunner,
+        *,
+        lease_owner: str | None = None,
+        lease_ttl_seconds: float = 60.0,
+    ) -> None:
         self._store = store
         self._runner = runner
+        self._lease_owner = lease_owner or str(uuid4())
+        self._lease_ttl_seconds = lease_ttl_seconds
 
     def execute(self, *, task_id: str, revision: int | None = None) -> PlanExecutionResult:
         plan = self._load_plan(task_id, revision)
-        executed: list[str] = []
-
         if plan.status == "completed":
             return PlanExecutionResult("completed", plan)
         if plan.status == "failed":
@@ -78,8 +86,38 @@ class PlanExecutor:
         if plan.status == "superseded":
             return PlanExecutionResult("blocked", plan, failure_reason="plan_superseded")
 
+        leased = self._store.acquire_execution_lease(
+            plan.id,
+            owner=self._lease_owner,
+            ttl_seconds=self._lease_ttl_seconds,
+        )
+        result: PlanExecutionResult | None = None
+        try:
+            result = self._execute_serial(task_id=task_id, plan=leased)
+        finally:
+            try:
+                self._store.release_execution_lease(
+                    leased.id,
+                    owner=self._lease_owner,
+                    lease_version=leased.execution_lease.version,
+                )
+            except PlanRevisionLeaseConflict:
+                # A terminal transition or a recovery takeover already cleared it.
+                pass
+        assert result is not None
+        latest = self._store.get_revision_by_id(result.revision.id)
+        return replace(result, revision=latest)
+
+    def _execute_serial(self, *, task_id: str, plan: PlanRevision) -> PlanExecutionResult:
+        executed: list[str] = []
+
         while True:
-            plan = self._store.get_revision_by_id(plan.id)
+            plan = self._store.heartbeat_execution_lease(
+                plan.id,
+                owner=self._lease_owner,
+                lease_version=plan.execution_lease.version,
+                ttl_seconds=self._lease_ttl_seconds,
+            )
             failed_node = _first_node_with_status(plan, "failed")
             if failed_node is not None:
                 return PlanExecutionResult(
@@ -126,6 +164,12 @@ class PlanExecutor:
                     node_results=running_plan.node_results,
                 )
                 outcome = self._run_node(context)
+                self._store.heartbeat_execution_lease(
+                    running_plan.id,
+                    owner=self._lease_owner,
+                    lease_version=running_plan.execution_lease.version,
+                    ttl_seconds=self._lease_ttl_seconds,
+                )
                 plan = self._store.update_node_status(
                     running_plan.id,
                     node_id,

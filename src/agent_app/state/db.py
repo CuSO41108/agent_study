@@ -222,6 +222,10 @@ SCHEMA_STATEMENTS = (
         node_results_json TEXT NOT NULL,
         replan_reason TEXT,
         version INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_version INTEGER NOT NULL DEFAULT 0,
+        heartbeat_at TEXT,
+        expires_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (task_id) REFERENCES tasks(id),
@@ -241,6 +245,7 @@ def initialize_database(db_path: str | Path) -> None:
             connection.execute(statement)
         _ensure_tool_runs_action_id(connection)
         _ensure_tool_action_columns(connection)
+        _ensure_plan_revision_lease_columns(connection)
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_runs_action_id
@@ -331,3 +336,19 @@ def _ensure_tool_action_columns(connection: sqlite3.Connection) -> None:
     for name, declaration in additions.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE tool_actions ADD COLUMN {name} {declaration}")
+
+
+def _ensure_plan_revision_lease_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(plan_revisions)").fetchall()
+    }
+    additions = {
+        "lease_owner": "TEXT",
+        "lease_version": "INTEGER NOT NULL DEFAULT 0",
+        "heartbeat_at": "TEXT",
+        "expires_at": "TEXT",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE plan_revisions ADD COLUMN {name} {declaration}")

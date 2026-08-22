@@ -4,8 +4,8 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -44,6 +44,26 @@ class PlanRevision:
     version: int
     created_at: str
     updated_at: str
+    execution_lease: "ExecutionLease" = field(default_factory=lambda: ExecutionLease())
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionLease:
+    """Persisted execution facts; recovery classification stays in memory."""
+
+    owner: str | None = None
+    version: int = 0
+    heartbeat_at: str | None = None
+    expires_at: str | None = None
+
+    def is_active(self, *, now: datetime | None = None) -> bool:
+        if self.owner is None or self.expires_at is None:
+            return False
+        current = now or datetime.now(UTC)
+        try:
+            return datetime.fromisoformat(self.expires_at) > current
+        except ValueError:
+            return False
 
 
 class PlanRevisionNotFound(KeyError):
@@ -51,6 +71,10 @@ class PlanRevisionNotFound(KeyError):
 
 
 class PlanRevisionConflict(RuntimeError):
+    pass
+
+
+class PlanRevisionLeaseConflict(PlanRevisionConflict):
     pass
 
 
@@ -83,8 +107,10 @@ class PlanStore:
                     """
                     INSERT INTO plan_revisions (
                         id, task_id, graph_id, revision, status, graph_json,
-                        node_results_json, replan_reason, version, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                        node_results_json, replan_reason, version,
+                        lease_owner, lease_version, heartbeat_at, expires_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0, NULL, NULL, ?, ?)
                     """,
                     (
                         revision_id,
@@ -207,6 +233,193 @@ class PlanStore:
             expected_version=expected_version,
         )
 
+    def acquire_execution_lease(
+        self,
+        revision_id: str,
+        *,
+        owner: str,
+        ttl_seconds: float = 60.0,
+        now: datetime | None = None,
+    ) -> PlanRevision:
+        if not owner.strip():
+            raise ValueError("Lease owner cannot be empty.")
+        if ttl_seconds <= 0:
+            raise ValueError("Lease TTL must be positive.")
+        current_time = now or datetime.now(UTC)
+        timestamp = current_time.isoformat()
+        expires_at = (current_time + timedelta(seconds=ttl_seconds)).isoformat()
+        with self._connect() as connection:
+            current = self._require_revision(connection, revision_id)
+            if current.status != "active":
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' is {current.status}, not active."
+                )
+            if current.execution_lease.is_active(now=current_time) and current.execution_lease.owner != owner:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' is leased by another active executor."
+                )
+            next_lease_version = current.execution_lease.version + 1
+            cursor = connection.execute(
+                """
+                UPDATE plan_revisions
+                SET lease_owner = ?, lease_version = ?, heartbeat_at = ?, expires_at = ?
+                WHERE id = ? AND status = 'active' AND lease_version = ?
+                """,
+                (
+                    owner,
+                    next_lease_version,
+                    timestamp,
+                    expires_at,
+                    current.id,
+                    current.execution_lease.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' lease changed concurrently."
+                )
+            row = connection.execute(_REVISION_SELECT + " WHERE id = ? LIMIT 1", (revision_id,)).fetchone()
+        assert row is not None
+        return _revision_from_row(row)
+
+    def heartbeat_execution_lease(
+        self,
+        revision_id: str,
+        *,
+        owner: str,
+        lease_version: int,
+        ttl_seconds: float = 60.0,
+        now: datetime | None = None,
+    ) -> PlanRevision:
+        if ttl_seconds <= 0:
+            raise ValueError("Lease TTL must be positive.")
+        current_time = now or datetime.now(UTC)
+        timestamp = current_time.isoformat()
+        expires_at = (current_time + timedelta(seconds=ttl_seconds)).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE plan_revisions
+                SET heartbeat_at = ?, expires_at = ?
+                WHERE id = ? AND status = 'active'
+                  AND lease_owner = ? AND lease_version = ?
+                """,
+                (timestamp, expires_at, revision_id, owner, lease_version),
+            )
+            if cursor.rowcount != 1:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' lease is no longer owned by this executor."
+                )
+            row = connection.execute(_REVISION_SELECT + " WHERE id = ? LIMIT 1", (revision_id,)).fetchone()
+        assert row is not None
+        return _revision_from_row(row)
+
+    def release_execution_lease(
+        self,
+        revision_id: str,
+        *,
+        owner: str,
+        lease_version: int | None = None,
+    ) -> PlanRevision:
+        with self._connect() as connection:
+            current = self._require_revision(connection, revision_id)
+            if current.execution_lease.owner != owner:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' is not owned by '{owner}'."
+                )
+            expected_version = current.execution_lease.version if lease_version is None else lease_version
+            if expected_version != current.execution_lease.version:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' lease version changed concurrently."
+                )
+            cursor = connection.execute(
+                """
+                UPDATE plan_revisions
+                SET lease_owner = NULL, lease_version = ?, heartbeat_at = NULL, expires_at = NULL
+                WHERE id = ? AND lease_owner = ? AND lease_version = ?
+                """,
+                (current.execution_lease.version + 1, revision_id, owner, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' lease changed concurrently."
+                )
+            row = connection.execute(_REVISION_SELECT + " WHERE id = ? LIMIT 1", (revision_id,)).fetchone()
+        assert row is not None
+        return _revision_from_row(row)
+
+    def rewind_running_node_to_pending(
+        self,
+        revision_id: str,
+        node_id: str,
+        *,
+        expected_version: int,
+        now: datetime | None = None,
+    ) -> PlanRevision:
+        """Explicitly rewind an expired running node after recovery inspection."""
+
+        current_time = now or datetime.now(UTC)
+        with self._connect() as connection:
+            current = self._require_revision(connection, revision_id)
+            if current.status != "active":
+                raise PlanRevisionConflict(f"Plan revision '{revision_id}' is not active.")
+            if current.version != expected_version:
+                raise PlanRevisionConflict(
+                    f"Plan revision '{revision_id}' changed from version {expected_version} to {current.version}."
+                )
+            if current.execution_lease.is_active(now=current_time):
+                raise PlanRevisionLeaseConflict(
+                    f"Plan revision '{revision_id}' still has an active execution lease."
+                )
+            node = current.graph.node_map().get(node_id)
+            if node is None:
+                raise KeyError(node_id)
+            if node.status != "running":
+                raise InvalidPlanNodeTransition(
+                    f"Only a running node can be rewound; '{node_id}' is {node.status}."
+                )
+            blocking_actions = connection.execute(
+                """
+                SELECT tool_name, status, recovery_json
+                FROM tool_actions
+                WHERE task_id = ? AND status IN ('prepared', 'executing', 'uncertain')
+                """,
+                (current.task_id,),
+            ).fetchall()
+            for tool_name, action_status, recovery_json in blocking_actions:
+                metadata = json.loads(recovery_json)
+                if metadata.get("plan_node_id") not in {None, node_id}:
+                    continue
+                if action_status == "uncertain" or metadata.get("side_effect", False):
+                    raise PlanRevisionConflict(
+                        f"Cannot rewind node '{node_id}': tool action '{tool_name}' has an uncertain side effect."
+                    )
+            next_graph = with_node_status(current.graph, node_id, "pending")
+            timestamp = current_time.isoformat()
+            cursor = connection.execute(
+                """
+                UPDATE plan_revisions
+                SET graph_json = ?, version = ?,
+                    lease_owner = NULL, lease_version = ?, heartbeat_at = NULL, expires_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'active' AND version = ?
+                """,
+                (
+                    _json_dumps(plan_graph_to_dict(next_graph)),
+                    current.version + 1,
+                    current.execution_lease.version + 1,
+                    None,
+                    timestamp,
+                    current.id,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PlanRevisionConflict(f"Plan revision '{revision_id}' was updated concurrently.")
+            row = connection.execute(_REVISION_SELECT + " WHERE id = ? LIMIT 1", (revision_id,)).fetchone()
+        assert row is not None
+        return _revision_from_row(row)
+
     def update_revision_status(
         self,
         revision_id: str,
@@ -233,7 +446,9 @@ class PlanStore:
             cursor = connection.execute(
                 """
                 UPDATE plan_revisions
-                SET status = ?, version = ?, updated_at = ?
+                SET status = ?, version = ?, lease_owner = NULL,
+                    lease_version = lease_version + 1, heartbeat_at = NULL, expires_at = NULL,
+                    updated_at = ?
                 WHERE id = ? AND version = ?
                 """,
                 (status, current.version + 1, timestamp, current.id, current.version),
@@ -299,7 +514,9 @@ class PlanStore:
             old_cursor = connection.execute(
                 """
                 UPDATE plan_revisions
-                SET status = 'superseded', version = ?, updated_at = ?
+                SET status = 'superseded', version = ?, lease_owner = NULL,
+                    lease_version = lease_version + 1, heartbeat_at = NULL, expires_at = NULL,
+                    updated_at = ?
                 WHERE id = ? AND status = 'active' AND version = ?
                 """,
                 (current.version + 1, timestamp, current.id, current.version),
@@ -311,8 +528,10 @@ class PlanStore:
                     """
                     INSERT INTO plan_revisions (
                         id, task_id, graph_id, revision, status, graph_json,
-                        node_results_json, replan_reason, version, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 1, ?, ?)
+                        node_results_json, replan_reason, version,
+                        lease_owner, lease_version, heartbeat_at, expires_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 1, NULL, 0, NULL, NULL, ?, ?)
                     """,
                     (
                         new_revision_id,
@@ -391,7 +610,9 @@ class PlanStore:
 
 _REVISION_SELECT = """
 SELECT id, task_id, graph_id, revision, status, graph_json,
-       node_results_json, replan_reason, version, created_at, updated_at
+       node_results_json, replan_reason, version,
+       lease_owner, lease_version, heartbeat_at, expires_at,
+       created_at, updated_at
 FROM plan_revisions
 """
 
@@ -408,8 +629,14 @@ def _revision_from_row(row: tuple[Any, ...]) -> PlanRevision:
         node_results=json.loads(row[6]),
         replan_reason=row[7],
         version=row[8],
-        created_at=row[9],
-        updated_at=row[10],
+        created_at=row[13],
+        updated_at=row[14],
+        execution_lease=ExecutionLease(
+            owner=row[9],
+            version=row[10],
+            heartbeat_at=row[11],
+            expires_at=row[12],
+        ),
     )
 
 
