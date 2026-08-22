@@ -118,6 +118,8 @@ class AgentLoop:
         allowed_tools: tuple[str, ...] | None = None,
         keep_task_open: bool = False,
         transient_context: str | None = None,
+        plan_revision_id: str | None = None,
+        plan_node_id: str | None = None,
     ) -> TurnResult:
         self._active_task_id = None
         self._turn_started_at = None
@@ -134,6 +136,8 @@ class AgentLoop:
                 allowed_tools=allowed_tools,
                 keep_task_open=keep_task_open,
                 transient_context=transient_context,
+                plan_revision_id=plan_revision_id,
+                plan_node_id=plan_node_id,
             )
         except KeyboardInterrupt:
             if self._active_task_id is None:
@@ -165,6 +169,8 @@ class AgentLoop:
         allowed_tools: tuple[str, ...] | None = None,
         keep_task_open: bool = False,
         transient_context: str | None = None,
+        plan_revision_id: str | None = None,
+        plan_node_id: str | None = None,
     ) -> TurnResult:
         resolved_allowed_tools = tuple(self._agent.allowed_tools if allowed_tools is None else allowed_tools)
         unknown_tools = sorted(set(resolved_allowed_tools) - set(self._agent.allowed_tools))
@@ -241,7 +247,11 @@ class AgentLoop:
         self._tool_context = replace(
             self._tool_context,
             prepared_edits={},
-            turn_state={"shell_approval_prefixes": self._session_shell_prefixes.setdefault(resolved_session_id, set())},
+            turn_state={
+                "shell_approval_prefixes": self._session_shell_prefixes.setdefault(resolved_session_id, set()),
+                "plan_revision_id": plan_revision_id,
+                "plan_node_id": plan_node_id,
+            },
             session_id=resolved_session_id,
             task_id=task.id,
             session_service=self._session_service,
@@ -677,6 +687,8 @@ class AgentLoop:
         resume_allowed_tools: tuple[str, ...] | None = None,
         resume_keep_task_open: bool = False,
         resume_transient_context: str | None = None,
+        resume_plan_revision_id: str | None = None,
+        resume_plan_node_id: str | None = None,
     ) -> TurnResult:
         self._active_task_id = event.task_id
         try:
@@ -685,6 +697,8 @@ class AgentLoop:
                 resume_allowed_tools=resume_allowed_tools,
                 resume_keep_task_open=resume_keep_task_open,
                 resume_transient_context=resume_transient_context,
+                resume_plan_revision_id=resume_plan_revision_id,
+                resume_plan_node_id=resume_plan_node_id,
             )
         except (InvalidTaskEvent, InvalidTaskTransition, TaskVersionConflict, KeyError, ValueError):
             raise
@@ -706,6 +720,8 @@ class AgentLoop:
         resume_allowed_tools: tuple[str, ...] | None = None,
         resume_keep_task_open: bool = False,
         resume_transient_context: str | None = None,
+        resume_plan_revision_id: str | None = None,
+        resume_plan_node_id: str | None = None,
     ) -> TurnResult:
         if event.type == "user_message":
             content = str(event.payload.get("content", ""))
@@ -724,6 +740,8 @@ class AgentLoop:
                     allowed_tools=resume_allowed_tools,
                     keep_task_open=resume_keep_task_open,
                     transient_context=resume_transient_context,
+                    plan_revision_id=resume_plan_revision_id,
+                    plan_node_id=resume_plan_node_id,
                 )
             task = self._tasks.require_task(event.task_id)
             if task.status == "waiting_user":
@@ -738,6 +756,8 @@ class AgentLoop:
                 allowed_tools=resume_allowed_tools,
                 keep_task_open=resume_keep_task_open,
                 transient_context=resume_transient_context,
+                plan_revision_id=resume_plan_revision_id,
+                plan_node_id=resume_plan_node_id,
             )
 
         if event.task_id is None:
@@ -823,6 +843,8 @@ class AgentLoop:
                     tool_call.id: dict(pending.decision.get("approval_metadata", {}))
                 },
                 "shell_approval_prefixes": self._session_shell_prefixes.setdefault(task.session_id, set()),
+                "plan_revision_id": resume_plan_revision_id,
+                "plan_node_id": resume_plan_node_id,
             },
             session_id=task.session_id,
             task_id=task.id,
@@ -1015,12 +1037,19 @@ class AgentLoop:
                     approval_decision="not_requested",
                 )
             task_id = self._require_active_task_id()
+            plan_node_id = self._tool_context.turn_state.get("plan_node_id")
+            plan_revision_id = self._tool_context.turn_state.get("plan_revision_id")
             self._tasks.wait_for_user(
                 task_id,
                 PendingAction(
                     kind="ask_user",
                     prompt=question.strip(),
-                    decision={"type": "ask_user", "question": question.strip()},
+                    decision={
+                        "type": "ask_user",
+                        "question": question.strip(),
+                        "plan_node_id": plan_node_id,
+                        "plan_revision_id": plan_revision_id,
+                    },
                 ),
             )
             self._session_service.append_task_trace(
@@ -1122,6 +1151,8 @@ class AgentLoop:
                         "arguments": tool_call.arguments,
                         "approval_metadata": approval_metadata,
                         "approval_process_id": self._process_id,
+                        "plan_node_id": self._tool_context.turn_state.get("plan_node_id"),
+                        "plan_revision_id": self._tool_context.turn_state.get("plan_revision_id"),
                     },
                 )
                 self._tasks.wait_for_user(task_id, pending)
@@ -1269,6 +1300,12 @@ class AgentLoop:
                 arguments=tool_call.arguments,
                 context=self._tool_context,
             )
+            plan_revision_id = self._tool_context.turn_state.get("plan_revision_id")
+            plan_node_id = self._tool_context.turn_state.get("plan_node_id")
+            if plan_revision_id is not None:
+                recovery_metadata["plan_revision_id"] = plan_revision_id
+            if plan_node_id is not None:
+                recovery_metadata["plan_node_id"] = plan_node_id
             action = self._session_service.prepare_tool_action(
                 session_id,
                 agent_id=self._agent.id,

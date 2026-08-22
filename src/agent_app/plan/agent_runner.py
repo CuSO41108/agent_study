@@ -21,6 +21,8 @@ class PlanAgentNodeRunner:
             allowed_tools=context.node.allowed_tools,
             keep_task_open=True,
             transient_context=build_node_prompt(context),
+            plan_revision_id=context.revision.id,
+            plan_node_id=context.node.id,
         )
         if result.pending_action is not None or result.task_status == "waiting_user":
             pending = result.pending_action

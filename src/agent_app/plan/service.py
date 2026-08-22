@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
 from agent_app.plan.executor import PlanExecutionResult, PlanExecutor, PlanNodeContext
 from agent_app.plan.planner import PlanPlanner
+from agent_app.plan.recovery import (
+    PlanRecoveryError,
+    PlanRecoveryService,
+    RecoveryDecision,
+    RecoveryKind,
+)
 from agent_app.plan.store import PlanRevision, PlanStore
 from agent_app.runtime.task_runtime import ReplanBudgetExceeded, TaskRuntime
 from agent_app.state.session_service import SessionService
@@ -29,12 +36,18 @@ class PlanTaskService:
         plan_store: PlanStore,
         session_service: SessionService,
         agent_loop: Any,
+        recovery_service: PlanRecoveryService | None = None,
     ) -> None:
         self._planner = planner
         self._plan_store = plan_store
         self._sessions = session_service
         self._tasks = TaskRuntime(session_service)
         self._agent_loop = agent_loop
+        self._recovery = recovery_service or PlanRecoveryService(
+            plan_store=plan_store,
+            session_service=session_service,
+        )
+        self._execution_owner = str(uuid4())
 
     def start(self, *, session_id: str, goal: str) -> PlanTaskResult:
         task = self._tasks.start_for_user_message(session_id=session_id, user_input=goal)
@@ -57,6 +70,96 @@ class PlanTaskService:
         revision = self._plan_store.get_active_revision(task.id)
         if revision is None:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
+        decision = self._recovery.inspect(task.id)
+        if decision.kind in {
+            RecoveryKind.LEASE_ACTIVE,
+            RecoveryKind.INTERRUPTED,
+            RecoveryKind.INCONSISTENT,
+        }:
+            raise PlanRecoveryError(decision)
+        return self._execute_and_reconcile(task_id, revision, auto_replan=True)
+
+    def has_plan(self, *, task_id: str) -> bool:
+        return bool(self._plan_store.list_revisions(task_id))
+
+    def inspect_recovery(self, *, task_id: str) -> RecoveryDecision:
+        return self._recovery.inspect(task_id)
+
+    def resume(self, *, task_id: str, decision: RecoveryDecision | None = None) -> PlanTaskResult:
+        """Re-inspect and explicitly resume a persisted Plan checkpoint."""
+
+        fresh = self._recovery.inspect(task_id)
+        if decision is not None and decision.task_id != task_id:
+            raise ValueError("Recovery decision belongs to another task.")
+        if fresh.kind in {
+            RecoveryKind.WAITING_TOOL_APPROVAL,
+            RecoveryKind.WAITING_USER_ANSWER,
+        }:
+            revision = self._plan_store.get_revision_by_id(fresh.revision_id or "")
+            return PlanTaskResult(
+                task=self._require_task(task_id),
+                revision=revision,
+                execution=PlanExecutionResult(
+                    "waiting_approval",
+                    revision,
+                    waiting_node_id=fresh.node_id,
+                ),
+            )
+        if fresh.kind in {
+            RecoveryKind.LEASE_ACTIVE,
+            RecoveryKind.INCONSISTENT,
+            RecoveryKind.TERMINAL,
+        }:
+            raise PlanRecoveryError(fresh)
+
+        task = self._require_task(task_id)
+        if fresh.kind == RecoveryKind.PAUSED:
+            task = self._tasks.resume(
+                task.id,
+                event=AgentEvent(
+                    id=str(uuid4()),
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    type="resume_requested",
+                    source="plan_recovery",
+                    correlation_id=task.id,
+                    expected_version=task.version,
+                ),
+            )
+        revision = self._plan_store.get_active_revision(task_id)
+        if revision is None:
+            raise PlanRecoveryError(fresh)
+        if fresh.kind == RecoveryKind.INTERRUPTED:
+            if not self._recovery.rewind_is_safe(fresh):
+                raise PlanRecoveryError(
+                    RecoveryDecision(
+                        kind=RecoveryKind.INTERRUPTED,
+                        task_id=task_id,
+                        revision_id=fresh.revision_id,
+                        node_id=fresh.node_id,
+                        reason=(
+                            "Interrupted node has an uncertain or side-effecting ToolAction; "
+                            "inspect the workspace and resolve it before resuming."
+                        ),
+                    )
+                )
+            revision = self._plan_store.rewind_running_node_to_pending(
+                revision.id,
+                fresh.node_id or "",
+                expected_version=revision.version,
+            )
+            self._sessions.append_task_trace(
+                task_id,
+                "plan_recovery_rewind",
+                {
+                    "plan_id": revision.graph.id,
+                    "revision": revision.graph.revision,
+                    "node_id": fresh.node_id,
+                    "from": "running",
+                    "to": "pending",
+                    "reason": fresh.reason,
+                },
+            )
         return self._execute_and_reconcile(task_id, revision, auto_replan=True)
 
     def is_waiting_for_user_answer(self, *, task_id: str) -> bool:
@@ -140,6 +243,8 @@ class PlanTaskService:
             resume_allowed_tools=node.allowed_tools,
             resume_keep_task_open=True,
             resume_transient_context=build_node_prompt(context),
+            resume_plan_revision_id=revision.id,
+            resume_plan_node_id=node.id,
         )
         task = self._require_task(task.id)
         revision = self._plan_store.get_revision_by_id(revision.id)
@@ -225,6 +330,8 @@ class PlanTaskService:
             resume_allowed_tools=node.allowed_tools,
             resume_keep_task_open=True,
             resume_transient_context=build_node_prompt(context),
+            resume_plan_revision_id=revision.id,
+            resume_plan_node_id=node.id,
         )
         task = self._require_task(task.id)
         revision = self._plan_store.get_revision_by_id(revision.id)
@@ -281,7 +388,11 @@ class PlanTaskService:
         auto_replan: bool,
     ) -> PlanTaskResult:
         before = self._plan_store.get_revision_by_id(revision.id)
-        executor = PlanExecutor(self._plan_store, PlanAgentNodeRunner(self._agent_loop))
+        executor = PlanExecutor(
+            self._plan_store,
+            PlanAgentNodeRunner(self._agent_loop),
+            lease_owner=self._execution_owner,
+        )
         execution = executor.execute(task_id=task_id, revision=revision.graph.revision)
         after = self._plan_store.get_revision_by_id(execution.revision.id)
         self._record_execution_trace(task_id, before=before, after=after, execution=execution)

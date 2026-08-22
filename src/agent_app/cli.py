@@ -34,6 +34,7 @@ from agent_app.orchestrator.loop import AgentLoop
 from agent_app.plan import (
     PlanPlanner,
     PlanPlanningError,
+    PlanRecoveryError,
     PlanStore,
     PlanTaskResult,
     PlanTaskService,
@@ -255,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     controls = parser.add_mutually_exclusive_group()
     controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
     controls.add_argument("--pause-task", metavar="TASK_ID", help="Pause a running task.")
-    controls.add_argument("--resume-task", metavar="TASK_ID", help="Resume a paused task.")
+    controls.add_argument("--resume-task", metavar="TASK_ID", help="Resume or recover a persisted task.")
     controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
     controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
     controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
@@ -374,30 +375,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reject": "user_rejected",
         }[action]
         try:
-            event_payload = {}
-            if action in {"approve", "reject"} and task.pending_action is not None:
-                event_payload["pending_action_id"] = task.pending_action.id
-            event = AgentEvent(
-                id=str(uuid4()),
-                task_id=task.id,
-                session_id=task.session_id,
-                type=event_type,
-                source="cli",
-                payload=event_payload,
-                correlation_id=task.id,
-                expected_version=task.version,
-            )
-            plan_result = (
-                plan_service.handle_approval(
+            if action == "resume" and plan_service.has_plan(task_id=task.id):
+                result = plan_service.resume(task_id=task.id)
+            else:
+                event_payload = {}
+                if action in {"approve", "reject"} and task.pending_action is not None:
+                    event_payload["pending_action_id"] = task.pending_action.id
+                event = AgentEvent(
+                    id=str(uuid4()),
                     task_id=task.id,
-                    event=event,
-                    approved=action == "approve",
+                    session_id=task.session_id,
+                    type=event_type,
+                    source="cli",
+                    payload=event_payload,
+                    correlation_id=task.id,
+                    expected_version=task.version,
                 )
-                if action in {"approve", "reject"}
-                else None
-            )
-            result = plan_result if plan_result is not None else loop.handle_event(event)
-        except (RuntimeError, ValueError) as exc:
+                plan_result = (
+                    plan_service.handle_approval(
+                        task_id=task.id,
+                        event=event,
+                        approved=action == "approve",
+                    )
+                    if action in {"approve", "reject"}
+                    else None
+                )
+                result = plan_result if plan_result is not None else loop.handle_event(event)
+        except (PlanRecoveryError, RuntimeError, ValueError) as exc:
             print(f"Task error: {exc}", file=sys.stderr)
             return 1
         if isinstance(result, PlanTaskResult):
@@ -1414,11 +1418,20 @@ def _run_repl_task_control(
             return None
         event_type = "pause_requested"
     elif command == "/resume":
-        candidates = [item for item in reversed(tasks) if item.status == "paused"]
+        candidates = [
+            item
+            for item in reversed(tasks)
+            if item.status == "paused"
+            or (
+                plan_service is not None
+                and plan_service.has_plan(task_id=item.id)
+                and _is_plan_resumable(plan_service, task_id=item.id)
+            )
+        ]
         task = _select_task_candidate(candidates, task_prefix=task_prefix, command=command)
         if task is None:
             if not candidates:
-                print("No paused task exists in this session.")
+                print("No paused or interrupted Plan task exists in this session.")
             return None
         event_type = "resume_requested"
     else:
@@ -1452,6 +1465,8 @@ def _run_repl_task_control(
             correlation_id=task.id,
             expected_version=task.version,
         )
+        if command == "/resume" and plan_service is not None and plan_service.has_plan(task_id=task.id):
+            return plan_service.resume(task_id=task.id)
         plan_result = (
             plan_service.handle_approval(
                 task_id=task.id,
@@ -1465,6 +1480,14 @@ def _run_repl_task_control(
     except (RuntimeError, ValueError) as exc:
         print(f"Task error: {exc}")
         return None
+
+
+def _is_plan_resumable(plan_service: PlanTaskService, *, task_id: str) -> bool:
+    try:
+        decision = plan_service.inspect_recovery(task_id=task_id)
+    except (KeyError, RuntimeError, ValueError):
+        return False
+    return decision.kind.value in {"ready_to_resume", "interrupted", "paused"}
 
 
 def _select_task_candidate(
