@@ -31,6 +31,7 @@ from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
 from agent_app.observability import export_task_trace, render_task_timeline, render_trace_events
 from agent_app.orchestrator.loop import AgentLoop
+from agent_app.plan import PlanPlanner, PlanPlanningError, plan_graph_to_dict
 from agent_app.skills.learning import build_learning_reference, normalize_generated_skill
 from agent_app.skills.registry import SkillRegistry
 from agent_app.state.db import initialize_database
@@ -76,6 +77,8 @@ _REPL_HELP = """Commands:
               Select a Skill explicitly for the next task turn.
   /skill:<name>
               Shortcut for /skill <name>.
+  /plan <goal>
+              Generate and display a validated PlanGraph without executing it.
   /new        Start a new session.
   /help       Show this help.
   exit        Leave interactive mode."""
@@ -101,6 +104,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/learn", "Draft a new Skill from this session; save only after confirmation."),
     CommandSpec("/skills", "List read-only Skills from both sources."),
     CommandSpec("/skill", "Select a Skill for the next task turn."),
+    CommandSpec("/plan", "Generate and display a validated plan without executing it."),
     CommandSpec("/new", "Start a new session."),
     CommandSpec("/help", "Show all REPL commands."),
 )
@@ -697,6 +701,9 @@ def _run_interactive_loop(
                 skill_registry=skill_registry,
             )
             continue
+        if command == "/plan":
+            _handle_plan_command(raw_target=raw_target, model_client=model_client)
+            continue
         if lowered == "/skills":
             _print_skills(skill_registry, session_service=session_service, session_id=current_session_id)
             continue
@@ -838,6 +845,19 @@ def _create_repl_prompt_session(skill_registry: SkillRegistry | None = None) -> 
         reserve_space_for_menu=16,
         style=_COMMAND_MENU_STYLE,
     )
+
+
+def _handle_plan_command(*, raw_target: str, model_client: object) -> None:
+    goal = raw_target.strip()
+    if not goal:
+        print("Plan error: /plan requires a goal.")
+        return
+    try:
+        graph = PlanPlanner(model_client).create_plan(goal)
+    except PlanPlanningError as exc:
+        print(f"Plan error: {exc}")
+        return
+    print(json.dumps(plan_graph_to_dict(graph), ensure_ascii=False, indent=2))
 
 
 def _print_skills(skill_registry: SkillRegistry, *, session_service: SessionService, session_id: str) -> None:
