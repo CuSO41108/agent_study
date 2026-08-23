@@ -4,6 +4,12 @@
 
 它不是桌面端或 Web 控制台：核心交互是终端 REPL，状态落在工作区的 SQLite 数据库，单轮命令则保持机器可读的 JSON 输出。
 
+## 界面展示
+
+Compact 模式默认只展示工具摘要和执行统计，完整过程仍可通过 `/trace` 回放：
+
+![AgentLab CLI compact interaction](docs/images/agentlab-cli-demo.png)
+
 ## 快速开始
 
 ```powershell
@@ -34,7 +40,7 @@ agent-app --configure
 
 **持久化 TaskState 状态机** — 每个目标都有独立生命周期（`created → running → waiting_user → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
 
-**CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。提交任务后会持续追加执行事件：规划状态、准备调用的工具与命令、Shell 的标准输出/错误输出（逐行）和模型文本分片都会立即显示，不再等待整个回合结束；空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
+**CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。Compact 模式持续追加人类可读的工具摘要、耗时和结果统计，默认缓存 stdout/stderr，完整过程可通过 `/trace` 回放；`--verbose` 或 `/verbose` 可切换到详细实时输出。空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
 
 **跨 Session 进度与接力** — `/sessions`（`/progress` 别名）在终端直接浏览最近 Session 的任务、未完成计划、todo、摘要和等待项。`/handoff` 可把安全 checkpoint 接力到新 Session，只复制目标、剩余计划、摘要、证据引用和哈希校验后的 active Skill，不复制原始历史或待审批动作。
 
@@ -122,6 +128,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/handoff [task-id前缀]` | 从安全 checkpoint 创建新 Session 接力任务 |
 | `/skills` | 列出有效的项目与用户全局 Skill |
 | `/skill <name>` / `/skill:<name>` | 为下一次任务回合显式选择 Skill |
+| `/verbose` | 切换 Compact / Verbose 实时输出 |
 | `/learn project` | 从当前 agent-app Session 生成项目共享 Skill 草稿 |
 | `/learn user` | 生成仅当前用户可复用的全局 Skill 草稿 |
 | `/learn drafts` | 列出当前 Session 尚未保存的 Skill 草稿 |
