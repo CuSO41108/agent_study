@@ -382,7 +382,7 @@ class PlanStore:
                 """
                 SELECT tool_name, status, recovery_json
                 FROM tool_actions
-                WHERE task_id = ? AND status IN ('prepared', 'executing', 'uncertain')
+                WHERE task_id = ? AND status IN ('prepared', 'executing', 'succeeded', 'uncertain')
                 """,
                 (current.task_id,),
             ).fetchall()
@@ -392,7 +392,7 @@ class PlanStore:
                     continue
                 if action_status == "uncertain" or metadata.get("side_effect", False):
                     raise PlanRevisionConflict(
-                        f"Cannot rewind node '{node_id}': tool action '{tool_name}' has an uncertain side effect."
+                        f"Cannot rewind node '{node_id}': tool action '{tool_name}' has a completed or uncertain side effect."
                     )
             next_graph = with_node_status(current.graph, node_id, "pending")
             timestamp = current_time.isoformat()

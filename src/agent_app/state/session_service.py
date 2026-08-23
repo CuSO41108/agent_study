@@ -214,6 +214,15 @@ class SessionService:
             ).fetchall()
         return [_task_from_row(row) for row in rows]
 
+    def list_all_tasks(self) -> list[TaskState]:
+        """Return tasks across Sessions for explicit recovery administration."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                _TASK_SELECT + " ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
     def list_recent_session_overviews(self, *, limit: int = 8) -> list[SessionOverview]:
         """Return a compact, read-only cross-session view for the REPL."""
         if not 1 <= limit <= 20:

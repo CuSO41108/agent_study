@@ -11,6 +11,7 @@ from uuid import uuid4
 from agent_app import cli
 from agent_app.plan import (
     PlanPlanner,
+    PlanRecoveryError,
     PlanRecoveryService,
     PlanRevisionConflict,
     PlanRevisionLeaseConflict,
@@ -297,15 +298,210 @@ class PlanRecoveryTests(unittest.TestCase):
         result = service.resume(task_id=self.task.id)
 
         self.assertEqual(resolution.action.status, "succeeded")
-        self.assertIn("without replaying", resolution.decision.reason)
+        self.assertIn("without replay", resolution.decision.reason)
         self.assertEqual(result.execution.status, "completed")
         self.assertEqual(result.task.status, "completed")
         node_result = result.revision.node_results["inspect"]
-        self.assertEqual(node_result["metadata"]["action_id"], action.id)
+        self.assertEqual(node_result["metadata"]["action_ids"], [action.id])
         self.assertEqual(node_result["output"], "src/module.py sha256:after")
         trace_types = [item.trace_type for item in self.sessions.list_task_traces(self.task.id)]
         self.assertIn("tool_action_resolution", trace_types)
         self.assertIn("plan_recovery_accept_effect", trace_types)
+
+    def test_resume_blocks_until_side_effect_is_resolved(self) -> None:
+        self._prepare_interrupted_side_effect(status="executing")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+
+        with self.assertRaises(PlanRecoveryError) as raised:
+            service.resume(task_id=self.task.id)
+
+        self.assertIn("unresolved side effects", raised.exception.decision.reason)
+        self.assertEqual(
+            self.store.get_active_revision(self.task.id).graph.node_map()["inspect"].status,
+            "running",
+        )
+
+    def test_resolution_requires_an_interrupted_recovery_decision(self) -> None:
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+
+        with self.assertRaises(PlanRecoveryError) as raised:
+            service.resolve_tool_action(
+                task_id=self.task.id,
+                action_id="not-used",
+                outcome="failed",
+                reason="No effect occurred.",
+                evidence="manual inspection",
+                resolved_by="test-user",
+            )
+
+        self.assertEqual(raised.exception.decision.kind, RecoveryKind.READY_TO_RESUME)
+
+    def test_prepared_action_resolved_failed_allows_retry(self) -> None:
+        _running, action = self._prepare_interrupted_side_effect(status="prepared")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_ResumeLoop(),
+            recovery_service=self.recovery,
+        )
+
+        resolution = service.resolve_tool_action(
+            task_id=self.task.id,
+            action_id=action.id,
+            outcome="failed",
+            reason="Execution never started.",
+            evidence="ToolAction remained prepared.",
+            resolved_by="test-user",
+        )
+        result = service.resume(task_id=self.task.id)
+
+        self.assertEqual(resolution.action.status, "failed")
+        self.assertEqual(resolution.action.resolution.previous_status, "prepared")
+        self.assertEqual(result.execution.status, "completed")
+
+    def test_mixed_distinct_side_effects_block_node_replay(self) -> None:
+        running, unresolved = self._prepare_interrupted_side_effect(status="uncertain")
+        succeeded = self.sessions.prepare_tool_action(
+            self.session_id,
+            agent_id="main",
+            tool_call=ToolCall(
+                id="write-succeeded",
+                name="file_write",
+                arguments={"path": "already.py", "content": "done"},
+            ),
+            recovery_metadata={"side_effect": True, "plan_node_id": "inspect"},
+            task_id=self.task.id,
+        )
+        self.sessions.mark_tool_action_executing(succeeded.id)
+        self.sessions.complete_tool_action(
+            succeeded.id,
+            status="succeeded",
+            tool_result=ToolResult(
+                tool_call_id=succeeded.tool_call_id,
+                tool_name=succeeded.tool_name,
+                success=True,
+                content="already.py updated",
+            ),
+        )
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+        service.resolve_tool_action(
+            task_id=self.task.id,
+            action_id=unresolved.id,
+            outcome="failed",
+            reason="The second write did not occur.",
+            evidence="second target unchanged",
+            resolved_by="test-user",
+        )
+
+        with self.assertRaises(PlanRecoveryError) as raised:
+            service.resume(task_id=self.task.id)
+        with self.assertRaises(PlanRevisionConflict):
+            self.store.rewind_running_node_to_pending(
+                running.id,
+                "inspect",
+                expected_version=running.version,
+                now=self.now,
+            )
+
+        self.assertIn("both succeeded and failed distinct side effects", raised.exception.decision.reason)
+        self.assertEqual(
+            self.store.get_active_revision(self.task.id).graph.node_map()["inspect"].status,
+            "running",
+        )
+
+    def test_all_failed_distinct_side_effects_allow_node_retry(self) -> None:
+        _running, first = self._prepare_interrupted_side_effect(status="uncertain")
+        second = self.sessions.prepare_tool_action(
+            self.session_id,
+            agent_id="main",
+            tool_call=ToolCall(
+                id="write-second-failed",
+                name="file_write",
+                arguments={"path": "second.py", "content": "not-written"},
+            ),
+            recovery_metadata={"side_effect": True, "plan_node_id": "inspect"},
+            task_id=self.task.id,
+        )
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_ResumeLoop(),
+            recovery_service=self.recovery,
+        )
+        for action in (first, second):
+            service.resolve_tool_action(
+                task_id=self.task.id,
+                action_id=action.id,
+                outcome="failed",
+                reason="The intended effect is absent.",
+                evidence=f"{action.arguments['path']} unchanged",
+                resolved_by="test-user",
+            )
+
+        result = service.resume(task_id=self.task.id)
+
+        self.assertEqual(result.execution.status, "completed")
+        trace_types = [item.trace_type for item in self.sessions.list_task_traces(self.task.id)]
+        self.assertIn("plan_recovery_rewind", trace_types)
+
+    def test_all_succeeded_distinct_side_effects_complete_node_without_replay(self) -> None:
+        _running, first = self._prepare_interrupted_side_effect(status="executing")
+        second = self.sessions.prepare_tool_action(
+            self.session_id,
+            agent_id="main",
+            tool_call=ToolCall(
+                id="write-second-succeeded",
+                name="file_write",
+                arguments={"path": "second.py", "content": "written"},
+            ),
+            recovery_metadata={"side_effect": True, "plan_node_id": "inspect"},
+            task_id=self.task.id,
+        )
+        self.sessions.mark_tool_action_executing(second.id)
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+        for action in (first, second):
+            service.resolve_tool_action(
+                task_id=self.task.id,
+                action_id=action.id,
+                outcome="succeeded",
+                reason="The intended effect is present.",
+                evidence=f"{action.arguments['path']} contains the intended content",
+                resolved_by="test-user",
+            )
+
+        result = service.resume(task_id=self.task.id)
+
+        self.assertEqual(result.execution.status, "completed")
+        node_result = result.revision.node_results["inspect"]
+        self.assertEqual(node_result["metadata"]["action_ids"], [first.id, second.id])
+        self.assertIn("x contains the intended content", node_result["output"])
+        self.assertIn("second.py contains the intended content", node_result["output"])
 
     def test_resolution_rejects_action_not_owned_by_interrupted_node(self) -> None:
         self._prepare_interrupted_side_effect(status="executing")
@@ -371,6 +567,41 @@ class PlanRecoveryTests(unittest.TestCase):
         self.assertEqual(resolved.status, "failed")
         self.assertEqual(resolved.resolution.reason, "Original hash still present")
 
+    def test_repl_all_resolves_cross_session_and_preserves_quoted_reason(self) -> None:
+        _running, action = self._prepare_interrupted_side_effect(status="uncertain")
+        other_session_id = self.sessions.create_session("other-session")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            cli._handle_tool_action_resolution_command(
+                raw_target="--all",
+                plan_service=service,
+                session_service=self.sessions,
+                session_id=other_session_id,
+            )
+            cli._handle_tool_action_resolution_command(
+                raw_target=(
+                    f"--all {action.id[:8]} failed '\"C:\\repo\\Quoted reason\"' "
+                    "-- evidence one -- evidence two"
+                ),
+                plan_service=service,
+                session_service=self.sessions,
+                session_id=other_session_id,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn(action.id, output)
+        resolved = self.sessions.get_tool_action(action.id)
+        self.assertEqual(resolved.resolution.reason, '"C:\\repo\\Quoted reason"')
+        self.assertEqual(resolved.resolution.evidence, "evidence one -- evidence two")
+
     def _prepare_interrupted_side_effect(self, *, status: str):
         running = self.store.update_node_status(
             self.revision.id,
@@ -391,6 +622,8 @@ class PlanRecoveryTests(unittest.TestCase):
             recovery_metadata={"side_effect": True, "plan_node_id": "inspect"},
             task_id=self.task.id,
         )
+        if status == "prepared":
+            return running, action
         action = self.sessions.mark_tool_action_executing(action.id)
         if status == "uncertain":
             action = self.sessions.complete_tool_action(

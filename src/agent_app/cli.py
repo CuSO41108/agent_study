@@ -70,8 +70,8 @@ _REPL_HELP = """Commands:
               Pause a running task before handing it off.
   /resume [task-id-prefix]
               Resume a paused task.
-  /resolve-action [action-id-prefix succeeded|failed "reason" -- evidence]
-              List or resolve an interrupted side-effect ToolAction. Run /resume afterwards.
+  /resolve-action [--all] [action-id-prefix succeeded|failed "reason" -- evidence]
+              List or resolve interrupted side effects; --all searches every Session.
   /handoff [task-id-prefix]
               Continue a paused/running/completed checkpoint in a new session without copying raw history.
   /sessions [count]
@@ -1095,8 +1095,13 @@ def _handle_tool_action_resolution_command(
     session_service: SessionService,
     session_id: str,
 ) -> None:
+    target = raw_target.strip()
+    all_sessions = target == "--all" or target.startswith("--all ")
+    if all_sessions:
+        target = target.removeprefix("--all").strip()
+    tasks = session_service.list_all_tasks() if all_sessions else session_service.list_tasks(session_id)
     candidates = []
-    for task in reversed(session_service.list_tasks(session_id)):
+    for task in reversed(tasks):
         if not plan_service.has_plan(task_id=task.id):
             continue
         try:
@@ -1104,10 +1109,10 @@ def _handle_tool_action_resolution_command(
         except (KeyError, PlanRecoveryError, RuntimeError, ValueError):
             continue
 
-    target = raw_target.strip()
     if not target:
         if not candidates:
-            print("No interrupted side-effect ToolAction requires resolution in this session.")
+            scope = "across Sessions" if all_sessions else "in this session"
+            print(f"No interrupted side-effect ToolAction requires resolution {scope}.")
             return
         print("Interrupted side-effect ToolActions:")
         for action in candidates:
@@ -1118,7 +1123,7 @@ def _handle_tool_action_resolution_command(
                 f"{action.tool_name}:{action.status}{target}"
             )
         print(
-            'Resolve with: /resolve-action <action-id-prefix> <succeeded|failed> '
+            'Resolve with: /resolve-action [--all] <action-id-prefix> <succeeded|failed> '
             '"<reason>" -- <evidence>'
         )
         return
@@ -1126,23 +1131,26 @@ def _handle_tool_action_resolution_command(
     decision_part, separator, evidence = target.partition(" -- ")
     if not separator or not evidence.strip():
         print(
-            'Usage: /resolve-action <action-id-prefix> <succeeded|failed> '
+            'Usage: /resolve-action [--all] <action-id-prefix> <succeeded|failed> '
             '"<reason>" -- <evidence>'
         )
         return
     try:
-        parts = shlex.split(decision_part, posix=False)
+        lexer = shlex.shlex(decision_part, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexer.escape = ""
+        parts = list(lexer)
     except ValueError as exc:
         print(f"Resolution error: {exc}")
         return
     if len(parts) != 3 or parts[1].lower() not in {"succeeded", "failed"}:
         print(
-            'Usage: /resolve-action <action-id-prefix> <succeeded|failed> '
+            'Usage: /resolve-action [--all] <action-id-prefix> <succeeded|failed> '
             '"<reason>" -- <evidence>'
         )
         return
     action_prefix, outcome, reason = parts
-    reason = reason.strip('"\'')
     matches = [action for action in candidates if action.id.startswith(action_prefix)]
     if not matches:
         print(f"No unresolved ToolAction matches prefix '{action_prefix}'.")

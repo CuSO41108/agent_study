@@ -12,6 +12,7 @@ from agent_app.plan.recovery import (
     PlanRecoveryService,
     RecoveryDecision,
     RecoveryKind,
+    SideEffectRecoveryKind,
 )
 from agent_app.plan.store import PlanRevision, PlanStore
 from agent_app.runtime.task_runtime import ReplanBudgetExceeded, TaskRuntime
@@ -215,62 +216,71 @@ class PlanTaskService:
         if revision is None:
             raise PlanRecoveryError(fresh)
         if fresh.kind == RecoveryKind.INTERRUPTED:
-            unresolved = self._recovery.resolution_candidates(fresh)
-            if unresolved:
+            assessment = self._recovery.assess_side_effects(fresh)
+            if assessment.kind in {
+                SideEffectRecoveryKind.UNRESOLVED,
+                SideEffectRecoveryKind.MIXED,
+            }:
                 raise PlanRecoveryError(
                     RecoveryDecision(
                         kind=RecoveryKind.INTERRUPTED,
                         task_id=task_id,
                         revision_id=fresh.revision_id,
                         node_id=fresh.node_id,
-                        reason=(
-                            "Interrupted node has an uncertain or side-effecting ToolAction; "
-                            "inspect the workspace and resolve it before resuming."
-                        ),
+                        reason=assessment.reason,
                     )
                 )
-            latest_resolution = self._recovery.latest_resolution_for_node(fresh)
-            if latest_resolution is not None and latest_resolution.resolution is not None:
-                resolution = latest_resolution.resolution
-                if resolution.outcome == "succeeded":
-                    revision = self._plan_store.update_node_status(
-                        revision.id,
-                        fresh.node_id or "",
-                        "completed",
-                        result={
-                            "status": "completed",
-                            "output": resolution.evidence,
-                            "error": None,
-                            "metadata": {
-                                "recovery": "human_tool_action_resolution",
-                                "action_id": latest_resolution.id,
-                                "resolved_by": resolution.resolved_by,
-                                "reason": resolution.reason,
-                            },
-                        },
-                        expected_version=revision.version,
-                    )
-                    self._sessions.append_task_trace(
-                        task_id,
-                        "plan_recovery_accept_effect",
-                        {
-                            "plan_id": revision.graph.id,
-                            "revision": revision.graph.revision,
-                            "node_id": fresh.node_id,
-                            "action_id": latest_resolution.id,
-                            "from": "running",
-                            "to": "completed",
-                            "reason": resolution.reason,
-                            "evidence": resolution.evidence,
-                        },
-                    )
-                else:
-                    revision = self._rewind_interrupted_node(task_id, revision, fresh)
-            elif self._recovery.rewind_is_safe(fresh):
+            if assessment.kind == SideEffectRecoveryKind.COMPLETE:
+                revision = self._accept_interrupted_side_effects(
+                    task_id,
+                    revision,
+                    fresh,
+                    assessment.succeeded_actions,
+                )
+            elif assessment.kind == SideEffectRecoveryKind.RETRY and self._recovery.rewind_is_safe(fresh):
                 revision = self._rewind_interrupted_node(task_id, revision, fresh)
             else:
                 raise PlanRecoveryError(fresh)
         return self._execute_and_reconcile(task_id, revision, auto_replan=True)
+
+    def _accept_interrupted_side_effects(
+        self,
+        task_id: str,
+        revision: PlanRevision,
+        decision: RecoveryDecision,
+        actions: tuple[ToolAction, ...],
+    ) -> PlanRevision:
+        action_ids = [action.id for action in actions]
+        evidence = [_tool_action_recovery_evidence(action) for action in actions]
+        accepted = self._plan_store.update_node_status(
+            revision.id,
+            decision.node_id or "",
+            "completed",
+            result={
+                "status": "completed",
+                "output": "\n".join(evidence),
+                "error": None,
+                "metadata": {
+                    "recovery": "tool_action_history",
+                    "action_ids": action_ids,
+                },
+            },
+            expected_version=revision.version,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "plan_recovery_accept_effect",
+            {
+                "plan_id": accepted.graph.id,
+                "revision": accepted.graph.revision,
+                "node_id": decision.node_id,
+                "action_ids": action_ids,
+                "from": "running",
+                "to": "completed",
+                "evidence": evidence,
+            },
+        )
+        return accepted
 
     def _rewind_interrupted_node(
         self,
@@ -709,3 +719,11 @@ def _node_result_payload(result: Any) -> dict[str, Any]:
         "output_preview": str(output)[:500] if output is not None else None,
         "metadata": result.get("metadata", {}),
     }
+
+
+def _tool_action_recovery_evidence(action: ToolAction) -> str:
+    if action.resolution is not None:
+        return action.resolution.evidence
+    if action.result is not None and action.result.content.strip():
+        return action.result.content.strip()[:1000]
+    return f"{action.tool_name} action {action.id} succeeded."

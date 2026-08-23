@@ -81,7 +81,10 @@ SQLite 使用三组任务表：
 CLI 支持 `--task-status`、`--pause-task`、`--resume-task`、`--cancel-task`、
 `--approve-task`、`--reject-task` 和 `--resolve-tool-action`。ToolAction 的
 人工 resolution 是动作事实，不会为 Task 或 PlanNode 增加恢复状态；只有证据
-明确后，显式 resume 才能重试未生效动作或接受已生效动作而不重放。
+明确后，显式 resume 才能重试未生效动作或接受已生效动作而不重放。恢复判定
+读取当前节点的完整 ToolAction 历史，而不是按时间选择最后一条：全部独立副作用
+失败才允许 rewind，全部独立副作用成功才允许完成，成功与失败混合时继续阻断。
+Store 层同样拒绝 rewind 任何包含已成功或仍不确定副作用的节点。
 
 ## ReAct 与 Observe
 

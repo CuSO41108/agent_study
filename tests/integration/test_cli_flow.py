@@ -7,6 +7,7 @@ import shutil
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -17,11 +18,12 @@ from prompt_toolkit.document import Document
 from agent_app import cli
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.orchestrator.loop import AgentLoop
+from agent_app.plan import PlanStore, parse_plan_graph
 from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.registry import build_default_registry
-from agent_app.types import AgentEvent, ExecutionEvent, ModelResponse, PendingAction, ToolCall
+from agent_app.types import AgentEvent, ExecutionEvent, ModelResponse, PendingAction, ToolCall, ToolResult
 
 
 class _FakeModelClient:
@@ -76,6 +78,101 @@ class CliIntegrationTests(unittest.TestCase):
         exported = json.loads(json_stdout.getvalue())
         self.assertEqual(exported["trace_id"], task.id)
         self.assertEqual(exported["schema_version"], 1)
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_resolves_interrupted_tool_action_through_main(self, mock_from_config) -> None:
+        mock_from_config.return_value = _FakeModelClient([])
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        session_id = sessions.create_session("tool-action-resolution-session")
+        task = TaskRuntime(sessions).start_for_user_message(
+            session_id=session_id,
+            user_input="Recover the interrupted write.",
+        )
+        store = PlanStore(database_path)
+        revision = store.create_revision(
+            task.id,
+            parse_plan_graph(
+                {
+                    "id": "cli-recovery-plan",
+                    "revision": 1,
+                    "goal": task.goal,
+                    "nodes": [
+                        {
+                            "id": "edit",
+                            "kind": "edit",
+                            "objective": "Update src/module.py.",
+                            "depends_on": [],
+                            "allowed_tools": ["file_read", "file_write"],
+                            "acceptance": ["The requested update is present."],
+                            "status": "pending",
+                        }
+                    ],
+                }
+            ),
+        )
+        running = store.update_node_status(
+            revision.id,
+            "edit",
+            "running",
+            expected_version=revision.version,
+        )
+        store.acquire_execution_lease(
+            running.id,
+            owner="expired-cli-process",
+            ttl_seconds=1,
+            now=datetime.now(UTC) - timedelta(seconds=10),
+        )
+        action = sessions.prepare_tool_action(
+            session_id,
+            agent_id="main",
+            tool_call=ToolCall(
+                id="cli-interrupted-write",
+                name="file_write",
+                arguments={"path": "src/module.py", "content": "print('new')\n"},
+            ),
+            recovery_metadata={"side_effect": True, "plan_node_id": "edit"},
+            task_id=task.id,
+        )
+        sessions.mark_tool_action_executing(action.id)
+        sessions.complete_tool_action(
+            action.id,
+            status="uncertain",
+            tool_result=ToolResult(
+                tool_call_id=action.tool_call_id,
+                tool_name=action.tool_name,
+                success=False,
+                content="Process exited before the write result was observed.",
+                error="uncertain_side_effect",
+            ),
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main(
+                [
+                    "--resolve-tool-action",
+                    action.id,
+                    "--resolution",
+                    "failed",
+                    "--resolution-reason",
+                    "The original file content is still present.",
+                    "--resolution-evidence",
+                    "src/module.py hash matches the pre-write value.",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        output = json.loads(stdout.getvalue())
+        resolved = sessions.get_tool_action(action.id)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["action_id"], action.id)
+        self.assertEqual(output["status"], "failed")
+        self.assertEqual(output["recovery_decision"]["kind"], "interrupted")
+        self.assertEqual(resolved.status, "failed")
+        self.assertEqual(resolved.resolution.outcome, "failed")
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_runs_full_turn_and_persists_session_data(self, mock_from_config) -> None:

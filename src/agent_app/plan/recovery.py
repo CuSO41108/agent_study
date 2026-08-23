@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -32,6 +33,25 @@ class RecoveryDecision:
     revision_id: str | None = None
     node_id: str | None = None
     pending_action_id: str | None = None
+
+
+class SideEffectRecoveryKind(str, Enum):
+    """A derived strategy for an interrupted node's complete ToolAction history."""
+
+    RETRY = "retry"
+    COMPLETE = "complete"
+    UNRESOLVED = "unresolved"
+    MIXED = "mixed"
+
+
+@dataclass(frozen=True, slots=True)
+class SideEffectRecoveryAssessment:
+    kind: SideEffectRecoveryKind
+    reason: str
+    actions: tuple[ToolAction, ...]
+    succeeded_actions: tuple[ToolAction, ...] = ()
+    failed_actions: tuple[ToolAction, ...] = ()
+    unresolved_actions: tuple[ToolAction, ...] = ()
 
 
 class PlanRecoveryError(RuntimeError):
@@ -235,6 +255,8 @@ class PlanRecoveryService:
         if decision.kind != RecoveryKind.INTERRUPTED:
             return False
         for action in self.actions_for_node(decision.task_id, decision.node_id):
+            if action.status == "succeeded" and action.recovery_metadata.get("side_effect", False):
+                return False
             if action.status == "uncertain":
                 return False
             if action.status in {"prepared", "executing"} and action.recovery_metadata.get("side_effect", False):
@@ -254,19 +276,20 @@ class PlanRecoveryService:
             and action.status in {"prepared", "executing", "uncertain"}
         ]
 
-    def latest_resolution_for_node(self, decision: RecoveryDecision) -> ToolAction | None:
-        if decision.kind != RecoveryKind.INTERRUPTED:
-            return None
-        resolved = [
+    def assess_side_effects(self, decision: RecoveryDecision) -> SideEffectRecoveryAssessment:
+        if decision.kind != RecoveryKind.INTERRUPTED or decision.node_id is None:
+            return SideEffectRecoveryAssessment(
+                kind=SideEffectRecoveryKind.UNRESOLVED,
+                reason="Side-effect recovery assessment requires an interrupted Plan node.",
+                actions=(),
+            )
+        actions = tuple(
             action
             for action in self.actions_for_node(decision.task_id, decision.node_id)
-            if action.resolution is not None
-            and action.recovery_metadata.get("plan_node_id") == decision.node_id
+            if action.recovery_metadata.get("plan_node_id") == decision.node_id
             and action.recovery_metadata.get("side_effect", False)
-        ]
-        if not resolved:
-            return None
-        return max(resolved, key=lambda action: (action.prepared_at, action.id))
+        )
+        return _assess_side_effect_actions(actions, node_id=decision.node_id)
 
     def _interrupted_reason(self, task: TaskState, node_id: str) -> str:
         actions = self.actions_for_node(task.id, node_id)
@@ -279,25 +302,17 @@ class PlanRecoveryService:
         if blocking:
             names = ", ".join(f"{action.tool_name}:{action.status}" for action in blocking)
             return f"Node '{node_id}' was interrupted; inspect possible side effects before retrying ({names})."
-        resolved = [
-            action
-            for action in actions
-            if action.resolution is not None
-            and action.recovery_metadata.get("plan_node_id") == node_id
-            and action.recovery_metadata.get("side_effect", False)
-        ]
-        if resolved:
-            latest = max(resolved, key=lambda action: (action.prepared_at, action.id))
-            assert latest.resolution is not None
-            if latest.resolution.outcome == "succeeded":
-                return (
-                    f"Node '{node_id}' has a human-confirmed completed side effect; "
-                    "explicit resume may accept it without replaying the node."
-                )
-            return (
-                f"Node '{node_id}' has a human-confirmed absent side effect; "
-                "explicit resume may retry it."
-            )
+        assessment = _assess_side_effect_actions(
+            tuple(
+                action
+                for action in actions
+                if action.recovery_metadata.get("plan_node_id") == node_id
+                and action.recovery_metadata.get("side_effect", False)
+            ),
+            node_id=node_id,
+        )
+        if assessment.actions:
+            return assessment.reason
         return f"Node '{node_id}' was interrupted after its execution lease expired; explicit resume may retry it."
 
     @staticmethod
@@ -321,3 +336,68 @@ class PlanRecoveryService:
 
 
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "expired", "handed_off"}
+
+
+def _assess_side_effect_actions(
+    actions: tuple[ToolAction, ...],
+    *,
+    node_id: str,
+) -> SideEffectRecoveryAssessment:
+    unresolved = tuple(
+        action for action in actions if action.status in {"prepared", "executing", "uncertain"}
+    )
+    if unresolved:
+        names = ", ".join(f"{action.tool_name}:{action.status}" for action in unresolved)
+        return SideEffectRecoveryAssessment(
+            kind=SideEffectRecoveryKind.UNRESOLVED,
+            reason=f"Node '{node_id}' still has unresolved side effects ({names}).",
+            actions=actions,
+            unresolved_actions=unresolved,
+        )
+
+    effect_groups: dict[str, list[ToolAction]] = {}
+    for action in actions:
+        key = json.dumps(
+            {"tool": action.tool_name, "arguments": action.arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        effect_groups.setdefault(key, []).append(action)
+
+    succeeded: list[ToolAction] = []
+    failed: list[ToolAction] = []
+    for group in effect_groups.values():
+        group_successes = [action for action in group if action.status == "succeeded"]
+        if group_successes:
+            succeeded.extend(group_successes)
+        else:
+            failed.extend(action for action in group if action.status == "failed")
+
+    if succeeded and failed:
+        return SideEffectRecoveryAssessment(
+            kind=SideEffectRecoveryKind.MIXED,
+            reason=(
+                f"Node '{node_id}' contains both succeeded and failed distinct side effects; "
+                "it cannot be safely replayed or marked complete automatically."
+            ),
+            actions=actions,
+            succeeded_actions=tuple(succeeded),
+            failed_actions=tuple(failed),
+        )
+    if succeeded:
+        return SideEffectRecoveryAssessment(
+            kind=SideEffectRecoveryKind.COMPLETE,
+            reason=(
+                f"All recorded side-effect groups for node '{node_id}' have a succeeded action; "
+                "explicit resume may accept them without replay."
+            ),
+            actions=actions,
+            succeeded_actions=tuple(succeeded),
+        )
+    return SideEffectRecoveryAssessment(
+        kind=SideEffectRecoveryKind.RETRY,
+        reason=f"Node '{node_id}' has no succeeded side effect and may be retried explicitly.",
+        actions=actions,
+        failed_actions=tuple(failed),
+    )

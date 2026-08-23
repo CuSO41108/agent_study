@@ -33,11 +33,12 @@ Requests with explicit multi-step intent can enter Plan-and-Execute through
   persisted Task, active revision, node, pending action, ToolAction, and lease
   facts. An expired running node with a possible write side effect cannot be
   rewound automatically.
-- An operator can attach one immutable resolution to the current interrupted
-  node's unresolved ToolAction. `failed` means the intended effect is confirmed
-  absent and explicit resume may retry the node. `succeeded` means the intended
-  effect is confirmed present; explicit resume completes that node from the
-  supplied evidence without replaying its tool call.
+- An operator can attach one immutable resolution to each unresolved ToolAction
+  of the current interrupted node. Recovery groups duplicate attempts by tool
+  name and normalized arguments, then derives one decision from the complete
+  history: all distinct effects absent permits a node retry; all distinct
+  effects present completes the node without replay; mixed present/absent
+  effects remain blocked for manual repair. Any unresolved action also blocks.
 
 ## Execution and audit flow
 
@@ -89,8 +90,9 @@ The important state transitions are persisted in SQLite task traces:
 AgentLoop model/tool traces, so a Plan run can be replayed without treating the
 PlanGraph as a separate hidden subsystem.
 
-Use `/resolve-action` to list candidates in the current Session. Resolve one
-with concrete evidence and then explicitly resume the Task:
+Use `/resolve-action` to list candidates in the current Session, or
+`/resolve-action --all` to search across Sessions. Resolve every candidate for
+the interrupted node with concrete evidence and then explicitly resume the Task:
 
 ```text
 /resolve-action <action-id-prefix> failed "Original hash still present" -- src/module.py sha256:before
@@ -120,8 +122,9 @@ The current implementation is accepted when all of the following hold:
    failures must be reported separately when they are unrelated baseline
    drift.
 8. An interrupted write remains blocked until its ToolAction is resolved;
-   confirmed absent effects may be retried, while confirmed completed effects
-   advance the node without a second tool execution.
+   all confirmed-absent effects may be retried, all confirmed-present effects
+   advance the node without a second tool execution, and mixed effects remain
+   blocked rather than selecting the latest resolution.
 
 ## Deliberately deferred
 
