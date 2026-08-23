@@ -61,7 +61,12 @@ class ShellTool(Tool):
         if context.event_sink is not None:
             runtime_kwargs["on_output"] = lambda stream, line: context.event_sink(
                 "tool_output",
-                {"tool": self.name, "stream": stream, "line": line},
+                {
+                    "tool": self.name,
+                    "tool_call_id": tool_call_id,
+                    "stream": stream,
+                    "line": line,
+                },
             )
         execution = self._runtime.run(command, **runtime_kwargs)
         if execution.error_type == "timeout":

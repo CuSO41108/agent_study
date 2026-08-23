@@ -694,10 +694,11 @@ class CliIntegrationTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("Agent Study", output)
-        self.assertIn("Interactive REPL", output)
+        self.assertIn("Agent Study v", output)
+        self.assertIn("Session · Interactive", output)
         self.assertIn("Type / to browse commands", output)
         session_id = (self.workspace_root / ".agent_app" / "current_session.txt").read_text(encoding="utf-8").strip()
-        self.assertIn(session_id, output)
+        self.assertNotIn(session_id, output)
 
     def test_slash_command_completer_lists_and_filters_repl_commands(self) -> None:
         completer = cli._SlashCommandCompleter()
@@ -734,9 +735,198 @@ class CliIntegrationTests(unittest.TestCase):
             )
 
         output = stdout.getvalue()
-        self.assertIn("[action] file_write: lionel_messi.html", output)
-        self.assertIn("write · 49 bytes · 4 lines", output)
+        self.assertIn("Write lionel_messi.html", output)
+        self.assertIn("49 bytes · 4 lines", output)
         self.assertNotIn("large generated page", output)
+
+    def test_live_renderer_compact_buffers_shell_output_and_summarizes_completion(self) -> None:
+        renderer = cli._LiveExecutionRenderer()
+        command = "Get-ChildItem -Recurse -Force | Where-Object { $_.FullName -notmatch '__pycache__' }"
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "arguments": {"command": command},
+                    },
+                )
+            )
+            renderer(
+                ExecutionEvent(
+                    type="tool_started",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={"tool": "shell", "tool_call_id": "shell-1"},
+                )
+            )
+            for line in ("__pycache__", "src/agent_app", "tests", "docs"):
+                renderer(
+                    ExecutionEvent(
+                        type="tool_output",
+                        task_id="task-1",
+                        session_id="session-1",
+                        payload={
+                            "tool": "shell",
+                            "tool_call_id": "shell-1",
+                            "stream": "stdout",
+                            "line": line,
+                        },
+                    )
+                )
+            renderer(
+                ExecutionEvent(
+                    type="tool_finished",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "success": True,
+                        "duration_ms": 420,
+                        "output_lines": 4,
+                        "output_bytes": 40,
+                    },
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("● Shell · List project structure", output)
+        self.assertIn("✓ Shell · List project structure", output)
+        self.assertIn("4 lines · 0.4s", output)
+        self.assertIn("src/agent_app", output)
+        self.assertNotIn("__pycache__", output)
+        self.assertNotIn(command, output)
+
+    def test_live_renderer_verbose_prints_raw_tool_output(self) -> None:
+        renderer = cli._LiveExecutionRenderer(verbose=True)
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "arguments": {"command": "Write-Output verbose-line"},
+                    },
+                )
+            )
+            renderer(
+                ExecutionEvent(
+                    type="tool_started",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={"tool": "shell", "tool_call_id": "shell-1"},
+                )
+            )
+            renderer(
+                ExecutionEvent(
+                    type="tool_output",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "stream": "stdout",
+                        "line": "verbose-line",
+                    },
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("arguments:", output)
+        self.assertIn("verbose-line", output)
+        self.assertIn("[tool] Running shell", output)
+
+    def test_live_renderer_expands_only_limited_failure_preview(self) -> None:
+        renderer = cli._LiveExecutionRenderer()
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "arguments": {"command": "Get-Item missing.txt"},
+                    },
+                )
+            )
+            renderer(
+                ExecutionEvent(
+                    type="tool_finished",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "success": False,
+                        "duration_ms": 1200,
+                        "output_lines": 8,
+                        "output_bytes": 120,
+                        "error": "Shell command exited with code 1.",
+                        "output_preview": "first error\nsecond error\nthird error\nfourth error\nfifth error\nsixth error",
+                    },
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("✗ Shell · Get-Item missing.txt", output)
+        self.assertIn("Shell command exited with code 1.", output)
+        self.assertIn("fifth error", output)
+        self.assertNotIn("sixth error", output)
+
+    def test_live_renderer_hides_full_shell_command_from_compact_action(self) -> None:
+        renderer = cli._LiveExecutionRenderer()
+        command = "Get-ChildItem -Recurse -Path src | Select-Object -ExpandProperty FullName"
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "shell",
+                        "tool_call_id": "shell-1",
+                        "arguments": {"command": command},
+                    },
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Shell · List project structure", output)
+        self.assertNotIn(command, output)
+
+    @patch("builtins.input", side_effect=["/verbose", "/verbose", "quit"])
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_verbose_command_toggles_output_mode(self, mock_from_config, _mock_input) -> None:
+        mock_from_config.return_value = _FakeModelClient([])
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            exit_code = cli.main([
+                "--workspace-root",
+                str(self.workspace_root),
+            ])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Output mode: verbose", output)
+        self.assertIn("Output mode: compact", output)
 
     @patch("builtins.input", side_effect=["", "hello", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
@@ -753,7 +943,7 @@ class CliIntegrationTests(unittest.TestCase):
             ])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("Interactive REPL", stdout.getvalue())
+        self.assertIn("Interactive", stdout.getvalue())
         self.assertIn("interactive turn", stdout.getvalue())
         self.assertIn("[task:", stdout.getvalue())
         self.assertIn("| completed]", stdout.getvalue())

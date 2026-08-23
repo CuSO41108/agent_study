@@ -224,6 +224,12 @@ class AgentLoopTests(unittest.TestCase):
             [trace.payload["event_type"] for trace in self.sessions.list_task_traces(result.task_id) if trace.trace_type == "stream"],
             [event.type for event in events],
         )
+        finished = next(event for event in events if event.type == "tool_finished")
+        self.assertEqual(finished.payload["tool_call_id"], "call-stream")
+        self.assertIn("duration_ms", finished.payload)
+        self.assertGreater(finished.payload["output_lines"], 0)
+        self.assertGreater(finished.payload["output_bytes"], 0)
+        self.assertIsNone(finished.payload["output_preview"])
 
     def test_multiple_tool_calls_run_serially_in_model_order(self) -> None:
         model = _FakeModelClient([

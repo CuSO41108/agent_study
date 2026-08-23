@@ -20,10 +20,8 @@ from prompt_toolkit.completion import Completer, Completion, CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
-from rich.align import Align
-from rich.console import Console, Group
+from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from agent_app.agent.definition import SINGLE_MAIN_AGENT
@@ -95,6 +93,8 @@ _REPL_HELP = """Commands:
               Generate a PlanGraph and execute its nodes serially.
   /replan <reason>
               Replan the latest active PlanGraph after a failure or new evidence.
+  /verbose
+              Toggle compact/verbose live tool output.
   /new        Start a new session.
   /help       Show this help.
   exit        Leave interactive mode."""
@@ -124,25 +124,18 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/plan", "Generate and display a validated plan without executing it."),
     CommandSpec("/plan-and-execute", "Generate and execute a validated plan serially."),
     CommandSpec("/replan", "Create a successor PlanGraph for the latest active plan."),
+    CommandSpec("/verbose", "Toggle compact/verbose live output."),
     CommandSpec("/new", "Start a new session."),
     CommandSpec("/help", "Show all REPL commands."),
 )
 
-_APP_MARK = """\
-       .--------.
-       | A * S  |
-       |  o o   |
-       '---+ +--'
-           v v
-"""
-
 _COMMAND_MENU_STYLE = Style.from_dict(
     {
-        "completion-menu": "bg:#101010",
-        "completion-menu.completion": "fg:#b5b5b5",
-        "completion-menu.completion.current": "fg:#c7c9ff bg:#2a2a3d bold",
-        "completion-menu.meta.completion": "fg:#8f8f8f",
-        "completion-menu.meta.completion.current": "fg:#e4e4e4 bg:#2a2a3d",
+        "completion-menu": "bg:#171a21",
+        "completion-menu.completion": "fg:#e5e7eb",
+        "completion-menu.completion.current": "fg:#ffffff bg:#334155 bold",
+        "completion-menu.meta.completion": "fg:#a7b0c0",
+        "completion-menu.meta.completion.current": "fg:#ffffff bg:#334155",
     }
 )
 
@@ -150,10 +143,25 @@ _COMMAND_MENU_STYLE = Style.from_dict(
 class _LiveExecutionRenderer:
     """Append agent execution events to the REPL as they arrive."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, verbose: bool = False) -> None:
+        self._verbose = verbose
         self._model_text = ""
         self._model_line_open = False
         self._streamed_final = False
+        self._planned_actions: dict[str, str] = {}
+        self._active_tool_call_id: str | None = None
+        self._output_stats: dict[str, dict[str, object]] = {}
+
+    @property
+    def verbose(self) -> bool:
+        return self._verbose
+
+    def set_verbose(self, verbose: bool) -> None:
+        self._verbose = verbose
+
+    def toggle_verbose(self) -> bool:
+        self._verbose = not self._verbose
+        return self._verbose
 
     def reset(self) -> None:
         if self._model_line_open:
@@ -161,39 +169,98 @@ class _LiveExecutionRenderer:
         self._model_text = ""
         self._model_line_open = False
         self._streamed_final = False
+        self._planned_actions.clear()
+        self._active_tool_call_id = None
+        self._output_stats.clear()
 
     def __call__(self, event: ExecutionEvent) -> None:
         if event.type == "task_started":
-            print(f"[task] Started: {event.payload.get('goal', '')}")
+            if self._verbose:
+                print(f"[task] Started: {event.payload.get('goal', '')}")
+            else:
+                print("You")
+                print(f"  {event.payload.get('goal', '')}")
         elif event.type == "model_started":
             self._close_model_line()
             self._model_text = ""
-            print("[agent] Planning next step…")
+            if self._verbose:
+                print("[agent] Planning next step…")
         elif event.type == "model_text_delta":
-            if not self._model_line_open:
-                print("[agent] ", end="", flush=True)
-                self._model_line_open = True
             text = str(event.payload.get("text", ""))
-            print(text, end="", flush=True)
             self._model_text += text
+            if self._verbose:
+                if not self._model_line_open:
+                    print("[agent] ", end="", flush=True)
+                    self._model_line_open = True
+                print(text, end="", flush=True)
         elif event.type == "action_planned":
             self._close_model_line()
             tool = event.payload.get("tool", "tool")
-            print(_format_live_action(tool, event.payload.get("arguments", {})))
+            call_id = str(event.payload.get("tool_call_id", ""))
+            summary = _format_live_action(
+                tool,
+                event.payload.get("arguments", {}),
+                verbose=self._verbose,
+            )
+            if call_id:
+                self._planned_actions[call_id] = summary
+                self._output_stats[call_id] = {"lines": 0, "bytes": 0, "preview": []}
+            if self._verbose:
+                print(summary)
+            else:
+                print(f"● {summary}")
         elif event.type == "tool_started":
             self._close_model_line()
-            print(f"[tool] Running {event.payload.get('tool', 'tool')}…")
+            call_id = str(event.payload.get("tool_call_id", ""))
+            self._active_tool_call_id = call_id or self._active_tool_call_id
+            if self._verbose:
+                print(f"[tool] Running {event.payload.get('tool', 'tool')}…")
         elif event.type == "tool_output":
             line = str(event.payload.get("line", ""))
-            if line:
+            call_id = str(event.payload.get("tool_call_id", "")) or self._active_tool_call_id
+            if call_id:
+                stats = self._output_stats.setdefault(
+                    call_id,
+                    {"lines": 0, "bytes": 0, "preview": []},
+                )
+                if line:
+                    stats["lines"] = int(stats["lines"]) + 1
+                    stats["bytes"] = int(stats["bytes"]) + len(line.encode("utf-8"))
+                    preview = stats["preview"]
+                    if isinstance(preview, list) and len(preview) < 5:
+                        preview.append((str(event.payload.get("stream", "output")), line))
+            if self._verbose and line:
                 print(f"  [{event.payload.get('tool', 'tool')}/{event.payload.get('stream', 'output')}] {line}")
         elif event.type == "tool_finished":
-            status = "completed" if event.payload.get("success") else "failed"
-            detail = event.payload.get("error")
-            print(f"[tool] {event.payload.get('tool', 'tool')} {status}" + (f": {detail}" if detail else ""))
+            call_id = str(event.payload.get("tool_call_id", ""))
+            tool = event.payload.get("tool", "tool")
+            summary = self._planned_actions.get(call_id) or _format_live_action(tool, {})
+            stats = self._output_stats.get(call_id, {"lines": 0, "bytes": 0, "preview": []})
+            if self._verbose:
+                status = "completed" if event.payload.get("success") else "failed"
+                detail = event.payload.get("error")
+                print(f"[tool] {tool} {status}" + (f": {detail}" if detail else ""))
+            else:
+                marker = "✓" if event.payload.get("success") else "✗"
+                duration_ms = _as_int(event.payload.get("duration_ms"), default=0)
+                output_lines = _as_int(event.payload.get("output_lines"), default=int(stats["lines"]))
+                output_bytes = _as_int(event.payload.get("output_bytes"), default=int(stats["bytes"]))
+                detail = _format_tool_completion(
+                    marker=marker,
+                    summary=summary,
+                    duration_ms=duration_ms,
+                    output_lines=output_lines,
+                    output_bytes=output_bytes,
+                    error=event.payload.get("error"),
+                    preview=event.payload.get("output_preview") or stats["preview"],
+                )
+                print(detail)
+            self._active_tool_call_id = None
         elif event.type == "turn_finishing":
             final_text = event.payload.get("final_text")
-            self._streamed_final = bool(final_text and final_text == self._model_text)
+            self._streamed_final = bool(
+                self._verbose and final_text and final_text == self._model_text
+            )
             self._close_model_line()
 
     def consume_streamed_final(self) -> bool:
@@ -207,11 +274,11 @@ class _LiveExecutionRenderer:
             self._model_line_open = False
 
 
-def _format_live_action(tool: object, arguments: object) -> str:
+def _format_live_action(tool: object, arguments: object, *, verbose: bool = False) -> str:
     """Render a useful action summary without echoing generated file contents."""
     tool_name = str(tool)
     if not isinstance(arguments, dict):
-        return f"[action] {tool_name}"
+        return f"[action] {tool_name}" if verbose else tool_name
 
     if tool_name == "file_write":
         path = str(arguments.get("path", "<unknown path>"))
@@ -219,11 +286,131 @@ def _format_live_action(tool: object, arguments: object) -> str:
         if isinstance(content, str):
             byte_count = len(content.encode("utf-8"))
             line_count = content.count("\n") + 1 if content else 0
-            return f"[action] file_write: {path}\n         write · {byte_count:,} bytes · {line_count:,} lines"
-        return f"[action] file_write: {path}"
+            summary = f"Write {path} · {byte_count:,} bytes · {line_count:,} lines"
+        else:
+            summary = f"Write {path}"
+        return f"[action] {summary}" if verbose else summary
 
+    summary = _summarize_action(tool_name, arguments)
+    if not verbose:
+        return summary
     rendered_arguments = json.dumps(arguments, ensure_ascii=False)
-    return f"[action] {tool_name}: {rendered_arguments}"
+    return f"[action] {summary}\n         arguments: {rendered_arguments}"
+
+
+def _summarize_action(tool_name: str, arguments: dict[str, object]) -> str:
+    if tool_name == "file_read":
+        return f"Read {arguments.get('path', '<unknown path>')}"
+    if tool_name == "code_search":
+        pattern = _shorten_text(arguments.get("pattern") or arguments.get("query") or "", limit=64)
+        return f"Search code · {pattern or 'requested pattern'}"
+    if tool_name == "replace_in_file":
+        return f"Edit {arguments.get('path', '<unknown path>')}"
+    if tool_name == "shell":
+        command = str(arguments.get("command", ""))
+        return f"Shell · {_summarize_shell_command(command)}"
+    if tool_name == "delegate_task":
+        objective = _shorten_text(arguments.get("objective") or arguments.get("prompt") or "", limit=64)
+        return f"Delegate · {objective or 'subtask'}"
+    if tool_name == "web_search":
+        query = _shorten_text(arguments.get("query") or "", limit=64)
+        return f"Web search · {query or 'requested query'}"
+    if tool_name == "skill_load":
+        return f"Load Skill · {arguments.get('name', '<unknown skill>')}"
+    if tool_name == "skill_read_resource":
+        return f"Read Skill resource · {arguments.get('name', '<unknown resource>')}"
+    if tool_name == "skill_list":
+        return "List Skills"
+    if tool_name == "todo_read":
+        return "Read Todo"
+    if tool_name == "todo_write":
+        return "Update Todo"
+    if tool_name == "ask_user":
+        return "Ask user"
+    if tool_name == "give_up":
+        return "Stop with diagnosis"
+    return tool_name
+
+
+def _summarize_shell_command(command: str) -> str:
+    compact = " ".join(command.split())
+    lowered = compact.casefold()
+    if "get-childitem" in lowered or "gci " in lowered or lowered.startswith("gci"):
+        return "List project structure"
+    if "get-content" in lowered or lowered.startswith("gc ") or lowered.startswith("type "):
+        return "Read files"
+    if "select-string" in lowered or " rg " in f" {lowered} " or lowered.startswith("rg "):
+        return "Search code"
+    if "test-" in lowered or "pytest" in lowered or "unittest" in lowered:
+        return "Run verification"
+    return _shorten_text(compact or "Run command", limit=72)
+
+
+def _shorten_text(value: object, *, limit: int) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _as_int(value: object, *, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_tool_completion(
+    *,
+    marker: str,
+    summary: str,
+    duration_ms: int,
+    output_lines: int,
+    output_bytes: int,
+    error: object,
+    preview: object,
+) -> str:
+    duration = f"{duration_ms / 1000:.1f}s"
+    details: list[str] = []
+    if output_lines:
+        details.append(f"{output_lines:,} lines")
+    if output_bytes and output_lines == 0:
+        details.append(f"{output_bytes:,} bytes")
+    details.append(duration)
+    lines = [f"  {marker} {summary}", f"    {' · '.join(details)}"]
+    if marker == "✗":
+        if error:
+            lines.append(f"    {_shorten_text(error, limit=160)}")
+        for stream, line in _meaningful_preview(preview, limit=5):
+            label = f"{stream}: " if stream and stream != "stdout" else ""
+            lines.append(f"    {label}{_shorten_text(line, limit=160)}")
+    elif summary.startswith("Shell ·"):
+        meaningful = [line for _stream, line in _meaningful_preview(preview, limit=3)]
+        if meaningful:
+            lines.append(f"    {' · '.join(_shorten_text(line, limit=48) for line in meaningful)}")
+    return "\n".join(lines)
+
+
+def _meaningful_preview(value: object, *, limit: int) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        if isinstance(value, str):
+            value = [("", line) for line in value.splitlines()]
+        else:
+            return []
+    result: list[tuple[str, str]] = []
+    ignored = ("__pycache__", ".git", "node_modules", ".venv", "venv")
+    for item in value:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            stream, raw_line = str(item[0]), str(item[1])
+        else:
+            stream, raw_line = "", str(item)
+        line = " ".join(raw_line.split())
+        if not line or any(part.casefold() in line.casefold() for part in ignored):
+            continue
+        result.append((stream, line))
+        if len(result) >= limit:
+            break
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -251,6 +438,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="interactive",
         action="store_true",
         help="Explicitly start the interactive REPL (also the default when no prompt is supplied).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed live tool output in interactive mode.",
     )
     parser.add_argument(
         "--configure",
@@ -316,7 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_state_path=session_state_path,
     )
     model_client = OpenAICompatibleModelClient.from_config(config)
-    live_renderer = _LiveExecutionRenderer() if interactive else None
+    live_renderer = _LiveExecutionRenderer(verbose=args.verbose) if interactive else None
     skill_registry = SkillRegistry(config.workspace_root)
     subagent_runner = SubagentRunner(
         model_client=model_client,
@@ -472,6 +664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             skill_registry=skill_registry,
             live_renderer=live_renderer,
             plan_service=plan_service,
+            session_label="New Session" if args.new_session else "Session",
         )
 
     try:
@@ -745,12 +938,13 @@ def _run_interactive_loop(
     skill_registry: SkillRegistry,
     live_renderer: _LiveExecutionRenderer | None,
     plan_service: PlanTaskService,
+    session_label: str,
 ) -> int:
     current_session_id = session_id
     continuation: list[str] = []
     pending_skill_names: list[str] = []
     prompt_session = _create_repl_prompt_session(skill_registry)
-    _print_interactive_banner(config=config, session_id=current_session_id)
+    _print_interactive_banner(config=config, session_label=session_label)
 
     while True:
         try:
@@ -783,10 +977,17 @@ def _run_interactive_loop(
         if lowered in {":new", "/new"}:
             current_session_id = session_service.create_session()
             _persist_current_session(session_state_path, current_session_id)
-            print(f"Started a new session. Session: {current_session_id}")
+            print("Started a new session.")
             continue
         if lowered == "/help":
             print(_REPL_HELP)
+            continue
+        if lowered == "/verbose":
+            if live_renderer is None:
+                print("Output mode is available only in interactive mode.")
+            else:
+                mode = "verbose" if live_renderer.toggle_verbose() else "compact"
+                print(f"Output mode: {mode}")
             continue
         if lowered == "/task":
             _print_latest_task(session_service, current_session_id)
@@ -1468,25 +1669,23 @@ def _read_repl_input(prompt_session: PromptSession[str] | None) -> str:
     return prompt_session.prompt("> ")
 
 
-def _print_interactive_banner(*, config: AppConfig, session_id: str) -> None:
-    """Render startup-only identity and runtime data; one-shot output stays untouched."""
-    details = Table.grid(padding=(0, 2))
-    details.add_column(style="bold cyan", no_wrap=True)
-    details.add_column()
-    details.add_row("Model", config.model or "Not configured")
-    details.add_row("Workspace", str(config.workspace_root))
-    details.add_row("Session", session_id)
-    details.add_row("Mode", "Interactive REPL")
-
-    logo = Text(_APP_MARK, style="bold bright_cyan", justify="center")
+def _print_interactive_banner(*, config: AppConfig, session_label: str = "Session") -> None:
+    """Render a compact startup identity without exposing internal session IDs."""
+    version_text = f"Agent Study v{_application_version()}"
+    runtime_text = " · ".join(
+        [
+            config.model or "Model not configured",
+            str(config.workspace_root),
+            session_label,
+            "Interactive",
+        ]
+    )
     console = Console()
     console.print(
         Panel(
-            Group(Align.center(logo), details),
-            title=f"[bold cyan]Agent Study[/] [dim]v{_application_version()}[/]",
-            subtitle="[dim]Local coding agent[/]",
+            Text(f"{version_text}\n{runtime_text}", style="bold bright_cyan"),
             border_style="cyan",
-            padding=(1, 3),
+            padding=(0, 1),
         )
     )
     print("Type / to browse commands; use /help for details; use 'exit' or 'quit' to leave.")

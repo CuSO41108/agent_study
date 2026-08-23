@@ -1369,6 +1369,18 @@ class AgentLoop:
                         "attempt": attempt,
                         "success": tool_result.success,
                         "error": tool_result.error,
+                        "duration_ms": duration_ms,
+                        "output_lines": len(tool_result.content.splitlines()) if tool_result.content else 0,
+                        "output_bytes": (
+                            len(tool_result.content.encode("utf-8"))
+                            if tool_result.content
+                            else 0
+                        ),
+                        "output_preview": (
+                            "\n".join(tool_result.content.splitlines()[:5])
+                            if not tool_result.success and tool_result.content
+                            else None
+                        ),
                     },
                 )
 
