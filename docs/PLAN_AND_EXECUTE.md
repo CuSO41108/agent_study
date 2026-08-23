@@ -1,8 +1,10 @@
 # Plan-and-Execute
 
-AgentLab keeps simple coding requests on the existing single-agent ReAct path.
-Requests with explicit multi-step intent can enter Plan-and-Execute through
-`/plan-and-execute` or the router's multi-step markers.
+AgentLab keeps simple, exploratory, and clarification requests on the existing
+single-agent ReAct path. Explicit `/plan-and-execute` always selects planning.
+Automatic routing is conservative: one sequence word, a normal question, or a
+line break is not enough. It requires a structured action list, an ordered
+multi-action sequence, or a code-change plus verification pair.
 
 ## Current contract
 

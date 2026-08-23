@@ -27,7 +27,45 @@ class PlanRoutingTests(unittest.TestCase):
         decision = route_request("implement the change and verify it with tests")
 
         self.assertEqual(decision.mode, "plan_and_execute")
-        self.assertEqual(decision.reason, "multi_step_markers")
+        self.assertEqual(decision.reason, "multiple_action_clauses")
+
+    def test_single_sequence_word_and_confirmation_questions_stay_on_react(self) -> None:
+        prompts = (
+            "也就是说要先安装这个skill：lark-cli，才能使用对吧",
+            "要先安装并配置 lark-cli 后，才能使用飞书文档能力，对吗？",
+            "先读取 README.md",
+            "安装并配置 lark-cli",
+            "implement the requested change",
+            "explain how install and configure work",
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = route_request(prompt)
+                self.assertEqual(decision.mode, "react")
+                self.assertEqual(decision.reason, "simple_or_exploratory_task")
+
+    def test_plain_multiline_text_does_not_force_plan_mode(self) -> None:
+        decision = route_request("读取 README.md\n告诉我这个项目是做什么的")
+
+        self.assertEqual(decision.mode, "react")
+
+    def test_structured_action_list_uses_plan_and_execute(self) -> None:
+        decision = route_request(
+            "安装 lark-cli\n"
+            "+ 完成飞书授权\n"
+            "+ 安装并配置 lark-doc Skill\n"
+            "+ 验证 AgentLab 能发现该 Skill"
+        )
+
+        self.assertEqual(decision.mode, "plan_and_execute")
+        self.assertEqual(decision.reason, "structured_step_list")
+
+    def test_ordered_chinese_actions_use_plan_and_execute(self) -> None:
+        decision = route_request("先定位登录超时原因，然后修改代码并运行测试")
+
+        self.assertEqual(decision.mode, "plan_and_execute")
+        self.assertEqual(decision.reason, "ordered_action_sequence")
 
     def test_explicit_modes_keep_the_goal_without_the_command(self) -> None:
         self.assertEqual(route_request("/plan inspect the repository").mode, "plan_only")

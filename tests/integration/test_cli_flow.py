@@ -207,6 +207,29 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(tool_runs[0].tool_name, "file_read")
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_confirmation_question_with_sequence_word_stays_on_react(
+        self,
+        mock_from_config,
+    ) -> None:
+        fake_model = _FakeModelClient([_text_response("需要安装 CLI，并配置对应的 Skill。")])
+        mock_from_config.return_value = fake_model
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main(
+                [
+                    "也就是说要先安装这个skill：lark-cli，才能使用对吧",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["final_text"], "需要安装 CLI，并配置对应的 Skill。")
+        self.assertTrue(fake_model.calls[0]["tools"])
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_runs_plan_and_execute_and_exports_plan_trace(self, mock_from_config) -> None:
         plan = (
             '{"id":"cli-plan","revision":1,"nodes":['
