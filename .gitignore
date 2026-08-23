@@ -12,3 +12,15 @@ evals/results/*.jsonl
 .agents/
 .specify/
 docs/AGENT_CONTEXT_ENGINEERING.md
+
+# Private local materials and runtime artifacts
+*简历*.md
+*面经*.md
+*面试*.md
+*导学*.md
+*resume*.md
+*interview*.md
+*.db
+*.sqlite
+*.sqlite3
+*.log
