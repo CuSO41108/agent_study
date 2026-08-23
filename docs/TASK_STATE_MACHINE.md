@@ -79,7 +79,9 @@ SQLite 使用三组任务表：
 - `pending_action`
 
 CLI 支持 `--task-status`、`--pause-task`、`--resume-task`、`--cancel-task`、
-`--approve-task` 和 `--reject-task`。
+`--approve-task`、`--reject-task` 和 `--resolve-tool-action`。ToolAction 的
+人工 resolution 是动作事实，不会为 Task 或 PlanNode 增加恢复状态；只有证据
+明确后，显式 resume 才能重试未生效动作或接受已生效动作而不重放。
 
 ## ReAct 与 Observe
 

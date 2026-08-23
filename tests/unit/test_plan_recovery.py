@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import shutil
 import unittest
+from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from agent_app import cli
 from agent_app.plan import (
     PlanPlanner,
     PlanRecoveryService,
@@ -19,7 +22,7 @@ from agent_app.plan import (
 from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
-from agent_app.types import ModelResponse, PendingAction, ToolCall, TurnResult
+from agent_app.types import ModelResponse, PendingAction, ToolCall, ToolResult, TurnResult
 
 
 def _graph(*, status: str = "pending"):
@@ -59,6 +62,11 @@ class _ResumeLoop:
             task_id=kwargs["_task_id"],
             task_status="running",
         )
+
+
+class _NoReplayLoop:
+    def run_turn(self, **_kwargs):
+        raise AssertionError("A confirmed completed side effect must not be replayed.")
 
 
 class PlanRecoveryTests(unittest.TestCase):
@@ -227,6 +235,176 @@ class PlanRecoveryTests(unittest.TestCase):
         self.assertEqual(result.execution.status, "completed")
         self.assertEqual(result.task.status, "completed")
         self.assertEqual(result.revision.graph.node_map()["inspect"].status, "completed")
+
+    def test_failed_tool_action_resolution_allows_explicit_retry(self) -> None:
+        running, action = self._prepare_interrupted_side_effect(status="uncertain")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_ResumeLoop(),
+            recovery_service=self.recovery,
+        )
+
+        candidates = service.list_tool_action_resolution_candidates(task_id=self.task.id)
+        resolution = service.resolve_tool_action(
+            task_id=self.task.id,
+            action_id=action.id,
+            outcome="failed",
+            reason="The target still has its original content.",
+            evidence="sha256:before",
+            resolved_by="test-user",
+        )
+        repeated_resolution = service.resolve_tool_action(
+            task_id=self.task.id,
+            action_id=action.id,
+            outcome="failed",
+            reason="The target still has its original content.",
+            evidence="sha256:before",
+            resolved_by="test-user",
+        )
+        result = service.resume(task_id=self.task.id)
+
+        self.assertEqual([item.id for item in candidates], [action.id])
+        self.assertEqual(resolution.action.status, "failed")
+        self.assertEqual(repeated_resolution.action, resolution.action)
+        self.assertEqual(resolution.decision.kind, RecoveryKind.INTERRUPTED)
+        self.assertEqual(result.execution.status, "completed")
+        self.assertEqual(result.task.status, "completed")
+        trace_types = [item.trace_type for item in self.sessions.list_task_traces(self.task.id)]
+        self.assertEqual(trace_types.count("tool_action_resolution"), 1)
+        self.assertIn("plan_recovery_rewind", trace_types)
+        self.assertEqual(self.store.get_revision_by_id(running.id).status, "completed")
+
+    def test_succeeded_tool_action_resolution_completes_node_without_replay(self) -> None:
+        _running, action = self._prepare_interrupted_side_effect(status="executing")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+
+        resolution = service.resolve_tool_action(
+            task_id=self.task.id,
+            action_id=action.id,
+            outcome="succeeded",
+            reason="The intended content is present.",
+            evidence="src/module.py sha256:after",
+            resolved_by="test-user",
+        )
+        result = service.resume(task_id=self.task.id)
+
+        self.assertEqual(resolution.action.status, "succeeded")
+        self.assertIn("without replaying", resolution.decision.reason)
+        self.assertEqual(result.execution.status, "completed")
+        self.assertEqual(result.task.status, "completed")
+        node_result = result.revision.node_results["inspect"]
+        self.assertEqual(node_result["metadata"]["action_id"], action.id)
+        self.assertEqual(node_result["output"], "src/module.py sha256:after")
+        trace_types = [item.trace_type for item in self.sessions.list_task_traces(self.task.id)]
+        self.assertIn("tool_action_resolution", trace_types)
+        self.assertIn("plan_recovery_accept_effect", trace_types)
+
+    def test_resolution_rejects_action_not_owned_by_interrupted_node(self) -> None:
+        self._prepare_interrupted_side_effect(status="executing")
+        unrelated = self.sessions.prepare_tool_action(
+            self.session_id,
+            agent_id="main",
+            tool_call=ToolCall(id="other-write", name="file_write", arguments={"path": "other.py"}),
+            recovery_metadata={"side_effect": True, "plan_node_id": "other-node"},
+            task_id=self.task.id,
+        )
+        self.sessions.mark_tool_action_executing(unrelated.id)
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+
+        with self.assertRaisesRegex(ValueError, "not an unresolved side effect"):
+            service.resolve_tool_action(
+                task_id=self.task.id,
+                action_id=unrelated.id,
+                outcome="failed",
+                reason="No effect found.",
+                evidence="manual inspection",
+                resolved_by="test-user",
+            )
+
+    def test_repl_lists_and_resolves_current_interrupted_action(self) -> None:
+        _running, action = self._prepare_interrupted_side_effect(status="uncertain")
+        service = PlanTaskService(
+            planner=PlanPlanner(_ResumePlannerModel()),
+            plan_store=self.store,
+            session_service=self.sessions,
+            agent_loop=_NoReplayLoop(),
+            recovery_service=self.recovery,
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            cli._handle_tool_action_resolution_command(
+                raw_target="",
+                plan_service=service,
+                session_service=self.sessions,
+                session_id=self.session_id,
+            )
+            cli._handle_tool_action_resolution_command(
+                raw_target=(
+                    f'{action.id[:8]} failed "Original hash still present" '
+                    "-- src/module.py sha256:before"
+                ),
+                plan_service=service,
+                session_service=self.sessions,
+                session_id=self.session_id,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn(action.id, output)
+        self.assertIn("Resolved ToolAction", output)
+        self.assertIn("Run /resume", output)
+        resolved = self.sessions.get_tool_action(action.id)
+        self.assertEqual(resolved.status, "failed")
+        self.assertEqual(resolved.resolution.reason, "Original hash still present")
+
+    def _prepare_interrupted_side_effect(self, *, status: str):
+        running = self.store.update_node_status(
+            self.revision.id,
+            "inspect",
+            "running",
+            expected_version=self.revision.version,
+        )
+        self.store.acquire_execution_lease(
+            running.id,
+            owner="crashed-process",
+            ttl_seconds=1,
+            now=self.now - timedelta(seconds=10),
+        )
+        action = self.sessions.prepare_tool_action(
+            self.session_id,
+            agent_id="main",
+            tool_call=ToolCall(id=f"write-{status}", name="file_write", arguments={"path": "x", "content": "y"}),
+            recovery_metadata={"side_effect": True, "plan_node_id": "inspect"},
+            task_id=self.task.id,
+        )
+        action = self.sessions.mark_tool_action_executing(action.id)
+        if status == "uncertain":
+            action = self.sessions.complete_tool_action(
+                action.id,
+                status="uncertain",
+                tool_result=ToolResult(
+                    tool_call_id=action.tool_call_id,
+                    tool_name=action.tool_name,
+                    success=False,
+                    content="",
+                    error="Interrupted side effect is uncertain.",
+                ),
+            )
+        return running, action
 
 
 if __name__ == "__main__":

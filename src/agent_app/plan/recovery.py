@@ -241,6 +241,33 @@ class PlanRecoveryService:
                 return False
         return True
 
+    def resolution_candidates(self, decision: RecoveryDecision) -> list[ToolAction]:
+        """Return unresolved side effects owned by the interrupted Plan node."""
+
+        if decision.kind != RecoveryKind.INTERRUPTED or decision.node_id is None:
+            return []
+        return [
+            action
+            for action in self.actions_for_node(decision.task_id, decision.node_id)
+            if action.recovery_metadata.get("plan_node_id") == decision.node_id
+            and action.recovery_metadata.get("side_effect", False)
+            and action.status in {"prepared", "executing", "uncertain"}
+        ]
+
+    def latest_resolution_for_node(self, decision: RecoveryDecision) -> ToolAction | None:
+        if decision.kind != RecoveryKind.INTERRUPTED:
+            return None
+        resolved = [
+            action
+            for action in self.actions_for_node(decision.task_id, decision.node_id)
+            if action.resolution is not None
+            and action.recovery_metadata.get("plan_node_id") == decision.node_id
+            and action.recovery_metadata.get("side_effect", False)
+        ]
+        if not resolved:
+            return None
+        return max(resolved, key=lambda action: (action.prepared_at, action.id))
+
     def _interrupted_reason(self, task: TaskState, node_id: str) -> str:
         actions = self.actions_for_node(task.id, node_id)
         blocking = [
@@ -252,6 +279,25 @@ class PlanRecoveryService:
         if blocking:
             names = ", ".join(f"{action.tool_name}:{action.status}" for action in blocking)
             return f"Node '{node_id}' was interrupted; inspect possible side effects before retrying ({names})."
+        resolved = [
+            action
+            for action in actions
+            if action.resolution is not None
+            and action.recovery_metadata.get("plan_node_id") == node_id
+            and action.recovery_metadata.get("side_effect", False)
+        ]
+        if resolved:
+            latest = max(resolved, key=lambda action: (action.prepared_at, action.id))
+            assert latest.resolution is not None
+            if latest.resolution.outcome == "succeeded":
+                return (
+                    f"Node '{node_id}' has a human-confirmed completed side effect; "
+                    "explicit resume may accept it without replaying the node."
+                )
+            return (
+                f"Node '{node_id}' has a human-confirmed absent side effect; "
+                "explicit resume may retry it."
+            )
         return f"Node '{node_id}' was interrupted after its execution lease expired; explicit resume may retry it."
 
     @staticmethod

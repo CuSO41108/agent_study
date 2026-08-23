@@ -118,6 +118,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/approve` / `/reject` | 批准或拒绝等待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态任务 |
 | `/pause` / `/resume` | 暂停或恢复任务 |
+| `/resolve-action` | 列出或用人工证据收敛中断节点的不确定副作用；决议后再执行 `/resume` |
 | `/handoff [task-id前缀]` | 从安全 checkpoint 创建新 Session 接力任务 |
 | `/skills` | 列出有效的项目与用户全局 Skill |
 | `/skill <name>` / `/skill:<name>` | 为下一次任务回合显式选择 Skill |
@@ -140,6 +141,8 @@ agent-app --watch-trace TASK_ID       # 跟随指定任务
 agent-app --approve-task TASK_ID      # 批准
 agent-app --reject-task TASK_ID       # 拒绝
 agent-app --cancel-task TASK_ID       # 取消
+agent-app --resolve-tool-action ACTION_ID --resolution failed `
+  --resolution-reason "原内容仍存在" --resolution-evidence "src/module.py sha256:before"
 ```
 
 ## Skill 使用方式

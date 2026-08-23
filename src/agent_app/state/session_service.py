@@ -27,6 +27,8 @@ from agent_app.types import (
     TaskTrace,
     TodoItem,
     ToolAction,
+    ToolActionResolution,
+    ToolActionResolutionOutcome,
     ToolActionStatus,
     ToolCall,
     ToolCallTrace,
@@ -1198,6 +1200,110 @@ class SessionService:
             ).fetchall()
         return [_tool_action_from_row(row) for row in rows]
 
+    def get_tool_action(self, action_id: str) -> ToolAction | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+        return None if row is None else _tool_action_from_row(row)
+
+    def resolve_tool_action(
+        self,
+        action_id: str,
+        *,
+        outcome: ToolActionResolutionOutcome,
+        reason: str,
+        evidence: str,
+        resolved_by: str,
+    ) -> ToolAction:
+        """Persist one immutable human resolution for an unresolved side effect."""
+
+        if outcome not in {"succeeded", "failed"}:
+            raise ValueError("Tool action resolution must be succeeded or failed.")
+        reason = reason.strip()
+        evidence = evidence.strip()
+        resolved_by = resolved_by.strip()
+        if not reason:
+            raise ValueError("Tool action resolution reason cannot be empty.")
+        if not evidence:
+            raise ValueError("Tool action resolution evidence cannot be empty.")
+        if not resolved_by:
+            raise ValueError("Tool action resolver cannot be empty.")
+
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(action_id)
+            existing = _tool_action_from_row(row)
+            if existing.resolution is not None:
+                resolution = existing.resolution
+                if (
+                    resolution.outcome == outcome
+                    and resolution.reason == reason
+                    and resolution.evidence == evidence
+                    and resolution.resolved_by == resolved_by
+                ):
+                    return existing
+                raise ValueError(f"Tool action '{action_id}' already has an immutable resolution.")
+            if existing.status not in {"prepared", "executing", "uncertain"}:
+                raise ValueError(
+                    f"Tool action '{action_id}' is {existing.status}; only prepared, executing, or uncertain actions can be resolved."
+                )
+            if existing.status == "prepared" and outcome == "succeeded":
+                raise ValueError(
+                    f"Tool action '{action_id}' was prepared but never started; it can only be resolved as failed."
+                )
+
+            previous_result = None
+            if existing.result is not None:
+                previous_result = {
+                    "success": existing.result.success,
+                    "content": existing.result.content,
+                    "error": existing.result.error,
+                }
+            resolution_payload = {
+                "outcome": outcome,
+                "reason": reason,
+                "evidence": evidence,
+                "resolved_by": resolved_by,
+                "resolved_at": timestamp,
+                "previous_status": existing.status,
+                "previous_result": previous_result,
+            }
+            result_content = evidence if outcome == "succeeded" else ""
+            result_error = None if outcome == "succeeded" else reason
+            cursor = connection.execute(
+                """
+                UPDATE tool_actions
+                SET status = ?, result_success = ?, result_content = ?, result_error = ?,
+                    resolution_json = ?, completed_at = COALESCE(completed_at, ?), updated_at = ?
+                WHERE id = ? AND status IN ('prepared', 'executing', 'uncertain') AND resolution_json IS NULL
+                """,
+                (
+                    outcome,
+                    1 if outcome == "succeeded" else 0,
+                    result_content,
+                    result_error,
+                    _json_dumps(resolution_payload),
+                    timestamp,
+                    timestamp,
+                    action_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Tool action '{action_id}' changed while it was being resolved.")
+            resolved_row = connection.execute(
+                _TOOL_ACTION_SELECT + " WHERE id = ? LIMIT 1",
+                (action_id,),
+            ).fetchone()
+        assert resolved_row is not None
+        return _tool_action_from_row(resolved_row)
+
     def append_subagent_run(
         self,
         *,
@@ -1500,7 +1606,8 @@ class SessionService:
 _TOOL_ACTION_SELECT = """
 SELECT id, session_id, task_id, agent_id, tool_call_id, tool_name, arguments_json,
        idempotency_key, status, recovery_json, result_success, result_content,
-       result_error, prepared_at, started_at, completed_at, updated_at, attempt, retry_of
+       result_error, prepared_at, started_at, completed_at, updated_at, attempt, retry_of,
+       resolution_json
 FROM tool_actions
 """
 
@@ -1514,6 +1621,28 @@ def _tool_action_from_row(row) -> ToolAction:
             success=bool(row[10]),
             content=row[11] or "",
             error=row[12],
+        )
+    resolution = None
+    if row[19] is not None:
+        raw_resolution = json.loads(row[19])
+        raw_previous_result = raw_resolution.get("previous_result")
+        previous_result = None
+        if raw_previous_result is not None:
+            previous_result = ToolResult(
+                tool_call_id=row[4],
+                tool_name=row[5],
+                success=bool(raw_previous_result["success"]),
+                content=raw_previous_result.get("content") or "",
+                error=raw_previous_result.get("error"),
+            )
+        resolution = ToolActionResolution(
+            outcome=raw_resolution["outcome"],
+            reason=raw_resolution["reason"],
+            evidence=raw_resolution["evidence"],
+            resolved_by=raw_resolution["resolved_by"],
+            resolved_at=raw_resolution["resolved_at"],
+            previous_status=raw_resolution["previous_status"],
+            previous_result=previous_result,
         )
     return ToolAction(
         id=row[0],
@@ -1533,6 +1662,7 @@ def _tool_action_from_row(row) -> ToolAction:
         updated_at=row[16],
         attempt=row[17],
         retry_of=row[18],
+        resolution=resolution,
     )
 
 

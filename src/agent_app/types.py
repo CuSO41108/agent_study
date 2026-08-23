@@ -41,6 +41,18 @@ class ExecutionEvent:
 
 
 ToolActionStatus = Literal["prepared", "executing", "succeeded", "failed", "uncertain"]
+ToolActionResolutionOutcome = Literal["succeeded", "failed"]
+
+
+@dataclass(slots=True, frozen=True)
+class ToolActionResolution:
+    outcome: ToolActionResolutionOutcome
+    reason: str
+    evidence: str
+    resolved_by: str
+    resolved_at: str
+    previous_status: ToolActionStatus
+    previous_result: ToolResult | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -62,6 +74,7 @@ class ToolAction:
     task_id: str | None = None
     attempt: int = 1
     retry_of: str | None = None
+    resolution: ToolActionResolution | None = None
 
 
 @dataclass(slots=True, frozen=True)

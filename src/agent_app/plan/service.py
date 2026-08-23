@@ -16,7 +16,13 @@ from agent_app.plan.recovery import (
 from agent_app.plan.store import PlanRevision, PlanStore
 from agent_app.runtime.task_runtime import ReplanBudgetExceeded, TaskRuntime
 from agent_app.state.session_service import SessionService
-from agent_app.types import AgentEvent, Message, TaskState
+from agent_app.types import (
+    AgentEvent,
+    Message,
+    TaskState,
+    ToolAction,
+    ToolActionResolutionOutcome,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +30,12 @@ class PlanTaskResult:
     task: TaskState
     revision: PlanRevision
     execution: PlanExecutionResult
+
+
+@dataclass(frozen=True, slots=True)
+class ToolActionResolutionResult:
+    action: ToolAction
+    decision: RecoveryDecision
 
 
 class PlanTaskService:
@@ -85,6 +97,79 @@ class PlanTaskService:
     def inspect_recovery(self, *, task_id: str) -> RecoveryDecision:
         return self._recovery.inspect(task_id)
 
+    def list_tool_action_resolution_candidates(self, *, task_id: str) -> tuple[ToolAction, ...]:
+        decision = self._recovery.inspect(task_id)
+        return tuple(self._recovery.resolution_candidates(decision))
+
+    def resolve_tool_action(
+        self,
+        *,
+        task_id: str,
+        action_id: str,
+        outcome: ToolActionResolutionOutcome,
+        reason: str,
+        evidence: str,
+        resolved_by: str,
+    ) -> ToolActionResolutionResult:
+        """Resolve one interrupted side effect without invoking the model or resuming execution."""
+
+        decision = self._recovery.inspect(task_id)
+        if decision.kind != RecoveryKind.INTERRUPTED:
+            raise PlanRecoveryError(decision)
+        candidates = self._recovery.resolution_candidates(decision)
+        action = next((item for item in candidates if item.id == action_id), None)
+        if action is None:
+            existing = self._sessions.get_tool_action(action_id)
+            if (
+                existing is None
+                or existing.task_id != task_id
+                or existing.recovery_metadata.get("plan_node_id") != decision.node_id
+                or existing.resolution is None
+            ):
+                raise ValueError(
+                    f"Tool action '{action_id}' is not an unresolved side effect of the current interrupted node."
+                )
+            action = existing
+        resolved = self._sessions.resolve_tool_action(
+            action.id,
+            outcome=outcome,
+            reason=reason,
+            evidence=evidence,
+            resolved_by=resolved_by,
+        )
+        resolution_traced = any(
+            trace.trace_type == "tool_action_resolution"
+            and trace.payload.get("action_id") == action.id
+            for trace in self._sessions.list_task_traces(task_id)
+        )
+        if not resolution_traced:
+            previous_status = (
+                resolved.resolution.previous_status
+                if resolved.resolution is not None
+                else action.status
+            )
+            self._sessions.append_task_trace(
+                task_id,
+                "tool_action_resolution",
+                {
+                    "revision_id": decision.revision_id,
+                    "node_id": decision.node_id,
+                    "action_id": action.id,
+                    "tool_call_id": action.tool_call_id,
+                    "tool": action.tool_name,
+                    "previous_status": previous_status,
+                    "outcome": outcome,
+                    "reason": reason.strip(),
+                    "evidence": evidence.strip(),
+                    "resolved_by": resolved_by.strip(),
+                    "resolved_at": resolved.resolution.resolved_at if resolved.resolution else None,
+                },
+            )
+        return ToolActionResolutionResult(
+            action=resolved,
+            decision=self._recovery.inspect(task_id),
+        )
+
     def resume(self, *, task_id: str, decision: RecoveryDecision | None = None) -> PlanTaskResult:
         """Re-inspect and explicitly resume a persisted Plan checkpoint."""
 
@@ -130,7 +215,8 @@ class PlanTaskService:
         if revision is None:
             raise PlanRecoveryError(fresh)
         if fresh.kind == RecoveryKind.INTERRUPTED:
-            if not self._recovery.rewind_is_safe(fresh):
+            unresolved = self._recovery.resolution_candidates(fresh)
+            if unresolved:
                 raise PlanRecoveryError(
                     RecoveryDecision(
                         kind=RecoveryKind.INTERRUPTED,
@@ -143,24 +229,73 @@ class PlanTaskService:
                         ),
                     )
                 )
-            revision = self._plan_store.rewind_running_node_to_pending(
-                revision.id,
-                fresh.node_id or "",
-                expected_version=revision.version,
-            )
-            self._sessions.append_task_trace(
-                task_id,
-                "plan_recovery_rewind",
-                {
-                    "plan_id": revision.graph.id,
-                    "revision": revision.graph.revision,
-                    "node_id": fresh.node_id,
-                    "from": "running",
-                    "to": "pending",
-                    "reason": fresh.reason,
-                },
-            )
+            latest_resolution = self._recovery.latest_resolution_for_node(fresh)
+            if latest_resolution is not None and latest_resolution.resolution is not None:
+                resolution = latest_resolution.resolution
+                if resolution.outcome == "succeeded":
+                    revision = self._plan_store.update_node_status(
+                        revision.id,
+                        fresh.node_id or "",
+                        "completed",
+                        result={
+                            "status": "completed",
+                            "output": resolution.evidence,
+                            "error": None,
+                            "metadata": {
+                                "recovery": "human_tool_action_resolution",
+                                "action_id": latest_resolution.id,
+                                "resolved_by": resolution.resolved_by,
+                                "reason": resolution.reason,
+                            },
+                        },
+                        expected_version=revision.version,
+                    )
+                    self._sessions.append_task_trace(
+                        task_id,
+                        "plan_recovery_accept_effect",
+                        {
+                            "plan_id": revision.graph.id,
+                            "revision": revision.graph.revision,
+                            "node_id": fresh.node_id,
+                            "action_id": latest_resolution.id,
+                            "from": "running",
+                            "to": "completed",
+                            "reason": resolution.reason,
+                            "evidence": resolution.evidence,
+                        },
+                    )
+                else:
+                    revision = self._rewind_interrupted_node(task_id, revision, fresh)
+            elif self._recovery.rewind_is_safe(fresh):
+                revision = self._rewind_interrupted_node(task_id, revision, fresh)
+            else:
+                raise PlanRecoveryError(fresh)
         return self._execute_and_reconcile(task_id, revision, auto_replan=True)
+
+    def _rewind_interrupted_node(
+        self,
+        task_id: str,
+        revision: PlanRevision,
+        decision: RecoveryDecision,
+    ) -> PlanRevision:
+        rewound = self._plan_store.rewind_running_node_to_pending(
+            revision.id,
+            decision.node_id or "",
+            expected_version=revision.version,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "plan_recovery_rewind",
+            {
+                "plan_id": rewound.graph.id,
+                "revision": rewound.graph.revision,
+                "node_id": decision.node_id,
+                "from": "running",
+                "to": "pending",
+                "reason": decision.reason,
+            },
+        )
+        return rewound
 
     def is_waiting_for_user_answer(self, *, task_id: str) -> bool:
         task = self._require_task(task_id)

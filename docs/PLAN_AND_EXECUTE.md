@@ -29,6 +29,15 @@ Requests with explicit multi-step intent can enter Plan-and-Execute through
   Replanning is bounded by the task budget (`max_replans`, currently 2).
 - If automatic Replan itself fails, the Service records the Planner/Revision
   error and closes both the Task and active PlanRevision as failed.
+- Recovery inspection is read-only and derives a `RecoveryDecision` from the
+  persisted Task, active revision, node, pending action, ToolAction, and lease
+  facts. An expired running node with a possible write side effect cannot be
+  rewound automatically.
+- An operator can attach one immutable resolution to the current interrupted
+  node's unresolved ToolAction. `failed` means the intended effect is confirmed
+  absent and explicit resume may retry the node. `succeeded` means the intended
+  effect is confirmed present; explicit resume completes that node from the
+  supplied evidence without replaying its tool call.
 
 ## Execution and audit flow
 
@@ -72,10 +81,24 @@ The important state transitions are persisted in SQLite task traces:
 | `plan_failure` | Failed and skipped nodes plus a diagnosis reason. |
 | `plan_replan` | Old and successor revisions, reason, and preserved completed nodes. |
 | `plan_replan_failed` | Automatic Replan failed; the Task and active revision were closed. |
+| `tool_action_resolution` | A human attached an immutable outcome, reason, evidence, identity, and timestamp to an unresolved side effect. |
+| `plan_recovery_rewind` | A confirmed absent effect allowed an interrupted node to return to pending before retry. |
+| `plan_recovery_accept_effect` | A confirmed completed effect advanced the interrupted node without replaying it. |
 
 `/trace` and `--task-trace-json` expose these events together with the normal
 AgentLoop model/tool traces, so a Plan run can be replayed without treating the
 PlanGraph as a separate hidden subsystem.
+
+Use `/resolve-action` to list candidates in the current Session. Resolve one
+with concrete evidence and then explicitly resume the Task:
+
+```text
+/resolve-action <action-id-prefix> failed "Original hash still present" -- src/module.py sha256:before
+/resume <task-id-prefix>
+```
+
+The non-interactive equivalent requires the full action ID plus
+`--resolution`, `--resolution-reason`, and `--resolution-evidence`.
 
 ## Acceptance checklist
 
@@ -96,6 +119,9 @@ The current implementation is accepted when all of the following hold:
 7. The targeted Plan, trace, and existing AgentLoop tests pass. Full-suite
    failures must be reported separately when they are unrelated baseline
    drift.
+8. An interrupted write remains blocked until its ToolAction is resolved;
+   confirmed absent effects may be retried, while confirmed completed effects
+   advance the node without a second tool execution.
 
 ## Deliberately deferred
 

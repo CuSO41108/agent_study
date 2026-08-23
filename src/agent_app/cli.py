@@ -6,6 +6,7 @@ import getpass
 import hashlib
 import json
 import os
+import shlex
 import sys
 import time
 from dataclasses import asdict, dataclass, is_dataclass
@@ -69,6 +70,8 @@ _REPL_HELP = """Commands:
               Pause a running task before handing it off.
   /resume [task-id-prefix]
               Resume a paused task.
+  /resolve-action [action-id-prefix succeeded|failed "reason" -- evidence]
+              List or resolve an interrupted side-effect ToolAction. Run /resume afterwards.
   /handoff [task-id-prefix]
               Continue a paused/running/completed checkpoint in a new session without copying raw history.
   /sessions [count]
@@ -111,6 +114,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/cancel", "Cancel a non-terminal task."),
     CommandSpec("/pause", "Pause a running task."),
     CommandSpec("/resume", "Resume a paused task."),
+    CommandSpec("/resolve-action", "Resolve an interrupted side effect with human evidence."),
     CommandSpec("/handoff", "Move a task into a new session."),
     CommandSpec("/sessions", "Show recent sessions and their progress."),
     CommandSpec("/progress", "Alias for /sessions."),
@@ -260,9 +264,13 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
     controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
     controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
+    controls.add_argument("--resolve-tool-action", metavar="ACTION_ID", help="Resolve an interrupted side-effect ToolAction.")
     controls.add_argument("--task-trace", metavar="TASK_ID", help="Show a persisted task trace timeline.")
     controls.add_argument("--task-trace-json", metavar="TASK_ID", help="Export a persisted task trace as JSON.")
     controls.add_argument("--watch-trace", nargs="?", const="latest", metavar="TASK_ID", help="Follow a task trace; omit TASK_ID for the active/latest task.")
+    parser.add_argument("--resolution", choices=("succeeded", "failed"), help="Human conclusion for --resolve-tool-action.")
+    parser.add_argument("--resolution-reason", help="Why the ToolAction resolution is trusted.")
+    parser.add_argument("--resolution-evidence", help="Concrete workspace or external evidence for the resolution.")
     return parser
 
 
@@ -273,6 +281,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     interactive = args.interactive or (args.prompt is None and control is None and not args.configure)
     if args.interactive and args.prompt is not None:
         print("Argument error: prompt cannot be used with --interactive.", file=sys.stderr)
+        return 2
+    resolution_values = (args.resolution, args.resolution_reason, args.resolution_evidence)
+    if args.resolve_tool_action and not all(resolution_values):
+        print(
+            "Argument error: --resolve-tool-action requires --resolution, "
+            "--resolution-reason, and --resolution-evidence.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.resolve_tool_action and any(resolution_values):
+        print("Argument error: resolution arguments require --resolve-tool-action.", file=sys.stderr)
         return 2
     if control is not None and (args.interactive or args.prompt is not None):
         print("Argument error: task controls cannot be combined with a prompt or --interactive.", file=sys.stderr)
@@ -340,6 +359,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if control is not None:
         action, task_id = control
+        if action == "resolve_action":
+            tool_action = sessions.get_tool_action(task_id)
+            if tool_action is None or tool_action.task_id is None:
+                print(f"Task error: tool action '{task_id}' was not found or has no task.", file=sys.stderr)
+                return 1
+            try:
+                resolution = plan_service.resolve_tool_action(
+                    task_id=tool_action.task_id,
+                    action_id=tool_action.id,
+                    outcome=args.resolution,
+                    reason=args.resolution_reason,
+                    evidence=args.resolution_evidence,
+                    resolved_by=f"cli:{getpass.getuser()}",
+                )
+            except (KeyError, PlanRecoveryError, RuntimeError, ValueError) as exc:
+                print(f"Task error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                json.dumps(
+                    {
+                        "action_id": resolution.action.id,
+                        "task_id": resolution.action.task_id,
+                        "status": resolution.action.status,
+                        "resolution": resolution.action.resolution,
+                        "recovery_decision": resolution.decision,
+                    },
+                    default=_serialize,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
         if task_id == "latest":
             latest = sessions.get_active_task(resolved_session_id) or sessions.get_latest_task(resolved_session_id)
             if latest is None:
@@ -647,6 +697,7 @@ def _selected_task_control(args) -> tuple[str, str] | None:
         ("cancel", "cancel_task"),
         ("approve", "approve_task"),
         ("reject", "reject_task"),
+        ("resolve_action", "resolve_tool_action"),
         ("trace", "task_trace"),
         ("trace_json", "task_trace_json"),
         ("watch_trace", "watch_trace"),
@@ -775,6 +826,14 @@ def _run_interactive_loop(
             continue
         if command == "/replan":
             _handle_replan_command(
+                raw_target=raw_target,
+                plan_service=plan_service,
+                session_service=session_service,
+                session_id=current_session_id,
+            )
+            continue
+        if command == "/resolve-action":
+            _handle_tool_action_resolution_command(
                 raw_target=raw_target,
                 plan_service=plan_service,
                 session_service=session_service,
@@ -1027,6 +1086,86 @@ def _handle_replan_command(
         print(f"Plan error: {exc}")
         return
     _print_plan_task_result(result)
+
+
+def _handle_tool_action_resolution_command(
+    *,
+    raw_target: str,
+    plan_service: PlanTaskService,
+    session_service: SessionService,
+    session_id: str,
+) -> None:
+    candidates = []
+    for task in reversed(session_service.list_tasks(session_id)):
+        if not plan_service.has_plan(task_id=task.id):
+            continue
+        try:
+            candidates.extend(plan_service.list_tool_action_resolution_candidates(task_id=task.id))
+        except (KeyError, PlanRecoveryError, RuntimeError, ValueError):
+            continue
+
+    target = raw_target.strip()
+    if not target:
+        if not candidates:
+            print("No interrupted side-effect ToolAction requires resolution in this session.")
+            return
+        print("Interrupted side-effect ToolActions:")
+        for action in candidates:
+            target_path = action.recovery_metadata.get("relative_path") or action.arguments.get("path")
+            target = f" target={target_path}" if isinstance(target_path, str) else ""
+            print(
+                f"  {action.id} [task {action.task_id}] "
+                f"{action.tool_name}:{action.status}{target}"
+            )
+        print(
+            'Resolve with: /resolve-action <action-id-prefix> <succeeded|failed> '
+            '"<reason>" -- <evidence>'
+        )
+        return
+
+    decision_part, separator, evidence = target.partition(" -- ")
+    if not separator or not evidence.strip():
+        print(
+            'Usage: /resolve-action <action-id-prefix> <succeeded|failed> '
+            '"<reason>" -- <evidence>'
+        )
+        return
+    try:
+        parts = shlex.split(decision_part, posix=False)
+    except ValueError as exc:
+        print(f"Resolution error: {exc}")
+        return
+    if len(parts) != 3 or parts[1].lower() not in {"succeeded", "failed"}:
+        print(
+            'Usage: /resolve-action <action-id-prefix> <succeeded|failed> '
+            '"<reason>" -- <evidence>'
+        )
+        return
+    action_prefix, outcome, reason = parts
+    reason = reason.strip('"\'')
+    matches = [action for action in candidates if action.id.startswith(action_prefix)]
+    if not matches:
+        print(f"No unresolved ToolAction matches prefix '{action_prefix}'.")
+        return
+    if len(matches) > 1:
+        print(f"ToolAction prefix '{action_prefix}' is ambiguous.")
+        return
+    action = matches[0]
+    try:
+        result = plan_service.resolve_tool_action(
+            task_id=action.task_id or "",
+            action_id=action.id,
+            outcome=outcome.lower(),
+            reason=reason,
+            evidence=evidence.strip(),
+            resolved_by=f"repl:{getpass.getuser()}",
+        )
+    except (KeyError, PlanRecoveryError, RuntimeError, ValueError) as exc:
+        print(f"Resolution error: {exc}")
+        return
+    print(f"Resolved ToolAction {result.action.id} as {result.action.status}.")
+    print(f"Recovery decision: {result.decision.kind.value} - {result.decision.reason}")
+    print(f"Run /resume {(action.task_id or '')[:8]} to continue without automatic side-effect replay.")
 
 
 def _print_plan_task_result(result: PlanTaskResult) -> None:

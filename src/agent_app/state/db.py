@@ -58,6 +58,7 @@ SCHEMA_STATEMENTS = (
         completed_at TEXT,
         attempt INTEGER NOT NULL DEFAULT 1,
         retry_of TEXT,
+        resolution_json TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(id)
     )
@@ -332,6 +333,7 @@ def _ensure_tool_action_columns(connection: sqlite3.Connection) -> None:
         "task_id": "TEXT",
         "attempt": "INTEGER NOT NULL DEFAULT 1",
         "retry_of": "TEXT",
+        "resolution_json": "TEXT",
     }
     for name, declaration in additions.items():
         if name not in columns:

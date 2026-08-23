@@ -30,7 +30,7 @@ from agent_app.plan.recovery import (
     RecoveryKind,
 )
 from agent_app.plan.routing import ExecutionMode, RouteDecision, route_request
-from agent_app.plan.service import PlanTaskResult, PlanTaskService
+from agent_app.plan.service import PlanTaskResult, PlanTaskService, ToolActionResolutionResult
 from agent_app.plan.store import (
     ExecutionLease,
     InvalidPlanNodeTransition,
@@ -73,6 +73,7 @@ __all__ = [
     "route_request",
     "PlanTaskResult",
     "PlanTaskService",
+    "ToolActionResolutionResult",
     "ExecutionLease",
     "InvalidPlanNodeTransition",
     "PlanRevision",

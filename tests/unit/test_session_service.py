@@ -142,6 +142,76 @@ class SessionServiceTests(unittest.TestCase):
         self.assertIsNone(stored.result)
         self.assertEqual(self.sessions.list_tool_runs(session_id), [])
 
+    def test_uncertain_tool_action_resolution_is_persisted_and_immutable(self) -> None:
+        session_id = self.sessions.create_session("session-resolution")
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="agent-1",
+            tool_call=ToolCall(id="call-resolution", name="file_write", arguments={"path": "x.py"}),
+            recovery_metadata={"side_effect": True},
+        )
+        self.sessions.mark_tool_action_executing(action.id)
+        self.sessions.complete_tool_action(
+            action.id,
+            status="uncertain",
+            tool_result=ToolResult(
+                tool_call_id="call-resolution",
+                tool_name="file_write",
+                success=False,
+                content="",
+                error="Process exited before the write result was persisted.",
+            ),
+        )
+
+        resolved = self.sessions.resolve_tool_action(
+            action.id,
+            outcome="succeeded",
+            reason="The expected file hash is present.",
+            evidence="sha256:abc123",
+            resolved_by="test-user",
+        )
+        same = self.sessions.resolve_tool_action(
+            action.id,
+            outcome="succeeded",
+            reason="The expected file hash is present.",
+            evidence="sha256:abc123",
+            resolved_by="test-user",
+        )
+
+        self.assertEqual(resolved.status, "succeeded")
+        self.assertTrue(resolved.result.success)
+        self.assertEqual(resolved.result.content, "sha256:abc123")
+        self.assertIsNotNone(resolved.resolution)
+        self.assertEqual(resolved.resolution.previous_status, "uncertain")
+        self.assertIn("before the write result", resolved.resolution.previous_result.error)
+        self.assertEqual(same, resolved)
+        with self.assertRaisesRegex(ValueError, "immutable resolution"):
+            self.sessions.resolve_tool_action(
+                action.id,
+                outcome="failed",
+                reason="Changed my mind.",
+                evidence="No file found.",
+                resolved_by="test-user",
+            )
+
+    def test_prepared_tool_action_cannot_be_resolved_as_succeeded(self) -> None:
+        session_id = self.sessions.create_session("session-prepared-resolution")
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="agent-1",
+            tool_call=ToolCall(id="prepared-write", name="file_write", arguments={"path": "x.py"}),
+            recovery_metadata={"side_effect": True},
+        )
+
+        with self.assertRaisesRegex(ValueError, "prepared but never started"):
+            self.sessions.resolve_tool_action(
+                action.id,
+                outcome="succeeded",
+                reason="Claimed success.",
+                evidence="No valid evidence.",
+                resolved_by="test-user",
+            )
+
     def test_append_subagent_run_and_list_subagent_runs(self) -> None:
         parent_session_id = self.sessions.create_session("parent-session")
         child_session_id = self.sessions.create_session("child-session")
