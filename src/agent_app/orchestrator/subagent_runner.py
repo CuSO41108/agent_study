@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from agent_app.agent.definition import AgentDefinition, WORKER_AGENT
+from agent_app.orchestrator.reviewer import (
+    ReviewResult,
+    WorkerReviewEvidence,
+    WorkerReviewer,
+    tool_results_to_evidence,
+)
+from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.session_service import SessionService
 from agent_app.tools.base import ToolExecutionContext
 from agent_app.types import ToolResult
@@ -42,7 +49,11 @@ class SubagentRunner:
         max_subagents_per_turn: int = 2,
         loop_factory: LoopFactory | None = None,
         skill_registry=None,
+        reviewer: WorkerReviewer | None = None,
+        max_repair_attempts: int = 2,
     ) -> None:
+        if max_repair_attempts < 0:
+            raise ValueError("max_repair_attempts cannot be negative.")
         self._model_client = model_client
         self._session_service = session_service
         self._workspace_root = workspace_root
@@ -60,6 +71,8 @@ class SubagentRunner:
         self._max_delegation_depth = max_delegation_depth
         self._max_subagents_per_turn = max_subagents_per_turn
         self._loop_factory = loop_factory
+        self._reviewer = reviewer
+        self._max_repair_attempts = max_repair_attempts
 
     def run(
         self,
@@ -98,11 +111,10 @@ class SubagentRunner:
             )
         context.turn_state["subagent_calls"] = current_calls + 1
 
-        child_session_id = session_service.create_session()
-        child_loop = self._build_child_loop(delegation_depth=context.delegation_depth + 1)
-        child_result = child_loop.run_turn(
-            user_input=_build_child_user_input(request),
-            session_id=child_session_id,
+        child_result = self._run_worker(
+            request=request,
+            session_service=session_service,
+            delegation_depth=context.delegation_depth + 1,
         )
         summary = _format_subagent_summary(
             child_session_id=child_result.session_id,
@@ -112,9 +124,109 @@ class SubagentRunner:
             final_text=child_result.final_text,
             stop_reason=child_result.stop_reason,
         )
-        session_service.append_subagent_run(
+        self._record_subagent_run(
+            session_service=session_service,
             parent_session_id=context.session_id or "",
             parent_tool_call_id=tool_call_id,
+            request=request,
+            child_result=child_result,
+            summary=summary,
+        )
+
+        if self._reviewer is None:
+            return _worker_tool_result(
+                tool_call_id=tool_call_id,
+                success=child_result.success,
+                summary=summary,
+                stop_reason=child_result.stop_reason,
+            )
+
+        review = self._review_worker(request=request, child_result=child_result)
+        self._record_review_trace(
+            context=context,
+            tool_call_id=tool_call_id,
+            child_session_id=child_result.session_id,
+            review=review,
+            attempt=0,
+        )
+        if review.decision == "accepted" and child_result.success:
+            return _reviewed_tool_result(tool_call_id=tool_call_id, summary=summary, review=review)
+
+        for attempt in range(1, self._max_repair_attempts + 1):
+            if not self._consume_repair_attempt(context):
+                break
+            repair_request = _repair_request(request, review)
+            repair_result = self._run_worker(
+                request=repair_request,
+                session_service=session_service,
+                delegation_depth=context.delegation_depth + 1,
+            )
+            repair_summary = _format_subagent_summary(
+                child_session_id=repair_result.session_id,
+                agent_id=self._worker_agent.id,
+                success=repair_result.success,
+                tool_runs=repair_result.tool_runs,
+                final_text=repair_result.final_text,
+                stop_reason=repair_result.stop_reason,
+            )
+            self._record_subagent_run(
+                session_service=session_service,
+                parent_session_id=context.session_id or "",
+                parent_tool_call_id=f"{tool_call_id}:repair:{attempt}",
+                request=repair_request,
+                child_result=repair_result,
+                summary=repair_summary,
+            )
+            review = self._review_worker(request=repair_request, child_result=repair_result)
+            self._record_review_trace(
+                context=context,
+                tool_call_id=tool_call_id,
+                child_session_id=repair_result.session_id,
+                review=review,
+                attempt=attempt,
+            )
+            if review.decision == "accepted" and repair_result.success:
+                return _reviewed_tool_result(
+                    tool_call_id=tool_call_id,
+                    summary=repair_summary,
+                    review=review,
+                )
+
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name="delegate_task",
+            success=False,
+            content=(
+                f"{summary}\nreview_decision={review.decision}\n"
+                f"review_feedback={_format_feedback(review)}"
+            ),
+            error=(
+                "Worker review did not accept the result. "
+                f"Repair attempts exhausted or blocked (max={self._max_repair_attempts})."
+            ),
+        )
+
+    def _run_worker(self, *, request: DelegatedTaskRequest, session_service: SessionService, delegation_depth: int):
+        child_session_id = session_service.create_session()
+        child_loop = self._build_child_loop(delegation_depth=delegation_depth)
+        return child_loop.run_turn(
+            user_input=_build_child_user_input(request),
+            session_id=child_session_id,
+        )
+
+    def _record_subagent_run(
+        self,
+        *,
+        session_service: SessionService,
+        parent_session_id: str,
+        parent_tool_call_id: str,
+        request: DelegatedTaskRequest,
+        child_result,
+        summary: str,
+    ) -> None:
+        session_service.append_subagent_run(
+            parent_session_id=parent_session_id,
+            parent_tool_call_id=parent_tool_call_id,
             child_session_id=child_result.session_id,
             agent_id=self._worker_agent.id,
             task=request.task,
@@ -122,13 +234,62 @@ class SubagentRunner:
             result_summary=summary,
         )
 
-        return ToolResult(
-            tool_call_id=tool_call_id,
-            tool_name="delegate_task",
-            success=child_result.success,
-            content=summary,
-            error=None if child_result.success else f"Subagent failed with stop reason '{child_result.stop_reason}'.",
+    def _review_worker(self, *, request: DelegatedTaskRequest, child_result) -> ReviewResult:
+        assert self._reviewer is not None
+        return self._reviewer.review(
+            WorkerReviewEvidence(
+                task=request.task,
+                success_criteria=request.success_criteria,
+                child_session_id=child_result.session_id,
+                worker_success=child_result.success,
+                final_text=child_result.final_text,
+                stop_reason=child_result.stop_reason,
+                tool_runs=tool_results_to_evidence(child_result.tool_runs),
+            )
         )
+
+    @staticmethod
+    def _record_review_trace(
+        *,
+        context: ToolExecutionContext,
+        tool_call_id: str,
+        child_session_id: str,
+        review: ReviewResult,
+        attempt: int,
+    ) -> None:
+        if context.task_id is None or context.session_service is None:
+            return
+        context.session_service.append_task_trace(
+            context.task_id,
+            "worker_review",
+            {
+                "tool_call_id": tool_call_id,
+                "child_session_id": child_session_id,
+                "attempt": attempt,
+                "decision": review.decision,
+                "feedback": list(review.feedback),
+                "evidence_refs": list(review.evidence_refs),
+                "summary": review.summary,
+            },
+        )
+
+    def _consume_repair_attempt(self, context: ToolExecutionContext) -> bool:
+        if context.task_id is None or context.session_service is None:
+            return True
+        task = context.session_service.get_task(context.task_id)
+        if task is None or task.budget.used_repair_attempts >= task.budget.max_repair_attempts:
+            return False
+        TaskRuntime(context.session_service).consume_repair_attempt(context.task_id)
+        context.session_service.append_task_trace(
+            context.task_id,
+            "worker_repair",
+            {
+                "allowed": True,
+                "attempt": task.budget.used_repair_attempts + 1,
+                "max_attempts": task.budget.max_repair_attempts,
+            },
+        )
+        return True
 
     def _build_child_loop(self, *, delegation_depth: int):
         if self._loop_factory is not None:
@@ -211,6 +372,58 @@ def _compact_summary(final_text: str | None, *, stop_reason: str | None) -> str:
         text = f"Subagent completed without a final text response (stop_reason={stop_reason or 'unknown'})."
     one_line = " ".join(text.split())
     return one_line[:400]
+
+
+def _worker_tool_result(
+    *,
+    tool_call_id: str,
+    success: bool,
+    summary: str,
+    stop_reason: str | None,
+) -> ToolResult:
+    return ToolResult(
+        tool_call_id=tool_call_id,
+        tool_name="delegate_task",
+        success=success,
+        content=summary,
+        error=None if success else f"Subagent failed with stop reason '{stop_reason}'.",
+    )
+
+
+def _reviewed_tool_result(*, tool_call_id: str, summary: str, review: ReviewResult) -> ToolResult:
+    content = "\n".join(
+        [
+            summary,
+            f"review_decision={review.decision}",
+            f"review_summary={review.summary or '(none)'}",
+        ]
+    )
+    return ToolResult(
+        tool_call_id=tool_call_id,
+        tool_name="delegate_task",
+        success=True,
+        content=content,
+        error=None,
+    )
+
+
+def _repair_request(request: DelegatedTaskRequest, review: ReviewResult) -> DelegatedTaskRequest:
+    feedback = _format_feedback(review)
+    return DelegatedTaskRequest(
+        task=(
+            f"{request.task.strip()}\n\n"
+            "Repair the previous Worker attempt using this read-only review feedback:\n"
+            f"{feedback}"
+        ),
+        success_criteria=request.success_criteria,
+        relevant_paths=request.relevant_paths,
+    )
+
+
+def _format_feedback(review: ReviewResult) -> str:
+    if review.feedback:
+        return "\n".join(f"- {item}" for item in review.feedback)
+    return review.summary or "No actionable feedback was provided."
 
 
 def normalize_relevant_paths(raw_paths: Sequence[str] | None) -> tuple[str, ...]:
