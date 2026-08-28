@@ -28,7 +28,13 @@ from agent_app.agent.definition import SINGLE_MAIN_AGENT
 from agent_app.config import AppConfig, global_config_path, load_config, save_global_model_config
 from agent_app.orchestrator.subagent_runner import SubagentRunner
 from agent_app.model.openai_compatible import OpenAICompatibleModelClient
-from agent_app.observability import export_task_trace, render_task_timeline, render_trace_events
+from agent_app.observability import (
+    ReplayModeError,
+    export_task_trace,
+    render_task_timeline,
+    render_trace_events,
+    replay_task_trace,
+)
 from agent_app.orchestrator.loop import AgentLoop
 from agent_app.plan import (
     PlanPlanner,
@@ -462,7 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--resolve-tool-action", metavar="ACTION_ID", help="Resolve an interrupted side-effect ToolAction.")
     controls.add_argument("--task-trace", metavar="TASK_ID", help="Show a persisted task trace timeline.")
     controls.add_argument("--task-trace-json", metavar="TASK_ID", help="Export a persisted task trace as JSON.")
+    controls.add_argument(
+        "--task-replay",
+        metavar="TASK_ID",
+        help="Audit or dry-replay a persisted task trace without executing tools.",
+    )
     controls.add_argument("--watch-trace", nargs="?", const="latest", metavar="TASK_ID", help="Follow a task trace; omit TASK_ID for the active/latest task.")
+    parser.add_argument(
+        "--replay-mode",
+        choices=("audit", "dry"),
+        default="audit",
+        help="Replay mode for --task-replay (default: audit).",
+    )
     parser.add_argument("--resolution", choices=("succeeded", "failed"), help="Human conclusion for --resolve-tool-action.")
     parser.add_argument("--resolution-reason", help="Why the ToolAction resolution is trusted.")
     parser.add_argument("--resolution-evidence", help="Concrete workspace or external evidence for the resolution.")
@@ -591,6 +608,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Task error: no task exists in the selected session.", file=sys.stderr)
                 return 1
             task_id = latest.id
+        if action == "replay":
+            try:
+                report = replay_task_trace(sessions, task_id, mode=args.replay_mode)
+            except (KeyError, ReplayModeError, RuntimeError, ValueError) as exc:
+                print(f"Task error: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(report, default=_serialize, ensure_ascii=False))
+            return 0 if report["result"] == "passed" else 1
         if action in {"trace", "trace_json", "watch_trace"}:
             try:
                 trace = export_task_trace(sessions, task_id)
@@ -896,6 +921,7 @@ def _selected_task_control(args) -> tuple[str, str] | None:
         ("resolve_action", "resolve_tool_action"),
         ("trace", "task_trace"),
         ("trace_json", "task_trace_json"),
+        ("replay", "task_replay"),
         ("watch_trace", "watch_trace"),
     ):
         value = getattr(args, attribute, None)

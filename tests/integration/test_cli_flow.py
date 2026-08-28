@@ -80,6 +80,40 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(exported["schema_version"], 1)
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_dry_replays_trace_without_calling_model(self, mock_from_config) -> None:
+        fake_model = _FakeModelClient([])
+        mock_from_config.return_value = fake_model
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        initialize_database(database_path)
+        sessions = SessionService(database_path)
+        session_id = sessions.create_session("dry-replay-session")
+        task = sessions.create_task(session_id, goal="dry replay this task")
+        sessions.append_task_trace(
+            task.id,
+            "tool_attempt",
+            {"tool_call_id": "read-1", "tool": "file_read", "success": True},
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main(
+                [
+                    "--task-replay",
+                    task.id,
+                    "--replay-mode",
+                    "dry",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["replay_mode"], "dry")
+        self.assertFalse(report["execution_performed"])
+        self.assertEqual(fake_model.calls, [])
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_resolves_interrupted_tool_action_through_main(self, mock_from_config) -> None:
         mock_from_config.return_value = _FakeModelClient([])
         database_path = self.workspace_root / ".agent_app" / "agent.db"

@@ -5,9 +5,15 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from agent_app.observability import export_task_trace, render_task_timeline
+from agent_app.observability import (
+    ReplayModeError,
+    export_task_trace,
+    render_task_timeline,
+    replay_task_trace,
+)
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
+from agent_app.types import ToolCall
 
 
 class ObservabilityTests(unittest.TestCase):
@@ -51,6 +57,62 @@ class ObservabilityTests(unittest.TestCase):
     def test_export_rejects_unknown_task(self) -> None:
         with self.assertRaises(KeyError):
             export_task_trace(self.sessions, "missing")
+
+    def test_audit_replay_is_read_only_and_checks_side_effect_actions(self) -> None:
+        session_id = self.sessions.create_session("replay-session")
+        task = self.sessions.create_task(session_id, goal="audit a safe file edit")
+        self.sessions.append_task_trace(
+            task.id,
+            "tool_attempt",
+            {
+                "tool_call_id": "write-1",
+                "tool": "file_write",
+                "side_effect": True,
+                "success": False,
+            },
+        )
+        action = self.sessions.prepare_tool_action(
+            session_id,
+            agent_id="main",
+            tool_call=ToolCall(
+                id="write-1",
+                name="file_write",
+                arguments={"path": "README.md", "content": "new"},
+            ),
+            recovery_metadata={"side_effect": True},
+            task_id=task.id,
+        )
+
+        before_traces = self.sessions.list_task_traces(task.id)
+        before_action = self.sessions.get_tool_action(action.id)
+        report = replay_task_trace(self.sessions, task.id, mode="audit")
+
+        self.assertEqual(report["result"], "attention_required")
+        self.assertTrue(report["read_only"])
+        self.assertFalse(report["execution_performed"])
+        self.assertEqual(report["persisted_action_count"], 1)
+        self.assertTrue(any("remains prepared" in item for item in report["findings"]))
+        self.assertEqual(self.sessions.list_task_traces(task.id), before_traces)
+        self.assertEqual(self.sessions.get_tool_action(action.id), before_action)
+
+    def test_dry_replay_never_executes_tools_and_live_mode_is_rejected(self) -> None:
+        session_id = self.sessions.create_session("dry-replay-session")
+        task = self.sessions.create_task(session_id, goal="dry replay")
+        self.sessions.append_task_trace(task.id, "model_call", {"phase": "policy"})
+        self.sessions.append_task_trace(
+            task.id,
+            "tool_attempt",
+            {"tool_call_id": "read-1", "tool": "file_read", "success": True},
+        )
+
+        report = replay_task_trace(self.sessions, task.id, mode="dry")
+
+        self.assertEqual(report["result"], "passed")
+        self.assertEqual(report["replay_mode"], "dry")
+        self.assertTrue(all(step["execution"] == "skipped" for step in report["steps"]))
+        self.assertTrue(all("never invokes" in step["reason"] for step in report["steps"]))
+        with self.assertRaises(ReplayModeError):
+            replay_task_trace(self.sessions, task.id, mode="live")
 
 
 if __name__ == "__main__":

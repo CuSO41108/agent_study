@@ -54,6 +54,8 @@ agent-app --configure
 
 **结构化观察、预算与 Trace** — 超时、冲突、拒绝、权限错误等统一为 `Observation`。模型调用、工具调用、token、活跃时间、重试和重复决策均受预算限制；`/trace`、`--task-trace` 和 `--watch-trace` 让一次任务的决策和执行过程可回放。
 
+**只读审计与 Dry Replay** — `--task-replay TASK_ID --replay-mode audit` 检查事件顺序、工具调用和副作用 `ToolAction` 是否一致；`--replay-mode dry` 只按持久化事件生成“会跳过哪些执行”的报告，不调用模型、不执行工具、不改变 SQLite。Live rerun 不属于默认回放能力，恢复必须走显式 `/resume`、人工副作用收敛和重新审批路径。
+
 **受控子代理与外部研究** — Root agent 只在边界清晰时通过 `delegate_task` 创建 worker Session，并限制深度与每回合数量。用户明确要求查阅公开资料时会触发 `web_search` 预研，来源 URL 随结果进入上下文。
 
 **评测闭环** — 固定 eval 任务覆盖文件编辑、Shell 边界和预算控制；支持 dry-run 与 live-model，保留工作区快照并输出 JSONL 报告。
@@ -147,6 +149,8 @@ agent-app --task-status TASK_ID       # 查看 task 状态
 agent-app --task-trace TASK_ID        # 渲染时间线
 agent-app --task-trace-json TASK_ID   # 导出结构化 Trace
 agent-app --watch-trace               # 跟随当前活跃/最新任务
+agent-app --task-replay TASK_ID --replay-mode audit  # 只读审计 Trace
+agent-app --task-replay TASK_ID --replay-mode dry    # 无副作用 Dry Replay
 agent-app --watch-trace TASK_ID       # 跟随指定任务
 agent-app --approve-task TASK_ID      # 批准
 agent-app --reject-task TASK_ID       # 拒绝

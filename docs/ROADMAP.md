@@ -5,4 +5,4 @@
 3. 补强评测闭环：沉淀真实 coding 任务，关联评测结果、失败样本与任务执行记录，形成可复现实验指标；Plan-and-Execute 已补齐 SQLite trace 与端到端验收。
 4. 改进任务连续性：在 summary、todo 和 evidence replay 之外，用 SQLite 结构化 Memory 记录任务摘要并支持跨 Session 字面关键词检索；不引入 Embedding 或向量检索。
 5. 优化子代理委派：继续收紧 worker agent 的边界、结果摘要和失败处理；仅在独立子任务场景评估并行与文件冲突控制。
-6. 根据真实任务需要，再评估 Trace Replay、Eval/CI 发布证据、独立 Worker 隔离和更细的 Skill/MCP 运维能力；代码 RAG、Embedding、向量数据库、共享工作区并发和完整 Multi-Agent 不属于当前实现。
+6. 已补齐只读 Trace audit replay 与无副作用 dry replay；继续完善 Eval/CI 发布证据、独立 Worker 隔离和更细的 Skill/MCP 运维能力；代码 RAG、Embedding、向量数据库、共享工作区并发和完整 Multi-Agent 不属于当前实现。

@@ -17,6 +17,17 @@ The default non-dry command reports `live_model_not_requested` skips; only
 `--live-model` calls the configured model. The runner stores each run outside
 the repository by default:
 
+Task traces can be inspected separately without running a model or tool:
+
+```powershell
+agent-app --task-replay TASK_ID --replay-mode audit
+agent-app --task-replay TASK_ID --replay-mode dry
+```
+
+`audit` checks persisted trace/action consistency. `dry` walks the recorded
+events and marks execution as skipped. Neither mode mutates the task or
+workspace; live rerun remains an explicit recovery/approval operation.
+
 ```text
 C:\tmp\agent-study-evals\<run-id>\
 ├── results.jsonl

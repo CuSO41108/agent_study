@@ -67,6 +67,7 @@ evals/
          ├─ observation:     结构化观察结果
          ├─ structured memory: SQLite 结构化记录与字面关键词匹配
          └─ session_service: 持久化 action / trace / memory_records
+         └─ observability: audit replay / dry replay（只读，不执行工具）
          └─ loop:            判断停止条件（预算/完成/失败）
 ```
 
@@ -76,5 +77,6 @@ evals/
 - **SQLite 单文件持久化**：所有 session、task、trace 和结构化 Memory 存于 `.agent_app/agent.db`
 - **乐观锁防冲突**：TaskState 的 `version` 字段保证并发安全
 - **副作用追溯**：所有写操作持久化 ToolAction + 幂等键，崩溃后可恢复
+- **Trace 回放边界**：audit replay 只检查持久化事实；dry replay 只生成跳过执行的确定性报告；live rerun 必须走显式恢复与审批流程
 - **工具安全边界**：文件路径约束在工作区；Shell 默认审批、session 前缀授权与递归删除硬拒绝；文件编辑使用检查点
 - **Memory 边界**：`memory_records` 只保存有来源的任务摘要和结构化事实，按 Session/Task 归属隔离；读取只做字面关键词匹配，不做 Embedding、向量相似度或 RAG
