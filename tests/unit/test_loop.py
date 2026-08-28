@@ -198,6 +198,30 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.tool_runs[0].tool_name, "file_read")
         self.assertEqual(len(self.sessions.list_tool_runs(result.session_id)), 1)
 
+    def test_new_session_receives_matching_structured_memory(self) -> None:
+        first_session = self.sessions.create_session("memory-source")
+        first_loop = self._build_loop(_FakeModelClient([_text_response("MCP stdio transport is ready.")]))
+
+        first_result = first_loop.run_turn(
+            user_input="record the MCP transport result",
+            session_id=first_session,
+        )
+
+        second_session = self.sessions.create_session("memory-target")
+        second_model = _FakeModelClient([_text_response("continued")])
+        second_loop = self._build_loop(second_model)
+        second_result = second_loop.run_turn(user_input="continue MCP transport work", session_id=second_session)
+
+        self.assertTrue(first_result.success)
+        self.assertTrue(second_result.success)
+        memory_messages = [
+            message
+            for message in second_model.calls[0]["messages"]
+            if "Historical structured memory" in (message.get("content") or "")
+        ]
+        self.assertEqual(len(memory_messages), 1)
+        self.assertIn("MCP stdio transport is ready.", memory_messages[0]["content"])
+
     def test_run_turn_emits_incremental_execution_events_and_persists_them(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-stream", name="file_read", arguments={"path": "README.md"})]),

@@ -31,6 +31,7 @@ class DatabaseTests(unittest.TestCase):
                           'tool_actions',
                           'tool_runs',
                           'session_context',
+                          'memory_records',
                           'turn_traces',
                           'tool_call_traces',
                           'subagent_runs',
@@ -50,6 +51,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             [row[0] for row in rows],
             [
+                "memory_records",
                 "messages",
                 "plan_revisions",
                 "session_context",

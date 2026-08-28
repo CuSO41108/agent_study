@@ -170,6 +170,32 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS memory_records (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT,
+        kind TEXT NOT NULL CHECK(kind IN ('task_summary', 'evidence', 'constraint', 'handoff')),
+        memory_key TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        source_ref TEXT,
+        importance INTEGER NOT NULL DEFAULT 0 CHECK(importance BETWEEN 0 AND 100),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id),
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
+        UNIQUE(session_id, memory_key)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory_records_task_updated
+    ON memory_records(task_id, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory_records_kind_updated
+    ON memory_records(kind, updated_at DESC)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS task_skill_activations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL,

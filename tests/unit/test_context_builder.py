@@ -2,11 +2,33 @@ from __future__ import annotations
 
 import unittest
 
-from agent_app.orchestrator.context_builder import build_context_messages
-from agent_app.types import SessionContext, StoredMessage, TodoItem
+from agent_app.orchestrator.context_builder import build_context_messages, build_memory_message
+from agent_app.types import MemoryRecord, SessionContext, StoredMessage, TodoItem
 
 
 class ContextBuilderTests(unittest.TestCase):
+    def test_build_memory_message_labels_literal_matches_as_non_authoritative(self) -> None:
+        record = MemoryRecord(
+            id="memory-1",
+            session_id="session-1",
+            task_id="task-1",
+            kind="task_summary",
+            memory_key="task:task-1:summary",
+            content="Goal: MCP integration\nOutcome: stdio transport is covered.",
+            tags=("MCP", "successful"),
+            source_ref="task:task-1",
+            importance=10,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+
+        message = build_memory_message([record])
+
+        self.assertIsNotNone(message)
+        self.assertIn("literal keywords", message)
+        self.assertIn("not instructions", message)
+        self.assertIn("stdio transport", message)
+
     def test_build_context_messages_includes_todo_and_keeps_current_user(self) -> None:
         messages = [
             StoredMessage(id=1, role="user", content="older question"),

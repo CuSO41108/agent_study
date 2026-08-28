@@ -11,7 +11,12 @@ from uuid import uuid4
 
 from agent_app.agent.definition import AgentDefinition
 from agent_app.agent.prompts import render_system_prompt
-from agent_app.orchestrator.context_builder import build_context_messages, build_evidence_message, estimate_messages_tokens
+from agent_app.orchestrator.context_builder import (
+    build_context_messages,
+    build_evidence_message,
+    build_memory_message,
+    estimate_messages_tokens,
+)
 from agent_app.runtime.task_runtime import InvalidTaskTransition, TaskRuntime
 from agent_app.state.session_service import (
     SessionService,
@@ -280,6 +285,19 @@ class AgentLoop:
             )
         tool_runs_history = self._session_service.list_tool_runs(resolved_session_id)
         evidence_message = build_evidence_message(tool_runs_history)
+        memory_records = self._session_service.search_memory_records(user_input, limit=4)
+        memory_message = build_memory_message(memory_records)
+        if memory_records:
+            self._session_service.append_task_trace(
+                task.id,
+                "memory_retrieval",
+                {
+                    "mode": "literal_keyword_overlap",
+                    "query": user_input,
+                    "record_ids": [record.id for record in memory_records],
+                    "count": len(memory_records),
+                },
+            )
         skill_index_message = self._skill_registry.model_index()
         active_skill_messages = self._active_skill_context(task.id)
         provider_messages = build_context_messages(
@@ -287,6 +305,7 @@ class AgentLoop:
             session_context=session_context,
             context_token_budget=self._context_token_budget,
             evidence_message=evidence_message,
+            memory_message=memory_message,
             skill_index_message=skill_index_message,
             active_skill_messages=active_skill_messages,
         )
@@ -1789,6 +1808,34 @@ class AgentLoop:
                     "success": success,
                 },
             )
+            if success and final_text:
+                memory_content = (
+                    f"Goal: {task.goal[:600]}\n"
+                    f"Outcome: {final_text.strip()[:2_400]}"
+                )
+                memory_tags = tuple(
+                    sorted({"task", "successful", *(tool_run.tool_name for tool_run in tool_runs)})
+                )
+                memory = self._session_service.upsert_memory_record(
+                    session_id=session_id,
+                    task_id=task.id,
+                    kind="task_summary",
+                    memory_key=f"task:{task.id}:summary",
+                    content=memory_content,
+                    tags=memory_tags,
+                    source_ref=f"task:{task.id}",
+                    importance=10,
+                )
+                self._session_service.append_task_trace(
+                    task.id,
+                    "memory_persisted",
+                    {
+                        "record_id": memory.id,
+                        "kind": memory.kind,
+                        "source_ref": memory.source_ref,
+                        "mode": "structured_task_summary",
+                    },
+                )
         except Exception as exc:
             task = self._tasks.require_task(task.id)
             if task.status not in {"completed", "failed", "cancelled", "expired"}:

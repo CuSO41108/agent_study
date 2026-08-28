@@ -76,6 +76,8 @@ _REPL_HELP = """Commands:
               Show recent sessions, todo items, task status, and pending input.
   /progress [count]
               Alias for /sessions.
+  /memory [keyword]
+              Browse structured task memory or search it by literal keywords.
   /learn <project|user>
               Generate and preview a new Skill draft from this agent-app session.
   /learn drafts
@@ -118,6 +120,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/handoff", "Move a task into a new session."),
     CommandSpec("/sessions", "Show recent sessions and their progress."),
     CommandSpec("/progress", "Alias for /sessions."),
+    CommandSpec("/memory", "Browse or search structured task memory."),
     CommandSpec("/learn", "Draft a new Skill from this session; save only after confirmation."),
     CommandSpec("/skills", "List read-only Skills from both sources."),
     CommandSpec("/skill", "Select a Skill for the next task turn."),
@@ -1044,6 +1047,9 @@ def _run_interactive_loop(
         if lowered == "/skills":
             _print_skills(skill_registry, session_service=session_service, session_id=current_session_id)
             continue
+        if command == "/memory":
+            _print_memory_records(session_service, query=raw_target.strip() or None)
+            continue
         if command == "/skill" or command.startswith("/skill:"):
             skill_name = raw_target.strip() if command == "/skill" else command.removeprefix("/skill:")
             _select_repl_skill(skill_registry, skill_name=skill_name, pending_skill_names=pending_skill_names)
@@ -1460,6 +1466,24 @@ def _print_session_overviews(
             print(f"    session todo: {_compact_repl_text(todo_text, limit=220)}")
         if overview.context.summary_text:
             print(f"    summary: {_compact_repl_text(overview.context.summary_text, limit=220)}")
+
+
+def _print_memory_records(session_service: SessionService, *, query: str | None) -> None:
+    records = (
+        session_service.search_memory_records(query, limit=12)
+        if query
+        else session_service.list_memory_records(limit=12)
+    )
+    if not records:
+        print("No structured memory records matched.")
+        return
+    heading = f"Structured memory matching '{query}':" if query else "Recent structured memory:"
+    print(heading)
+    for record in records:
+        task = f" task={record.task_id}" if record.task_id else ""
+        tags = f" tags={','.join(record.tags)}" if record.tags else ""
+        print(f"  {record.id} [{record.kind}] session={record.session_id}{task}{tags}")
+        print(f"    {_compact_repl_text(record.content, limit=320)}")
 
 
 def _compact_repl_text(value: str, *, limit: int) -> str:

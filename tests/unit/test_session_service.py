@@ -252,6 +252,71 @@ class SessionServiceTests(unittest.TestCase):
         self.assertEqual(messages[0].content, "msg-4")
         self.assertEqual(messages[-1].content, "msg-19")
 
+    def test_structured_memory_upserts_and_searches_with_literal_keywords(self) -> None:
+        first_session = self.sessions.create_session("memory-session-1")
+        task = self.sessions.create_task(first_session, goal="Implement MCP transport")
+        second_session = self.sessions.create_session("memory-session-2")
+
+        first = self.sessions.upsert_memory_record(
+            session_id=first_session,
+            task_id=task.id,
+            kind="task_summary",
+            memory_key="task:transport:summary",
+            content="MCP stdio transport is covered by a deterministic protocol test.",
+            tags=("MCP", "stdio", "successful"),
+            source_ref=f"task:{task.id}",
+            importance=10,
+        )
+        updated = self.sessions.upsert_memory_record(
+            session_id=first_session,
+            task_id=task.id,
+            kind="task_summary",
+            memory_key="task:transport:summary",
+            content="MCP stdio and HTTP transports are covered.",
+            tags=("MCP", "http"),
+            source_ref=f"task:{task.id}",
+            importance=20,
+        )
+        self.sessions.upsert_memory_record(
+            session_id=second_session,
+            task_id=None,
+            kind="constraint",
+            memory_key="constraint:no-vector-search",
+            content="Do not use vector similarity or embeddings.",
+            tags=("constraint", "no-vector"),
+            importance=100,
+        )
+
+        self.assertEqual(first.id, updated.id)
+        self.assertEqual(self.sessions.list_memory_records(task_id=task.id), [updated])
+        matches = self.sessions.search_memory_records("MCP HTTP", limit=5)
+        self.assertEqual([record.id for record in matches], [updated.id])
+        self.assertEqual(
+            self.sessions.search_memory_records("vector embeddings", limit=5)[0].memory_key,
+            "constraint:no-vector-search",
+        )
+        self.assertEqual(self.sessions.search_memory_records("second prompt", limit=5), [])
+
+    def test_structured_memory_validates_bounds_and_unknown_kind(self) -> None:
+        session_id = self.sessions.create_session("memory-validation")
+
+        with self.assertRaisesRegex(ValueError, "Unknown memory record kind"):
+            self.sessions.upsert_memory_record(
+                session_id=session_id,
+                task_id=None,
+                kind="unknown",  # type: ignore[arg-type]
+                memory_key="bad",
+                content="content",
+            )
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            self.sessions.upsert_memory_record(
+                session_id=session_id,
+                task_id=None,
+                kind="evidence",
+                memory_key="too-long",
+                content="x" * 8_001,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -10,6 +11,8 @@ from uuid import uuid4
 
 from agent_app.types import (
     AgentEvent,
+    MemoryKind,
+    MemoryRecord,
     Message,
     Observation,
     PendingAction,
@@ -1498,6 +1501,143 @@ class SessionService:
                 (session_id,),
             )
 
+    def upsert_memory_record(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None,
+        kind: MemoryKind,
+        memory_key: str,
+        content: str,
+        tags: tuple[str, ...] = (),
+        source_ref: str | None = None,
+        importance: int = 0,
+    ) -> MemoryRecord:
+        """Persist one bounded structured memory fact.
+
+        This is intentionally an exact/keyword-searchable store. It does not
+        calculate embeddings or call a model while reading memory.
+        """
+
+        if kind not in {"task_summary", "evidence", "constraint", "handoff"}:
+            raise ValueError("Unknown memory record kind.")
+        if not memory_key.strip():
+            raise ValueError("Memory record key cannot be empty.")
+        content = content.strip()
+        if not content:
+            raise ValueError("Memory record content cannot be empty.")
+        if len(content) > 8_000:
+            raise ValueError("Memory record content cannot exceed 8000 characters.")
+        if not 0 <= importance <= 100:
+            raise ValueError("Memory record importance must be between 0 and 100.")
+        normalized_tags = tuple(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))
+        if len(normalized_tags) > 16:
+            raise ValueError("A memory record cannot contain more than 16 tags.")
+        if not self.session_exists(session_id):
+            raise KeyError(session_id)
+        if task_id is not None and self.get_task(task_id) is None:
+            raise KeyError(task_id)
+
+        timestamp = _utc_now()
+        record_id = str(uuid4())
+        normalized_key = memory_key.strip()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_records (
+                    id, session_id, task_id, kind, memory_key, content,
+                    tags_json, source_ref, importance, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, memory_key) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    kind = excluded.kind,
+                    content = excluded.content,
+                    tags_json = excluded.tags_json,
+                    source_ref = excluded.source_ref,
+                    importance = excluded.importance,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record_id,
+                    session_id,
+                    task_id,
+                    kind,
+                    normalized_key,
+                    content,
+                    _json_dumps(list(normalized_tags)),
+                    source_ref,
+                    importance,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                _MEMORY_RECORD_SELECT + " WHERE session_id = ? AND memory_key = ? LIMIT 1",
+                (session_id, normalized_key),
+            ).fetchone()
+            connection.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (timestamp, session_id))
+        assert row is not None
+        return _memory_record_from_row(row)
+
+    def list_memory_records(
+        self,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        kind: MemoryKind | None = None,
+        limit: int = 24,
+    ) -> list[MemoryRecord]:
+        if not 1 <= limit <= 100:
+            raise ValueError("Memory record limit must be between 1 and 100.")
+        if kind is not None and kind not in {"task_summary", "evidence", "constraint", "handoff"}:
+            raise ValueError("Unknown memory record kind.")
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            parameters.append(session_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            parameters.append(task_id)
+        if kind is not None:
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                _MEMORY_RECORD_SELECT + where + " ORDER BY importance DESC, updated_at DESC, id ASC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return [_memory_record_from_row(row) for row in rows]
+
+    def search_memory_records(
+        self,
+        query: str,
+        *,
+        session_id: str | None = None,
+        limit: int = 8,
+    ) -> list[MemoryRecord]:
+        """Search memory using deterministic literal token overlap only."""
+
+        if not 1 <= limit <= 20:
+            raise ValueError("Memory search limit must be between 1 and 20.")
+        tokens = _memory_search_tokens(query)
+        if not tokens:
+            return []
+        candidates = self.list_memory_records(session_id=session_id, limit=100)
+        scored: list[tuple[int, MemoryRecord]] = []
+        normalized_query = query.casefold().strip()
+        for record in candidates:
+            searchable = " ".join((record.memory_key, record.content, *record.tags)).casefold()
+            score = sum(4 if token in record.tags else 1 for token in tokens if token in searchable)
+            if normalized_query and normalized_query in searchable:
+                score += 5
+            if score:
+                scored.append((score, record))
+        scored.sort(key=lambda item: (-item[0], -item[1].importance, item[1].updated_at, item[1].id))
+        return [record for _score, record in scored[:limit]]
+
     def append_turn_trace(
         self,
         session_id: str,
@@ -1610,6 +1750,48 @@ class SessionService:
             )
             for row in rows
         ]
+
+
+_MEMORY_RECORD_SELECT = """
+SELECT id, session_id, task_id, kind, memory_key, content, tags_json,
+       source_ref, importance, created_at, updated_at
+FROM memory_records
+"""
+
+
+def _memory_record_from_row(row) -> MemoryRecord:
+    return MemoryRecord(
+        id=row[0],
+        session_id=row[1],
+        task_id=row[2],
+        kind=row[3],
+        memory_key=row[4],
+        content=row[5],
+        tags=tuple(json.loads(row[6])),
+        source_ref=row[7],
+        importance=int(row[8]),
+        created_at=row[9],
+        updated_at=row[10],
+    )
+
+
+def _memory_search_tokens(value: str) -> tuple[str, ...]:
+    stopwords = {
+        "a", "an", "and", "are", "for", "from", "how", "in", "is", "of", "on",
+        "or", "please", "prompt", "task", "the", "this", "to", "what", "with",
+    }
+    ascii_tokens = [
+        token
+        for token in re.findall(r"[a-z0-9_./-]{2,}", value.casefold())
+        if token not in stopwords
+    ]
+    cjk_sequences = re.findall(r"[\u4e00-\u9fff]+", value)
+    cjk_tokens = [
+        sequence[index:index + 2]
+        for sequence in cjk_sequences
+        for index in range(max(1, len(sequence) - 1))
+    ]
+    return tuple(dict.fromkeys((*ascii_tokens, *cjk_tokens)))
 
 
 _TOOL_ACTION_SELECT = """

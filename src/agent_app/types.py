@@ -99,6 +99,26 @@ class SessionContext:
     todo_items: tuple[TodoItem, ...] = ()
 
 
+MemoryKind = Literal["task_summary", "evidence", "constraint", "handoff"]
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryRecord:
+    """One explicitly structured, keyword-searchable long-term memory record."""
+
+    id: str
+    session_id: str
+    task_id: str | None
+    kind: MemoryKind
+    memory_key: str
+    content: str
+    tags: tuple[str, ...]
+    source_ref: str | None
+    importance: int
+    created_at: str
+    updated_at: str
+
+
 TaskStatus = Literal[
     "created",
     "running",
