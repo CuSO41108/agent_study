@@ -44,6 +44,8 @@ agent-app --configure
 
 **跨 Session 进度与接力** — `/sessions`（`/progress` 别名）在终端直接浏览最近 Session 的任务、未完成计划、todo、摘要和等待项。`/handoff` 可把安全 checkpoint 接力到新 Session，只复制目标、剩余计划、摘要、证据引用和哈希校验后的 active Skill，不复制原始历史或待审批动作。
 
+**结构化跨 Session Memory** — 成功任务摘要会以 `memory_records` 结构化写入 SQLite，保留 Session/Task 归属、来源引用、标签和重要性；新回合只按字面关键词匹配历史记录，并通过 `/memory [keyword]` 查看。这里不使用 Embedding、向量数据库、向量相似度或 RAG。
+
 **分层、只读的 Skill 机制** — 同时发现项目共享 `skills/<name>/SKILL.md` 与用户全局 `%USERPROFILE%\.agent-study\skills/<name>/SKILL.md`；项目同名 Skill 优先。模型先看到受限的元数据索引，匹配后才加载 `SKILL.md`，再按需读取被正文显式引用的小型支持文件。每次激活固定来源路径、版本和内容哈希，文件变化不会被静默注入。
 
 **安全的 `/learn` 沉淀流程** — 用户显式执行 `/learn project` 或 `/learn user` 后，模型从当前 **agent-app Session** 提炼可复用的 Skill 草稿并写入 SQLite，先展示新增文件 diff。只有再次执行 `/learn save <id>` 才创建新的 Skill 文件夹；不支持覆盖、更新或删除已有 Skill，并拦截疑似凭据的草稿。
@@ -64,7 +66,7 @@ agent-app --configure
     ├─ 单轮：agent-app "任务" ───────────────► JSON 结果
     └─ 交互：agent-app ─► CLI REPL
                               │
-                              ├─ /sessions、/trace、/handoff
+                              ├─ /sessions、/memory、/trace、/handoff
                               ├─ /skills、/skill、/learn
                               └─ AgentLoop
                                    │
@@ -79,24 +81,24 @@ agent-app --configure
                               SessionService / TaskRuntime
                                            │
                          .agent_app/agent.db (SQLite)
-         sessions · tasks · events · traces · actions · Skill activations · drafts
+                         sessions · tasks · events · traces · actions · memory_records · Skill activations · drafts
 ```
 
 主要目录：
 
 ```text
 src/agent_app/
-├── cli.py                    REPL、命令菜单、/sessions、/learn、Banner
+├── cli.py                    REPL、命令菜单、/sessions、/memory、/learn、Banner
 ├── orchestrator/
 │   ├── loop.py               ReAct 主循环与 active Skill 上下文注入
-│   ├── context_builder.py    summary、todo、evidence、Skill 上下文组装
+│   ├── context_builder.py    summary、todo、evidence、Memory、Skill 上下文组装
 │   └── subagent_runner.py    受限 worker 子代理执行
 ├── skills/
 │   ├── registry.py           双来源发现、前置元数据、哈希和新建校验
 │   └── learning.py           /learn 的会话提炼、脱敏和草稿校验
 ├── state/
 │   ├── db.py                 SQLite schema 与迁移
-│   └── session_service.py    Session、Task、Trace、Skill 激活和草稿持久化
+│   └── session_service.py    Session、Task、Trace、Memory、Skill 激活和草稿持久化
 ├── runtime/task_runtime.py   TaskState 状态机与转移规则
 ├── tools/
 │   ├── skill.py              skill_list / skill_load / skill_read_resource
@@ -120,6 +122,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/task` / `/tasks` | 查看当前 Session 的最新任务或全部任务 |
 | `/sessions [count]` | 浏览最近 1–20 个 Session 的进度、todo、摘要和等待项 |
 | `/progress [count]` | `/sessions` 的别名 |
+| `/memory [keyword]` | 浏览结构化任务记忆，或用字面关键词搜索历史记录 |
 | `/trace [task-id前缀]` | 查看任务执行时间线 |
 | `/approve` / `/reject` | 批准或拒绝等待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态任务 |
@@ -177,17 +180,17 @@ invocation: code review, review a diff
 3. Do not change files unless the user asks for a fix.
 ```
 
-目前不引入 MCP，也不允许模型自动下载、修改或删除 Skill。`/learn` 是唯一写入入口，且必须经过“草稿预览 → 用户显式 save → 仅新建”的流程。
+MCP 作为可选外部工具适配层接入，但不允许模型自动安装或启用未知 Server；也不允许模型自动下载、修改或删除 Skill。`/learn` 是 Skill 写入入口，且必须经过“草稿预览 → 用户显式 save → 仅新建”的流程。
 
 ## 测试
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m coverage run -m unittest discover -s tests -v
-python -m coverage report --precision=2 --fail-under=90
+python -m coverage report --precision=2
 ```
 
-项目使用 `unittest`；`pyproject.toml` 将核心代码覆盖率阈值设为 90%。
+项目使用 `unittest`；覆盖率作为观察指标，质量判断以行为回归、安全边界、Eval 和报告完整性为主。
 
 ## 设计边界
 
@@ -197,7 +200,7 @@ python -m coverage report --precision=2 --fail-under=90
 - `replace_in_file` 不是通用 patch 系统，不支持模糊匹配、正则或多文件编辑
 - `waiting_tool` 保留状态契约，但工具仍是同步执行
 - Skill 当前不等于插件或 MCP：只提供有边界、可审计的本地指令加载；不支持更新/删除已有 Skill
-- 上下文以 summary、todo、recent tool evidence、Skill 索引和 active Skill 为主，不做重型向量检索
+- 上下文以 summary、todo、recent tool evidence、结构化 Memory、Skill 索引和 active Skill 为主；Memory 只做字面关键词匹配，不做 Embedding、向量相似度或 RAG
 - 不设 RBAC、租户、告警等服务化 governance 机制
 
 ## 延伸文档

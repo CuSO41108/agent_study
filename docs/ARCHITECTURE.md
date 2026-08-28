@@ -12,7 +12,7 @@ src/agent_app/
 │   └── prompts.py             系统提示模板
 ├── orchestrator/
 │   ├── loop.py                ReAct 主循环：模型调用、工具执行、观察处理
-│   ├── context_builder.py     上下文组装（summary、todo、evidence replay）
+│   ├── context_builder.py     上下文组装（summary、todo、evidence、Memory）
 │   └── subagent_runner.py     子代理委派执行
 ├── tools/
 │   ├── base.py                工具基类、Observation 构造、schema 校验
@@ -29,7 +29,7 @@ src/agent_app/
 │   └── _path_utils.py         工作区路径解析与安全校验
 ├── state/
 │   ├── db.py                  SQLite schema 初始化与迁移
-│   └── session_service.py     Session/Task/Event/Action/Trace 持久化
+│   └── session_service.py     Session/Task/Event/Action/Trace/Memory 持久化
 ├── runtime/
 │   ├── task_runtime.py        TaskState 状态机
 │   ├── shell_runtime.py       Shell 生命周期、超时/中断与进程树清理
@@ -57,7 +57,7 @@ evals/
                                  │
     AgentLoop.run_turn()  ◄──────┘
          │
-         ├─ context_builder: 组装 messages (summary + todo + evidence)
+         ├─ context_builder: 组装 messages (summary + todo + evidence + Memory)
          ├─ model_client:    调用 LLM
          ├─ approval:        分类工具调用
          │    ├─ allow   → 直接执行
@@ -65,14 +65,16 @@ evals/
          │    └─ deny    → 拒绝并记录原因
          ├─ tool.execute():  执行工具
          ├─ observation:     结构化观察结果
-         ├─ session_service: 持久化 action / trace
+         ├─ structured memory: SQLite 结构化记录与字面关键词匹配
+         └─ session_service: 持久化 action / trace / memory_records
          └─ loop:            判断停止条件（预算/完成/失败）
 ```
 
 ## 设计原则
 
 - **不引入外部编排框架**：ReAct 循环由项目内 `AgentLoop` 实现
-- **SQLite 单文件持久化**：所有 session、task、trace 存于 `.agent_app/agent.db`
+- **SQLite 单文件持久化**：所有 session、task、trace 和结构化 Memory 存于 `.agent_app/agent.db`
 - **乐观锁防冲突**：TaskState 的 `version` 字段保证并发安全
 - **副作用追溯**：所有写操作持久化 ToolAction + 幂等键，崩溃后可恢复
 - **工具安全边界**：文件路径约束在工作区；Shell 默认审批、session 前缀授权与递归删除硬拒绝；文件编辑使用检查点
+- **Memory 边界**：`memory_records` 只保存有来源的任务摘要和结构化事实，按 Session/Task 归属隔离；读取只做字面关键词匹配，不做 Embedding、向量相似度或 RAG

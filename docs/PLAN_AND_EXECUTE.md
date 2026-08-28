@@ -138,9 +138,11 @@ The current implementation is accepted when all of the following hold:
 
 ## Deliberately deferred
 
-MCP, vector databases, code RAG, multiple agents, multiple processes editing
-one workspace, and end-to-end parallel AgentLoop node execution remain later
-capabilities. The scheduler's generic resource-safe batch boundary is already
-implemented, but it is not implied that the current shared-task AgentLoop
-adapter executes those batches concurrently. None of this roadmap introduces
-RAG, Embedding, vector similarity, or a vector database.
+MCP transport/tool adaptation and SQLite structured task Memory are now
+implemented as separate capability layers. Vector databases, code RAG,
+Embedding, multiple processes editing one workspace, and end-to-end parallel
+AgentLoop node execution remain outside the current implementation. The
+scheduler's generic resource-safe batch boundary is already implemented, but
+it is not implied that the current shared-task AgentLoop adapter executes those
+batches concurrently. None of this roadmap introduces RAG, Embedding, vector
+similarity, or a vector database.

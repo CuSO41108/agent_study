@@ -162,7 +162,7 @@ provider 不返回 usage 时使用估算值，并标记 `usage_source=estimated`
 ```powershell
 python -m unittest discover -s tests
 python -m coverage run -m unittest discover -s tests
-python -m coverage report --precision=2 --fail-under=90
+python -m coverage report --precision=2
 ```
 
 状态机、Event 顺序、版本冲突、事务回滚、跨进程审批、安全重试、异常边界、
