@@ -69,6 +69,30 @@ class EvalScorerTests(unittest.TestCase):
             }.issubset(case_ids)
         )
 
+    def test_runner_schema_only_validates_without_creating_run(self) -> None:
+        root = _make_workspace("eval_schema_only")
+        run_root = root / "runs"
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = eval_runner_main([
+                    "--schema-only",
+                    "--gate",
+                    "--case",
+                    "fix_single_file_001",
+                    "--run-root",
+                    str(run_root),
+                ])
+
+            output = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(output["schema_version"], 2)
+            self.assertEqual(output["validated_case_count"], 1)
+            self.assertEqual(output["case_ids"], ["fix_single_file_001"])
+            self.assertFalse(run_root.exists())
+        finally:
+            _cleanup_explicit(files=[], dirs=[root])
+
     def test_v2_schema_requires_version_and_positive_repeat(self) -> None:
         case = {
             "schema_version": 2,
@@ -647,6 +671,10 @@ class EvalScorerTests(unittest.TestCase):
         )
 
         self.assertNotIn("--live-model", pr_workflow)
+        self.assertIn("python -m coverage run -m unittest discover -s tests -v", pr_workflow)
+        self.assertIn("--schema-only", pr_workflow)
+        self.assertIn("python scripts/check_privacy.py", pr_workflow)
+        self.assertIn("python -m coverage report --precision=2", pr_workflow)
         self.assertFalse(
             (repo_root / ".github" / "workflows" / "eval-live.yml").exists()
         )

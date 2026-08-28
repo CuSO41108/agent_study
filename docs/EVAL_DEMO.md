@@ -6,6 +6,7 @@ than a one-off CLI demo.
 ## Run The Eval Suite
 
 ```powershell
+python -m evals.runner --schema-only --gate
 python -m evals.runner --dry-run
 python -m evals.runner
 python -m evals.runner --live-model
@@ -54,6 +55,10 @@ repository changes. If the provider reports exhausted quota, the suite stops,
 prints an instruction to top up the account, records `quota_exhausted`, and
 returns exit code 2. Rate limiting without quota exhaustion remains a normal
 provider error.
+
+`--schema-only` validates every selected Eval case and exits before creating a
+run directory. Coverage is reported for observability only; it is not a hard
+percentage gate.
 
 ## Eval Case Schema v2
 

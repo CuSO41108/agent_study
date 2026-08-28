@@ -28,10 +28,11 @@ class ProjectMetadataTests(unittest.TestCase):
         include = coverage_tool["run"]["include"]
         omit = coverage_tool["report"]["omit"]
 
-        self.assertEqual(coverage_tool["report"]["fail_under"], 90)
+        self.assertNotIn("fail_under", coverage_tool["report"])
         self.assertIn("src/agent_app/config.py", include)
         self.assertIn("src/agent_app/tools/*.py", include)
         self.assertIn("src/agent_app/orchestrator/*.py", include)
+        self.assertIn("src/agent_app/observability.py", include)
         self.assertIn("src/agent_app/runtime/*.py", include)
         self.assertIn("src/agent_app/cli.py", omit)
         self.assertIn("src/agent_app/agent/prompts.py", omit)

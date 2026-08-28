@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write a review-pending baseline candidate for completed attempts.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Validate cases and emit skipped records without calling a model.")
+    parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="Validate selected Eval case schemas and exit without creating a run or calling a model.",
+    )
     parser.add_argument("--live-model", action="store_true", help="Actually call the configured model. Omit for non-network reporting.")
     return parser
 
@@ -71,6 +76,18 @@ def main(argv: list[str] | None = None) -> int:
         cases = [case for case in cases if case["id"] == args.case_id]
     if args.limit is not None:
         cases = cases[: max(0, args.limit)]
+    if args.schema_only:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "validated_case_count": len(cases),
+                    "case_ids": [case["id"] for case in cases],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
 
     run_id = _run_id()
     run_root = _resolve_path(repo_root, args.run_root) if args.run_root else default_run_root()
