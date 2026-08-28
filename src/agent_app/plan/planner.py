@@ -27,7 +27,11 @@ class PlanPlanner:
                 "with no Markdown and no commentary. The object must contain id, revision=1, "
                 "goal, and nodes. Each node must use exactly one kind: inspect, edit, run, "
                 "or verify. Each node must include objective, depends_on, allowed_tools, "
-                "acceptance, and status=pending. Use a static acyclic dependency graph. "
+                "acceptance, and status=pending. It may include resources, an array of "
+                "{key,mode} claims where key is workspace or file:<workspace-relative-path> "
+                "and mode is read, write, or exclusive. Only declare a narrower resource "
+                "when it is known; omitted resources use a conservative kind-based fallback. "
+                "Use a static acyclic dependency graph. "
                 "Allowed tools by kind are: inspect=file_read,code_search,web_search,skill_list,"
                 "skill_load,skill_read_resource; edit=file_read,code_search,replace_in_file,file_write; "
                 "run=shell; verify=file_read,code_search,shell. Keep the plan as small as possible."
@@ -65,7 +69,9 @@ class PlanPlanner:
                 "You are revising a failed coding-task plan. Return only one JSON object. "
                 "Keep completed nodes unchanged, repair or replace only unfinished work, "
                 "and use a static acyclic graph with the same plan id and a higher revision. "
-                "Use only node kinds inspect, edit, run, verify and their allowed tool boundaries."
+                "Use only node kinds inspect, edit, run, verify and their allowed tool boundaries. "
+                "Preserve or conservatively update optional resource claims using {key,mode}; "
+                "never infer parallel safety for an unknown side effect."
             ),
             messages=[
                 {

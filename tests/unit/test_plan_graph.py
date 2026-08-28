@@ -7,6 +7,9 @@ from agent_app.plan.graph import (
     parse_plan_graph,
     plan_graph_to_dict,
     ready_node_ids,
+    resource_claims_for_node,
+    resources_conflict,
+    select_non_conflicting_nodes,
     topological_order,
     validate_plan_graph,
 )
@@ -156,6 +159,75 @@ class PlanGraphTests(unittest.TestCase):
         errors = validate_plan_graph(payload)
 
         self.assertIn("node 'inspect' of kind 'inspect' cannot use tool 'delegate_task'", errors)
+
+    def test_resource_claims_round_trip_and_conservative_defaults(self) -> None:
+        payload = _plan_payload(
+            nodes=[
+                {
+                    "id": "read-a",
+                    "kind": "inspect",
+                    "objective": "Read file A.",
+                    "depends_on": [],
+                    "allowed_tools": ["file_read"],
+                    "acceptance": ["File A was read."],
+                    "status": "pending",
+                    "resources": [{"key": "file:src/A.py", "mode": "read"}],
+                },
+                {
+                    "id": "write-b",
+                    "kind": "edit",
+                    "objective": "Write file B.",
+                    "depends_on": [],
+                    "allowed_tools": ["file_write"],
+                    "acceptance": ["File B was written."],
+                    "status": "pending",
+                    "resources": [{"key": "file:src/B.py", "mode": "write"}],
+                },
+            ]
+        )
+        graph = parse_plan_graph(payload)
+
+        self.assertEqual(plan_graph_to_dict(graph), payload)
+        self.assertEqual(resource_claims_for_node(graph.nodes[0])[0].normalized_key, "file:src/a.py")
+        self.assertFalse(resources_conflict(graph.nodes[0], graph.nodes[1]))
+        self.assertEqual(select_non_conflicting_nodes(graph, ("read-a", "write-b"), limit=2), ("read-a", "write-b"))
+
+        default_edit = parse_plan_graph(
+            _plan_payload(
+                nodes=[
+                    {
+                        "id": "edit-a",
+                        "kind": "edit",
+                        "objective": "Edit A.",
+                        "depends_on": [],
+                        "allowed_tools": ["file_write"],
+                        "acceptance": ["A is edited."],
+                        "status": "pending",
+                    },
+                    {
+                        "id": "edit-b",
+                        "kind": "edit",
+                        "objective": "Edit B.",
+                        "depends_on": [],
+                        "allowed_tools": ["file_write"],
+                        "acceptance": ["B is edited."],
+                        "status": "pending",
+                    },
+                ]
+            )
+        )
+        self.assertTrue(resources_conflict(default_edit.nodes[0], default_edit.nodes[1]))
+
+    def test_duplicate_normalized_resource_keys_are_rejected(self) -> None:
+        payload = _plan_payload()
+        payload["nodes"][0]["resources"] = [
+            {"key": "file:src/A.py", "mode": "read"},
+            {"key": "file:src\\A.py", "mode": "write"},
+        ]
+
+        errors = validate_plan_graph(payload)
+
+        self.assertIn("node 'inspect' declares duplicate resource 'file:src\\A.py'", errors)
 
     def test_all_supported_node_statuses_are_contract_values(self) -> None:
         for status in ("pending", "running", "waiting_approval", "completed", "failed", "skipped"):

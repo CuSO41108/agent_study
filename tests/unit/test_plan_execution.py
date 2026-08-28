@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import threading
+import time
 import unittest
 from pathlib import Path
 from uuid import uuid4
@@ -49,6 +51,49 @@ def _graph(*, revision: int = 1, statuses: dict[str, str] | None = None):
                     "allowed_tools": ["shell"],
                     "acceptance": ["The verification passes."],
                     "status": statuses.get("verify", "pending"),
+                },
+            ],
+        }
+    )
+
+
+def _independent_graph(*, kind: str = "inspect", resources: list[list[dict[str, str]]] | None = None):
+    allowed_tools = "file_read" if kind == "inspect" else "file_write"
+    node_resources = resources or [[], []]
+    return parse_plan_graph(
+        {
+            "id": "parallel-plan",
+            "revision": 1,
+            "goal": "Execute independent nodes safely.",
+            "nodes": [
+                {
+                    "id": f"{kind}-a",
+                    "kind": kind,
+                    "objective": f"Execute {kind} node A.",
+                    "depends_on": [],
+                    "allowed_tools": [allowed_tools],
+                    "acceptance": ["Node A completed."],
+                    "status": "pending",
+                    **({"resources": node_resources[0]} if node_resources[0] else {}),
+                },
+                {
+                    "id": f"{kind}-b",
+                    "kind": kind,
+                    "objective": f"Execute {kind} node B.",
+                    "depends_on": [],
+                    "allowed_tools": [allowed_tools],
+                    "acceptance": ["Node B completed."],
+                    "status": "pending",
+                    **({"resources": node_resources[1]} if node_resources[1] else {}),
+                },
+                {
+                    "id": "verify",
+                    "kind": "verify",
+                    "objective": "Verify both independent nodes.",
+                    "depends_on": [f"{kind}-a", f"{kind}-b"],
+                    "allowed_tools": ["file_read"],
+                    "acceptance": ["Both nodes completed."],
+                    "status": "pending",
                 },
             ],
         }
@@ -110,6 +155,44 @@ class PlanExecutionTests(unittest.TestCase):
         )
         self.assertEqual(result.revision.node_results["verify"]["output"], "done:verify")
         self.assertEqual(self.store.get_revision_by_id(revision.id).status, "completed")
+
+    def test_executor_runs_independent_read_nodes_concurrently(self) -> None:
+        self.store.create_revision(self.task.id, _independent_graph())
+        entered = threading.Barrier(2)
+        calls: list[str] = []
+
+        def runner(context):
+            if context.node.id in {"inspect-a", "inspect-b"}:
+                entered.wait(timeout=2)
+            calls.append(context.node.id)
+            return NodeExecutionResult("completed", output=f"done:{context.node.id}")
+
+        result = PlanExecutor(self.store, runner, max_concurrency=2).execute(task_id=self.task.id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(set(calls[:2]), {"inspect-a", "inspect-b"})
+        self.assertEqual(calls[-1], "verify")
+
+    def test_executor_keeps_unclaimed_side_effecting_nodes_serial(self) -> None:
+        self.store.create_revision(self.task.id, _independent_graph(kind="edit"))
+        state_lock = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        def runner(context):
+            nonlocal active, peak_active
+            with state_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with state_lock:
+                active -= 1
+            return NodeExecutionResult("completed", output=f"done:{context.node.id}")
+
+        result = PlanExecutor(self.store, runner, max_concurrency=2).execute(task_id=self.task.id)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(peak_active, 1)
 
     def test_failed_node_skips_dependents_and_fails_revision(self) -> None:
         self.store.create_revision(self.task.id, _graph())

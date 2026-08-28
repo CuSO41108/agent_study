@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
 from agent_app.plan.executor import PlanExecutionResult, PlanExecutor, PlanNodeContext
+from agent_app.plan.graph import resource_claims_for_node
 from agent_app.plan.planner import PlanPlanner
 from agent_app.plan.recovery import (
     PlanRecoveryError,
@@ -644,6 +645,10 @@ class PlanTaskService:
                     "kind": node.kind,
                     "objective": node.objective,
                     "acceptance": list(node.acceptance),
+                    "resources": [
+                        {"key": resource.key, "mode": resource.mode}
+                        for resource in resource_claims_for_node(node)
+                    ],
                     "from_status": previous.status,
                     "to_status": node.status,
                     "executed": node.id in execution.executed_node_ids,
@@ -702,6 +707,10 @@ def _plan_revision_payload(revision: PlanRevision) -> dict[str, Any]:
                 "allowed_tools": list(node.allowed_tools),
                 "objective": node.objective,
                 "acceptance": list(node.acceptance),
+                "resources": [
+                    {"key": resource.key, "mode": resource.mode}
+                    for resource in resource_claims_for_node(node)
+                ],
             }
             for node in revision.graph.nodes
         ],

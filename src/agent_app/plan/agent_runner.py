@@ -7,7 +7,14 @@ from agent_app.plan.executor import NodeExecutionResult, PlanNodeContext
 
 
 class PlanAgentNodeRunner:
-    """Adapt the existing AgentLoop to one bounded PlanGraph node."""
+    """Adapt the existing AgentLoop to one bounded PlanGraph node.
+
+    AgentLoop currently owns mutable turn state and the parent TaskRuntime has
+    one optimistic version stream. Keep this adapter serial until a later
+    isolated worker/task implementation explicitly opts into concurrency.
+    """
+
+    supports_concurrent = False
 
     def __init__(self, agent_loop: Any) -> None:
         self._agent_loop = agent_loop

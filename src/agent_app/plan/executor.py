@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from uuid import uuid4
 
-from agent_app.plan.graph import PlanNode, ready_node_ids
+from agent_app.plan.graph import PlanNode, ready_node_ids, select_non_conflicting_nodes
 from agent_app.plan.store import PlanRevision, PlanRevisionLeaseConflict, PlanStore
 
 
@@ -57,11 +58,13 @@ NodeRunner = Callable[[PlanNodeContext], NodeExecutionResult]
 
 
 class PlanExecutor:
-    """Execute a validated PlanGraph one ready node at a time.
+    """Execute a validated PlanGraph in resource-safe ready batches.
 
     The runner is deliberately injected. The first implementation therefore
     provides a safe scheduling/persistence boundary without embedding another
-    ReAct loop or changing the existing AgentLoop entry point.
+    ReAct loop or changing the existing AgentLoop entry point. Runners may set
+    ``supports_concurrent = False`` when their own state model is not
+    re-entrant; those runners are safely scheduled one node at a time.
     """
 
     def __init__(
@@ -71,11 +74,15 @@ class PlanExecutor:
         *,
         lease_owner: str | None = None,
         lease_ttl_seconds: float = 60.0,
+        max_concurrency: int = 4,
     ) -> None:
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive.")
         self._store = store
         self._runner = runner
         self._lease_owner = lease_owner or str(uuid4())
         self._lease_ttl_seconds = lease_ttl_seconds
+        self._max_concurrency = max_concurrency
 
     def execute(self, *, task_id: str, revision: int | None = None) -> PlanExecutionResult:
         plan = self._load_plan(task_id, revision)
@@ -93,7 +100,7 @@ class PlanExecutor:
         )
         result: PlanExecutionResult | None = None
         try:
-            result = self._execute_serial(task_id=task_id, plan=leased)
+            result = self._execute(task_id=task_id, plan=leased)
         finally:
             try:
                 self._store.release_execution_lease(
@@ -108,111 +115,124 @@ class PlanExecutor:
         latest = self._store.get_revision_by_id(result.revision.id)
         return replace(result, revision=latest)
 
-    def _execute_serial(self, *, task_id: str, plan: PlanRevision) -> PlanExecutionResult:
+    def _execute(self, *, task_id: str, plan: PlanRevision) -> PlanExecutionResult:
         executed: list[str] = []
 
-        while True:
-            plan = self._store.heartbeat_execution_lease(
-                plan.id,
-                owner=self._lease_owner,
-                lease_version=plan.execution_lease.version,
-                ttl_seconds=self._lease_ttl_seconds,
-            )
-            failed_node = _first_node_with_status(plan, "failed")
-            if failed_node is not None:
-                return PlanExecutionResult(
-                    "failed",
-                    plan,
-                    tuple(executed),
-                    failure_reason=(
-                        str(plan.node_results.get(failed_node.id, {}).get("error"))
-                        or f"node '{failed_node.id}' failed"
-                    ),
-                )
-            waiting_node = _first_node_with_status(plan, "waiting_approval")
-            if waiting_node is not None:
-                return PlanExecutionResult(
-                    "waiting_approval",
-                    plan,
-                    tuple(executed),
-                    waiting_node_id=waiting_node.id,
-                )
-            running_node = _first_node_with_status(plan, "running")
-            if running_node is not None:
-                return PlanExecutionResult(
-                    "blocked",
-                    plan,
-                    tuple(executed),
-                    failure_reason=f"node '{running_node.id}' was already running; inspect before retrying",
-                )
+        runner_limit = self._max_concurrency
+        if not getattr(self._runner, "supports_concurrent", True):
+            runner_limit = 1
 
-            ready = ready_node_ids(plan.graph)
-            if ready:
-                node_id = ready[0]
-                running_plan = self._store.update_node_status(
+        with ThreadPoolExecutor(max_workers=runner_limit, thread_name_prefix="plan-node") as pool:
+            while True:
+                plan = self._store.heartbeat_execution_lease(
                     plan.id,
-                    node_id,
-                    "running",
-                    expected_version=plan.version,
-                )
-                node = running_plan.graph.node_map()[node_id]
-                context = PlanNodeContext(
-                    task_id=task_id,
-                    session_id=self._store.get_task_session_id(task_id),
-                    revision=running_plan,
-                    node=node,
-                    node_results=running_plan.node_results,
-                )
-                outcome = self._run_node(context)
-                self._store.heartbeat_execution_lease(
-                    running_plan.id,
                     owner=self._lease_owner,
-                    lease_version=running_plan.execution_lease.version,
+                    lease_version=plan.execution_lease.version,
                     ttl_seconds=self._lease_ttl_seconds,
                 )
-                plan = self._store.update_node_status(
-                    running_plan.id,
-                    node_id,
-                    outcome.status,
-                    result=outcome.to_record(),
-                    expected_version=running_plan.version,
-                )
-                executed.append(node_id)
-                if outcome.status == "waiting_approval":
-                    return PlanExecutionResult(
-                        "waiting_approval",
-                        plan,
-                        tuple(executed),
-                        waiting_node_id=node_id,
-                    )
-                if outcome.status == "failed":
-                    plan = self._skip_dependents(plan, failed_node_id=node_id)
+                failed_node = _first_node_with_status(plan, "failed")
+                if failed_node is not None:
                     return PlanExecutionResult(
                         "failed",
                         plan,
                         tuple(executed),
-                        failure_reason=outcome.error or f"node '{node_id}' failed",
+                        failure_reason=(
+                            str(plan.node_results.get(failed_node.id, {}).get("error"))
+                            or f"node '{failed_node.id}' failed"
+                        ),
                     )
-                continue
+                waiting_node = _first_node_with_status(plan, "waiting_approval")
+                if waiting_node is not None:
+                    return PlanExecutionResult(
+                        "waiting_approval",
+                        plan,
+                        tuple(executed),
+                        waiting_node_id=waiting_node.id,
+                    )
+                running_node = _first_node_with_status(plan, "running")
+                if running_node is not None:
+                    return PlanExecutionResult(
+                        "blocked",
+                        plan,
+                        tuple(executed),
+                        failure_reason=f"node '{running_node.id}' was already running; inspect before retrying",
+                    )
 
-            blocked_ids = _blocked_pending_node_ids(plan)
-            if blocked_ids:
-                plan = self._skip_nodes(plan, blocked_ids)
-                plan = self._store.update_revision_status(
-                    plan.id,
-                    "failed",
-                    expected_version=plan.version,
-                )
-                return PlanExecutionResult(
-                    "failed",
-                    plan,
-                    tuple(executed),
-                    failure_reason="node_dependencies_blocked",
-                )
+                ready = ready_node_ids(plan.graph)
+                if ready:
+                    batch = select_non_conflicting_nodes(plan.graph, ready, limit=runner_limit)
+                    running_plan = plan
+                    contexts: list[PlanNodeContext] = []
+                    for node_id in batch:
+                        running_plan = self._store.update_node_status(
+                            running_plan.id,
+                            node_id,
+                            "running",
+                            expected_version=running_plan.version,
+                        )
+                        node = running_plan.graph.node_map()[node_id]
+                        contexts.append(
+                            PlanNodeContext(
+                                task_id=task_id,
+                                session_id=self._store.get_task_session_id(task_id),
+                                revision=running_plan,
+                                node=node,
+                                node_results=running_plan.node_results,
+                            )
+                        )
+                    executed.extend(node_id for node_id in batch)
+                    futures = {
+                        context.node.id: pool.submit(self._run_node, context)
+                        for context in contexts
+                    }
+                    outcomes = {
+                        node_id: futures[node_id].result()
+                        for node_id in batch
+                    }
+                    plan = self._store.get_revision_by_id(running_plan.id)
+                    failed_nodes: list[tuple[str, NodeExecutionResult]] = []
+                    waiting_nodes: list[str] = []
+                    for node_id in batch:
+                        outcome = outcomes[node_id]
+                        plan = self._store.heartbeat_execution_lease(
+                            plan.id,
+                            owner=self._lease_owner,
+                            lease_version=plan.execution_lease.version,
+                            ttl_seconds=self._lease_ttl_seconds,
+                        )
+                        plan = self._store.update_node_status(
+                            plan.id,
+                            node_id,
+                            outcome.status,
+                            result=outcome.to_record(),
+                            expected_version=plan.version,
+                        )
+                        if outcome.status == "failed":
+                            failed_nodes.append((node_id, outcome))
+                        elif outcome.status == "waiting_approval":
+                            waiting_nodes.append(node_id)
+                    if failed_nodes:
+                        for failed_node_id, _outcome in failed_nodes:
+                            plan = self._skip_dependents(plan, failed_node_id=failed_node_id)
+                        node_id, outcome = failed_nodes[0]
+                        return PlanExecutionResult(
+                            "failed",
+                            plan,
+                            tuple(executed),
+                            failure_reason=outcome.error or f"node '{node_id}' failed",
+                        )
+                    if waiting_nodes:
+                        return PlanExecutionResult(
+                            "waiting_approval",
+                            plan,
+                            tuple(executed),
+                            waiting_node_id=waiting_nodes[0],
+                        )
+                    continue
 
-            node_statuses = {node.status for node in plan.graph.nodes}
-            if node_statuses <= {"completed", "skipped"}:
-                if "skipped" in node_statuses:
+                blocked_ids = _blocked_pending_node_ids(plan)
+                if blocked_ids:
+                    plan = self._skip_nodes(plan, blocked_ids)
                     plan = self._store.update_revision_status(
                         plan.id,
                         "failed",
@@ -222,21 +242,36 @@ class PlanExecutor:
                         "failed",
                         plan,
                         tuple(executed),
-                        failure_reason="plan_contains_skipped_nodes",
+                        failure_reason="node_dependencies_blocked",
                     )
-                plan = self._store.update_revision_status(
-                    plan.id,
-                    "completed",
-                    expected_version=plan.version,
-                )
-                return PlanExecutionResult("completed", plan, tuple(executed))
 
-            return PlanExecutionResult(
-                "blocked",
-                plan,
-                tuple(executed),
-                failure_reason="no_ready_node",
-            )
+                node_statuses = {node.status for node in plan.graph.nodes}
+                if node_statuses <= {"completed", "skipped"}:
+                    if "skipped" in node_statuses:
+                        plan = self._store.update_revision_status(
+                            plan.id,
+                            "failed",
+                            expected_version=plan.version,
+                        )
+                        return PlanExecutionResult(
+                            "failed",
+                            plan,
+                            tuple(executed),
+                            failure_reason="plan_contains_skipped_nodes",
+                        )
+                    plan = self._store.update_revision_status(
+                        plan.id,
+                        "completed",
+                        expected_version=plan.version,
+                    )
+                    return PlanExecutionResult("completed", plan, tuple(executed))
+
+                return PlanExecutionResult(
+                    "blocked",
+                    plan,
+                    tuple(executed),
+                    failure_reason="no_ready_node",
+                )
 
     def resume_waiting_node(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -8,6 +9,7 @@ from jsonschema import Draft202012Validator
 
 
 PlanNodeKind = Literal["inspect", "edit", "run", "verify"]
+ResourceAccess = Literal["read", "write", "exclusive"]
 PlanNodeStatus = Literal[
     "pending",
     "running",
@@ -26,6 +28,7 @@ _NODE_STATUSES = (
     "failed",
     "skipped",
 )
+_RESOURCE_ACCESS_MODES = ("read", "write", "exclusive")
 
 # These are capability boundaries for PlanGraph nodes. The Planner may narrow
 # a node's list, but it cannot grant a node a tool outside this mapping.
@@ -95,6 +98,19 @@ PLAN_GRAPH_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string", "minLength": 1},
                     },
                     "status": {"enum": list(_NODE_STATUSES)},
+                    "resources": {
+                        "type": "array",
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["key", "mode"],
+                            "properties": {
+                                "key": {"type": "string", "minLength": 1},
+                                "mode": {"enum": list(_RESOURCE_ACCESS_MODES)},
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -113,6 +129,25 @@ class PlanNode:
     allowed_tools: tuple[str, ...]
     acceptance: tuple[str, ...]
     status: PlanNodeStatus = "pending"
+    resources: tuple["ResourceClaim", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceClaim:
+    """A node's declared access to a logical or workspace resource."""
+
+    key: str
+    mode: ResourceAccess
+
+    def __post_init__(self) -> None:
+        if not self.key.strip():
+            raise ValueError("Resource key cannot be empty.")
+        if self.mode not in _RESOURCE_ACCESS_MODES:
+            raise ValueError(f"Unsupported resource access mode: {self.mode}")
+
+    @property
+    def normalized_key(self) -> str:
+        return _normalize_resource_key(self.key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +215,17 @@ def validate_plan_graph(payload: Any) -> tuple[str, ...]:
             for tool_name in unknown_tools
         )
 
+        resource_keys: set[str] = set()
+        for resource in node.get("resources", []):
+            key = str(resource["key"]).strip()
+            if not key:
+                errors.append(f"node '{node_id}' declares an empty resource key")
+                continue
+            normalized_key = _normalize_resource_key(key)
+            if normalized_key in resource_keys:
+                errors.append(f"node '{node_id}' declares duplicate resource '{key}'")
+            resource_keys.add(normalized_key)
+
     if not any(error.startswith("duplicate node id") for error in errors) and not has_unknown_dependency:
         errors.extend(_cycle_errors(node_payloads))
     return tuple(errors)
@@ -207,6 +253,10 @@ def parse_plan_graph(payload: Mapping[str, Any]) -> PlanGraph:
                 allowed_tools=tuple(node["allowed_tools"]),
                 acceptance=tuple(node["acceptance"]),
                 status=node["status"],
+                resources=tuple(
+                    ResourceClaim(key=resource["key"], mode=resource["mode"])
+                    for resource in node.get("resources", [])
+                ),
             )
             for node in nodes_payload
         ),
@@ -229,6 +279,16 @@ def plan_graph_to_dict(graph: PlanGraph) -> dict[str, Any]:
                 "allowed_tools": list(node.allowed_tools),
                 "acceptance": list(node.acceptance),
                 "status": node.status,
+                **(
+                    {
+                        "resources": [
+                            {"key": resource.key, "mode": resource.mode}
+                            for resource in node.resources
+                        ]
+                    }
+                    if node.resources
+                    else {}
+                ),
             }
             for node in graph.nodes
         ],
@@ -253,6 +313,7 @@ def with_node_status(graph: PlanGraph, node_id: str, status: PlanNodeStatus) -> 
                 allowed_tools=node.allowed_tools,
                 acceptance=node.acceptance,
                 status=status if node.id == node_id else node.status,
+                resources=node.resources,
             )
             for node in graph.nodes
         ),
@@ -273,6 +334,86 @@ def ready_node_ids(graph: PlanGraph) -> tuple[str, ...]:
         if node.status == "pending"
         and all(nodes[dependency].status == "completed" for dependency in node.depends_on)
     )
+
+
+def resource_claims_for_node(node: PlanNode) -> tuple[ResourceClaim, ...]:
+    """Return explicit claims, or a conservative kind-based fallback.
+
+    A plan that does not declare resources must remain safe. Inspection is
+    therefore a shared workspace read, while edit/run/verify are exclusive
+    workspace operations because their tools may have side effects.
+    """
+
+    if node.resources:
+        return node.resources
+    mode: ResourceAccess = "read" if node.kind == "inspect" else "exclusive"
+    return (ResourceClaim("workspace", mode),)
+
+
+def resources_conflict(left: PlanNode, right: PlanNode) -> bool:
+    """Return whether two nodes may not execute at the same time."""
+
+    return any(
+        _claims_conflict(first, second)
+        for first in resource_claims_for_node(left)
+        for second in resource_claims_for_node(right)
+    )
+
+
+def select_non_conflicting_nodes(
+    graph: PlanGraph,
+    node_ids: Sequence[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Select a deterministic, resource-safe ready batch."""
+
+    if limit <= 0:
+        raise ValueError("Concurrency limit must be positive.")
+    nodes = graph.node_map()
+    selected: list[str] = []
+    for node_id in node_ids:
+        candidate = nodes[node_id]
+        if any(resources_conflict(candidate, nodes[selected_id]) for selected_id in selected):
+            continue
+        selected.append(node_id)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
+def _claims_conflict(left: ResourceClaim, right: ResourceClaim) -> bool:
+    if left.mode == "read" and right.mode == "read":
+        return False
+    left_key = left.normalized_key
+    right_key = right.normalized_key
+    if left_key == right_key:
+        return True
+    if "workspace" in {left_key, right_key}:
+        return True
+    if not _is_file_resource(left_key) or not _is_file_resource(right_key):
+        return False
+    left_path = left_key.split(":", 1)[1]
+    right_path = right_key.split(":", 1)[1]
+    return _is_path_prefix(left_path, right_path) or _is_path_prefix(right_path, left_path)
+
+
+def _normalize_resource_key(key: str) -> str:
+    value = key.strip().replace("\\", "/")
+    if value.casefold() in {"workspace", "workspace:root"}:
+        return "workspace"
+    if value.casefold().startswith(("file:", "path:")):
+        prefix, path = value.split(":", 1)
+        return f"{prefix.casefold()}:{posixpath.normpath(path).casefold()}"
+    return value.casefold()
+
+
+def _is_file_resource(key: str) -> bool:
+    return key.startswith(("file:", "path:"))
+
+
+def _is_path_prefix(parent: str, candidate: str) -> bool:
+    return parent == candidate or candidate.startswith(parent.rstrip("/") + "/")
 
 
 def topological_order(graph: PlanGraph) -> tuple[str, ...]:
