@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Agent Study · Runtime Architecture",
+    "locale": "zh-CN",
+    "output": "docs/agent-study-runtime.v2.architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/CuSO41108/agent_study.git",
+      "revision": "34587adda6aca679dacfba0faa9de5f8faa502e4"
+    },
+    "viewBox": [1300, 650],
+    "views": [
+      {
+        "id": "request-loop",
+        "label": "主请求链路",
+        "focus": ["operator", "cli", "agent_loop", "model_client", "tool_registry", "session_service", "sqlite"],
+        "note": "从 PowerShell 输入开始，经过 ReAct 决策、工具分发，最后提交到 SQLite。"
+      },
+      {
+        "id": "safety-and-recovery",
+        "label": "安全与恢复",
+        "focus": ["agent_loop", "task_runtime", "tool_registry", "approval_shell", "session_service"],
+        "note": "关注 TaskState、预算、Shell 审批和 ToolAction 如何共同约束副作用。"
+      },
+      {
+        "id": "extensibility",
+        "label": "扩展能力",
+        "focus": ["agent_loop", "tool_registry", "session_service"],
+        "note": "ToolRegistry 还承载 Skill、搜索、Todo 与 delegate_task 等可扩展能力。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "用户 / 脚本",
+      "sublabel": "PowerShell",
+      "pos": [30, 260],
+      "size": [130, 68],
+      "sources": [
+        { "path": "README.md", "line": 5, "label": "CLI-first 边界" }
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI / REPL",
+      "sublabel": "argparse + prompt_toolkit",
+      "pos": [220, 260],
+      "size": [140, 68],
+      "tag": "agent-app",
+      "sources": [
+        { "path": "src/agent_app/cli.py", "line": 27, "end_line": 58, "label": "入口与组件装配" }
+      ]
+    },
+    {
+      "id": "agent_loop",
+      "type": "backend",
+      "label": "AgentLoop",
+      "sublabel": "ReAct + context_builder",
+      "pos": [420, 260],
+      "size": [160, 72],
+      "tag": "决策中枢",
+      "sources": [
+        { "path": "src/agent_app/orchestrator/loop.py", "line": 55, "end_line": 109, "label": "模型与工具编排" },
+        { "path": "src/agent_app/orchestrator/context_builder.py", "line": 13, "end_line": 79, "label": "上下文预算与拼装" },
+        { "path": "docs/ARCHITECTURE.md", "line": 53, "end_line": 72, "label": "核心运行流程" }
+      ]
+    },
+    {
+      "id": "model_client",
+      "type": "cloud",
+      "label": "OpenAI-Compatible Model",
+      "sublabel": "/v1/chat/completions",
+      "pos": [420, 70],
+      "size": [160, 72],
+      "tag": "可替换 Provider",
+      "sources": [
+        { "path": "src/agent_app/model/openai_compatible.py", "line": 13, "end_line": 59, "label": "请求与工具协议" },
+        { "path": "README.md", "line": 29, "label": "兼容协议说明" }
+      ]
+    },
+    {
+      "id": "tool_registry",
+      "type": "backend",
+      "label": "ToolRegistry",
+      "sublabel": "文件 · Shell · Skill",
+      "pos": [640, 260],
+      "size": [160, 72],
+      "tag": "能力路由",
+      "sources": [
+        { "path": "src/agent_app/tools/registry.py", "line": 17, "end_line": 58, "label": "Root / Worker 工具集" },
+        { "path": "src/agent_app/skills/registry.py", "line": 56, "end_line": 205, "label": "Skill 发现与哈希" }
+      ]
+    },
+    {
+      "id": "task_runtime",
+      "type": "security",
+      "label": "TaskRuntime",
+      "sublabel": "TaskState · budget",
+      "pos": [420, 500],
+      "size": [160, 72],
+      "tag": "状态护栏",
+      "sources": [
+        { "path": "src/agent_app/runtime/task_runtime.py", "line": 34, "end_line": 71, "label": "任务生命周期" },
+        { "path": "src/agent_app/runtime/task_runtime.py", "line": 318, "end_line": 357, "label": "预算停止条件" }
+      ]
+    },
+    {
+      "id": "approval_shell",
+      "type": "security",
+      "label": "Shell Approval",
+      "sublabel": "PowerShell + ToolAction",
+      "pos": [640, 500],
+      "size": [160, 72],
+      "tag": "默认逐条审批",
+      "sources": [
+        { "path": "src/agent_app/tools/approval.py", "line": 37, "end_line": 60, "label": "命令分类与硬拒绝" },
+        { "path": "src/agent_app/tools/shell.py", "line": 13, "end_line": 104, "label": "受控执行" },
+        { "path": "src/agent_app/runtime/shell_runtime.py", "line": 24, "end_line": 104, "label": "超时与进程树" }
+      ]
+    },
+    {
+      "id": "session_service",
+      "type": "backend",
+      "label": "SessionService",
+      "sublabel": "Session / Task / Trace / Memory",
+      "pos": [860, 260],
+      "size": [170, 72],
+      "tag": "事务持久化",
+      "sources": [
+        { "path": "src/agent_app/state/session_service.py", "line": 66, "end_line": 163, "label": "状态与任务存取" },
+        { "path": "docs/ARCHITECTURE.md", "line": 30, "end_line": 38, "label": "状态层职责" }
+      ]
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": ".agent_app/agent.db",
+      "pos": [1090, 260],
+      "size": [150, 72],
+      "tag": "单文件状态源",
+      "sources": [
+        { "path": "src/agent_app/state/db.py", "line": 265, "end_line": 333, "label": "Schema 初始化与索引" },
+        { "path": "README.md", "line": 83, "end_line": 86, "label": "持久化对象" }
+      ]
+    }
+  ],
+  "connections": [
+    { "id": "input-to-cli", "from": "operator", "to": "cli", "variant": "emphasis" },
+    { "id": "cli-to-loop", "from": "cli", "to": "agent_loop", "label": "run_turn", "variant": "emphasis" },
+    { "id": "loop-to-model", "from": "agent_loop", "to": "model_client", "label": "messages ⇄ ToolCall", "variant": "emphasis", "route": "straight", "fromSide": "top", "toSide": "bottom" },
+    { "id": "loop-to-tools", "from": "agent_loop", "to": "tool_registry", "label": "dispatch", "variant": "emphasis" },
+    { "id": "loop-to-runtime", "from": "agent_loop", "to": "task_runtime", "label": "状态 / 预算", "variant": "security", "labelDy": 24 },
+    { "id": "tools-to-approval", "from": "tool_registry", "to": "approval_shell", "label": "shell", "variant": "security", "labelDy": 24 },
+    { "id": "tools-to-session", "from": "tool_registry", "to": "session_service", "label": "tool result / trace", "variant": "dashed", "labelDy": 60 },
+    { "id": "session-to-sqlite", "from": "session_service", "to": "sqlite", "label": "commit", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "面试主线",
+      "items": [
+        "CLI 负责交互与装配，AgentLoop 是模型—工具 ReAct 编排中心。",
+        "context_builder 按预算组装 summary、todo、evidence 和 Memory。",
+        "模型返回文本或 ToolCall，ToolRegistry 分发后把结果送回下一轮。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "安全追问",
+      "items": [
+        "Shell 默认逐条审批，递归/批量删除硬拒绝；当前 Session 可授权明确前缀。",
+        "文件写入和受控 Shell 先持久化 ToolAction，副作用不确定时不自动重试。",
+        "TaskRuntime 用状态迁移、乐观锁和预算停止条件约束执行。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "扩展与可靠性",
+      "items": [
+        "SkillRegistry 先暴露元数据，匹配后按需加载并固定来源哈希。",
+        "SubagentRunner 通过 delegate_task 创建受限 worker，并对结果做 review。",
+        "SessionService 将 Session、Task、Trace、Action、Memory 写入工作区 SQLite。"
+      ]
+    }
+  ]
+}
