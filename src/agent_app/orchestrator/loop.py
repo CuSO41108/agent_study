@@ -375,7 +375,7 @@ class AgentLoop:
             model_duration_ms = int((time.monotonic() - model_started) * 1000)
             response_tokens = response.total_tokens or _estimate_response_tokens(provider_messages, response)
             task = self._tasks.consume_model_call(task.id, tokens=response_tokens)
-            decision_payload = _decision_payload(response)
+            decision_payload = _decision_payload(response, tool_registry=self._tool_registry)
             self._session_service.append_task_trace(
                 task.id,
                 "model_call",
@@ -394,7 +394,11 @@ class AgentLoop:
             for tool_call in response.tool_calls:
                 self._emit_execution_event(
                     "action_planned",
-                    {"tool": tool_call.name, "tool_call_id": tool_call.id, "arguments": tool_call.arguments},
+                    {
+                        "tool": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "arguments": _audit_arguments(tool_call, tool=self._tool_registry.get(tool_call.name)),
+                    },
                 )
             repeated_reason = self._record_decision_repetition(task.id, decision_payload)
             if repeated_reason is not None:
@@ -1309,7 +1313,7 @@ class AgentLoop:
             action = self._session_service.prepare_tool_action(
                 session_id,
                 agent_id=self._agent.id,
-                tool_call=_persisted_tool_call(tool_call),
+                tool_call=_persisted_tool_call(tool_call, tool=tool),
                 recovery_metadata=recovery_metadata,
                 task_id=task_id,
                 attempt=attempt,
@@ -1332,7 +1336,12 @@ class AgentLoop:
                 started = time.monotonic()
                 self._emit_execution_event(
                     "tool_started",
-                    {"tool": tool_call.name, "tool_call_id": tool_call.id, "arguments": tool_call.arguments, "attempt": attempt},
+                    {
+                        "tool": tool_call.name,
+                        "tool_call_id": tool_call.id,
+                        "arguments": _audit_arguments(tool_call, tool=tool),
+                        "attempt": attempt,
+                    },
                 )
                 try:
                     tool_result = tool.execute(
@@ -1398,7 +1407,7 @@ class AgentLoop:
                 {
                     "tool_call_id": tool_call.id,
                     "tool": tool_call.name,
-                    "arguments": _audit_arguments(tool_call),
+                    "arguments": _audit_arguments(tool_call, tool=tool),
                     "arguments_hash": hashlib.sha256(
                         json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True).encode("utf-8")
                     ).hexdigest(),
@@ -2165,7 +2174,7 @@ def _has_unverified_successful_edit(tool_runs: list[ToolResult]) -> bool:
     )
 
 
-def _decision_payload(response: ModelResponse) -> dict[str, Any]:
+def _decision_payload(response: ModelResponse, *, tool_registry=None) -> dict[str, Any]:
     if response.tool_calls:
         return {
             "type": "tool_calls",
@@ -2173,7 +2182,10 @@ def _decision_payload(response: ModelResponse) -> dict[str, Any]:
                 {
                     "id": tool_call.id,
                     "tool": tool_call.name,
-                    "arguments": tool_call.arguments,
+                    "arguments": _audit_arguments(
+                        tool_call,
+                        tool=tool_registry.get(tool_call.name) if tool_registry is not None else None,
+                    ),
                 }
                 for tool_call in response.tool_calls
             ],
@@ -2221,9 +2233,15 @@ def _web_search_observation_message(content: str) -> str:
     )
 
 
-def _persisted_tool_call(tool_call: ToolCall) -> ToolCall:
+def _persisted_tool_call(tool_call: ToolCall, *, tool=None) -> ToolCall:
     if tool_call.name != "shell":
-        return tool_call
+        if tool is None:
+            return tool_call
+        return ToolCall(
+            id=tool_call.id,
+            name=tool_call.name,
+            arguments=tool.redact_arguments(tool_call.arguments),
+        )
     return ToolCall(
         id=tool_call.id,
         name=tool_call.name,
@@ -2231,9 +2249,9 @@ def _persisted_tool_call(tool_call: ToolCall) -> ToolCall:
     )
 
 
-def _audit_arguments(tool_call: ToolCall) -> dict[str, Any]:
+def _audit_arguments(tool_call: ToolCall, *, tool=None) -> dict[str, Any]:
     if tool_call.name != "shell":
-        return tool_call.arguments
+        return tool.redact_arguments(tool_call.arguments) if tool is not None else tool_call.arguments
     return {"command_redacted": True, "command_sha256": _shell_command_sha256(tool_call.arguments)}
 
 

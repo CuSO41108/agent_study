@@ -46,6 +46,11 @@ class Tool(ABC):
             },
         }
 
+    def redact_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Return the representation safe for durable audit records."""
+
+        return dict(arguments)
+
     def validate_arguments(self, arguments: Any) -> str | None:
         return validate_arguments(arguments=arguments, schema=self.parameters_schema)
 

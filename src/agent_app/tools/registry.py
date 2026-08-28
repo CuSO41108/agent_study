@@ -27,6 +27,16 @@ class ToolRegistry:
             raise KeyError(name)
         return tool
 
+    def register(self, tool: Tool, *, replace_existing: bool = False) -> None:
+        """Register a discovered tool without silently replacing a capability."""
+
+        if not replace_existing and tool.name in self._tools:
+            raise ValueError(f"Tool '{tool.name}' is already registered.")
+        self._tools[tool.name] = tool
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._tools)
+
     def get_specs(self, allowed_tools: list[str]) -> list[dict]:
         return [self._tools[name].spec() for name in allowed_tools if name in self._tools]
 
