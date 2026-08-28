@@ -2,7 +2,7 @@
 
 一个面向本地仓库工作流的 CLI-first coding agent。项目把模型调用、工具执行、文件编辑审批、任务状态机、跨 Session 接力、可扩展 Skill 和可回放 Trace 放进同一个可测试的 Python 实现中，用来研究“本地 coding agent 怎样可靠地完成工作”。
 
-它不是桌面端或 Web 控制台：核心交互是终端 REPL，状态落在工作区的 SQLite 数据库，单轮命令则保持机器可读的 JSON 输出。
+它不是桌面端或 Web 控制台：核心交互是基于 PowerShell 的终端 REPL，状态落在工作区的 SQLite 数据库，单轮命令则保持机器可读的 JSON 输出。
 
 ## 界面展示
 
@@ -192,7 +192,7 @@ python -m coverage report --precision=2 --fail-under=90
 ## 设计边界
 
 - 本地 CLI harness，不做服务化、Web UI 或托管运行
-- ReAct 循环由项目内 `AgentLoop` 实现，不引入 LangChain、LangGraph 等外部编排框架
+- ReAct 循环由项目内 `AgentLoop` 实现，不引入 LangChain/LangGraph 等外部编排框架
 - 文件类工具的路径约束在工作区内；Shell 以工作区为启动目录、按当前用户权限执行且默认审批
 - `replace_in_file` 不是通用 patch 系统，不支持模糊匹配、正则或多文件编辑
 - `waiting_tool` 保留状态契约，但工具仍是同步执行
