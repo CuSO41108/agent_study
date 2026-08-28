@@ -13,9 +13,17 @@ multi-action sequence, or a code-change plus verification pair.
   and `verify`.
 - Each node declares `objective`, `acceptance`, `depends_on`, and an allowed
   tool subset. The subset can be narrower than the kind default, never wider.
-- Nodes execute serially in dependency order. There is no fixed node-count
-  limit, conditional branch, loop, recursive subgraph, or shared-workspace
-  parallel execution.
+- The executor computes ready nodes from dependency state, then selects a
+  deterministic resource-safe batch under a concurrency limit. Nodes may
+  declare `ResourceClaim` entries with `read`, `write`, or `exclusive` access;
+  missing claims use conservative defaults (`inspect` reads `workspace`, while
+  `edit`, `run`, and `verify` exclusively claim `workspace`). There is no fixed
+  node-count limit, conditional branch, loop, or recursive subgraph.
+- The generic `NodeRunner` boundary supports concurrent batches. The current
+  `PlanAgentNodeRunner` explicitly opts out because one shared AgentLoop still
+  owns mutable turn state and one optimistic TaskRuntime version stream; the
+  integrated AgentLoop path therefore remains serial until Worker/Task
+  isolation is implemented.
 - A node reuses the existing `AgentLoop` with a transient node prompt. The
   prompt is visible to the model for that turn but is not persisted as a user
   message. The node's tool subset and `keep_task_open` boundary are passed to
@@ -50,8 +58,8 @@ flowchart TD
     B -->|simple| R[Single-agent ReAct]
     B -->|multi-step| P[Planner]
     P --> V[Validate static DAG]
-    V --> E[Serial PlanExecutor]
-    E --> N[Select ready node]
+    V --> E[Resource-safe PlanExecutor]
+    E --> N[Select ready batch]
     N --> L[Existing AgentLoop with transient node scope]
     L --> D{Outcome}
     D -->|completed| C[Persist result and continue]
@@ -131,6 +139,8 @@ The current implementation is accepted when all of the following hold:
 ## Deliberately deferred
 
 MCP, vector databases, code RAG, multiple agents, multiple processes editing
-one workspace, and true parallel DAG scheduling remain later capabilities. They
-are not implied by the current Plan-and-Execute trace or by the `delegate_task`
-tool outside PlanGraph execution.
+one workspace, and end-to-end parallel AgentLoop node execution remain later
+capabilities. The scheduler's generic resource-safe batch boundary is already
+implemented, but it is not implied that the current shared-task AgentLoop
+adapter executes those batches concurrently. None of this roadmap introduces
+RAG, Embedding, vector similarity, or a vector database.
