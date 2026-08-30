@@ -131,6 +131,35 @@ TaskStatus = Literal[
     "expired",
     "handed_off",
 ]
+ExecutionRunStatus = Literal[
+    "running",
+    "waiting_approval",
+    "paused_by_budget",
+    "paused_by_user",
+    "interrupted",
+    "completed",
+    "failed",
+]
+CheckpointCursor = Literal[
+    "await_model",
+    "decision_ready",
+    "waiting_approval",
+    "executing_tool",
+    "observation_ready",
+    "paused_by_budget",
+    "paused_by_user",
+    "completed",
+    "failed",
+]
+CheckpointStatus = Literal[
+    "running",
+    "waiting_approval",
+    "paused_by_budget",
+    "paused_by_user",
+    "interrupted",
+    "completed",
+    "failed",
+]
 EventType = Literal[
     "task_created",
     "user_message",
@@ -172,12 +201,14 @@ class TaskBudget:
     max_repair_attempts: int = 2
     repeat_decision_limit: int = 3
     max_replans: int = 2
+    max_continuations: int = 2
     used_model_calls: int = 0
     used_tool_calls: int = 0
     used_tokens: int = 0
     used_active_seconds: float = 0.0
     used_repair_attempts: int = 0
     used_replans: int = 0
+    used_continuations: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -237,6 +268,39 @@ class TaskState:
     updated_at: str
     waiting_deadline: str | None = None
     parent_task_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ExecutionRun:
+    """One bounded execution window belonging to a durable Task."""
+
+    id: str
+    task_id: str
+    session_id: str
+    agent_id: str
+    scope: str
+    status: ExecutionRunStatus
+    max_tool_rounds: int
+    tool_rounds: int
+    parent_checkpoint_id: str | None
+    stop_reason: str | None
+    started_at: str
+    updated_at: str
+    finished_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class Checkpoint:
+    """A durable cursor describing where an ExecutionRun can safely continue."""
+
+    id: str
+    task_id: str
+    run_id: str
+    parent_checkpoint_id: str | None
+    cursor: CheckpointCursor
+    status: CheckpointStatus
+    state: dict[str, Any]
+    created_at: str
 
 
 @dataclass(slots=True, frozen=True)

@@ -11,6 +11,11 @@ from uuid import uuid4
 
 from agent_app.types import (
     AgentEvent,
+    Checkpoint,
+    CheckpointCursor,
+    CheckpointStatus,
+    ExecutionRun,
+    ExecutionRunStatus,
     MemoryKind,
     MemoryRecord,
     Message,
@@ -522,6 +527,167 @@ class SessionService:
             )
             for row in rows
         ]
+
+    def create_execution_run(
+        self,
+        *,
+        task_id: str,
+        agent_id: str,
+        scope: str,
+        max_tool_rounds: int,
+        parent_checkpoint_id: str | None = None,
+    ) -> ExecutionRun:
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if max_tool_rounds <= 0:
+            raise ValueError("max_tool_rounds must be positive.")
+        run_id = str(uuid4())
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_runs (
+                    id, task_id, session_id, agent_id, scope, status,
+                    max_tool_rounds, tool_rounds, parent_checkpoint_id,
+                    stop_reason, started_at, updated_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, NULL, ?, ?, NULL)
+                """,
+                (
+                    run_id,
+                    task.id,
+                    task.session_id,
+                    agent_id,
+                    scope,
+                    max_tool_rounds,
+                    parent_checkpoint_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return self.get_execution_run(run_id)
+
+    def get_execution_run(self, run_id: str) -> ExecutionRun:
+        with self._connect() as connection:
+            row = connection.execute(
+                _EXECUTION_RUN_SELECT + " WHERE id = ? LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return _execution_run_from_row(row)
+
+    def list_execution_runs(self, task_id: str) -> list[ExecutionRun]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _EXECUTION_RUN_SELECT + " WHERE task_id = ? ORDER BY started_at ASC, id ASC",
+                (task_id,),
+            ).fetchall()
+        return [_execution_run_from_row(row) for row in rows]
+
+    def update_execution_run(
+        self,
+        run_id: str,
+        *,
+        status: ExecutionRunStatus | None = None,
+        tool_rounds: int | None = None,
+        stop_reason: str | None = None,
+    ) -> ExecutionRun:
+        current = self.get_execution_run(run_id)
+        next_status = current.status if status is None else status
+        next_rounds = current.tool_rounds if tool_rounds is None else tool_rounds
+        if next_rounds < current.tool_rounds:
+            raise ValueError("Execution run tool_rounds cannot decrease.")
+        finished_at = current.finished_at
+        if next_status in {
+            "completed",
+            "failed",
+            "paused_by_budget",
+            "paused_by_user",
+            "interrupted",
+            "waiting_approval",
+        }:
+            finished_at = current.finished_at or _utc_now()
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE execution_runs
+                SET status = ?, tool_rounds = ?, stop_reason = ?, updated_at = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (next_status, next_rounds, stop_reason, timestamp, finished_at, run_id),
+            )
+        return self.get_execution_run(run_id)
+
+    def create_checkpoint(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        cursor: CheckpointCursor,
+        status: CheckpointStatus,
+        state: dict,
+        parent_checkpoint_id: str | None = None,
+    ) -> Checkpoint:
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        run = self.get_execution_run(run_id)
+        if run.task_id != task_id:
+            raise ValueError("Checkpoint task_id does not match its execution run.")
+        checkpoint_id = str(uuid4())
+        timestamp = _utc_now()
+        parent_id = parent_checkpoint_id
+        if parent_id is None:
+            previous = self.get_latest_checkpoint(task_id)
+            parent_id = previous.id if previous is not None else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO checkpoints (
+                    id, task_id, run_id, parent_checkpoint_id, cursor,
+                    status, state_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    task_id,
+                    run_id,
+                    parent_id,
+                    cursor,
+                    status,
+                    _json_dumps(state),
+                    timestamp,
+                ),
+            )
+        return self.get_checkpoint(checkpoint_id)
+
+    def get_checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        with self._connect() as connection:
+            row = connection.execute(
+                _CHECKPOINT_SELECT + " WHERE id = ? LIMIT 1",
+                (checkpoint_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(checkpoint_id)
+        return _checkpoint_from_row(row)
+
+    def get_latest_checkpoint(self, task_id: str) -> Checkpoint | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                _CHECKPOINT_SELECT + " WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else _checkpoint_from_row(row)
+
+    def list_checkpoints(self, task_id: str) -> list[Checkpoint]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                _CHECKPOINT_SELECT + " WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+                (task_id,),
+            ).fetchall()
+        return [_checkpoint_from_row(row) for row in rows]
 
     def activate_skill(
         self,
@@ -1866,6 +2032,20 @@ FROM tasks
 """
 
 
+_EXECUTION_RUN_SELECT = """
+SELECT id, task_id, session_id, agent_id, scope, status, max_tool_rounds,
+       tool_rounds, parent_checkpoint_id, stop_reason, started_at, updated_at,
+       finished_at
+FROM execution_runs
+"""
+
+
+_CHECKPOINT_SELECT = """
+SELECT id, task_id, run_id, parent_checkpoint_id, cursor, status, state_json, created_at
+FROM checkpoints
+"""
+
+
 _SKILL_ACTIVATION_SELECT = """
 SELECT id, task_id, skill_name, scope, source_path, content_hash, version,
        activation_reason, state, activated_at
@@ -1878,6 +2058,37 @@ SELECT id, session_id, scope, skill_name, content, content_hash,
        status, created_at, saved_at, saved_path
 FROM skill_drafts
 """
+
+
+def _execution_run_from_row(row) -> ExecutionRun:
+    return ExecutionRun(
+        id=row[0],
+        task_id=row[1],
+        session_id=row[2],
+        agent_id=row[3],
+        scope=row[4],
+        status=row[5],
+        max_tool_rounds=int(row[6]),
+        tool_rounds=int(row[7]),
+        parent_checkpoint_id=row[8],
+        stop_reason=row[9],
+        started_at=row[10],
+        updated_at=row[11],
+        finished_at=row[12],
+    )
+
+
+def _checkpoint_from_row(row) -> Checkpoint:
+    return Checkpoint(
+        id=row[0],
+        task_id=row[1],
+        run_id=row[2],
+        parent_checkpoint_id=row[3],
+        cursor=row[4],
+        status=row[5],
+        state=json.loads(row[6]),
+        created_at=row[7],
+    )
 
 
 def _task_from_row(row) -> TaskState:

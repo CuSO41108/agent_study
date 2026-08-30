@@ -259,6 +259,39 @@ SCHEMA_STATEMENTS = (
         UNIQUE(task_id, revision)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS execution_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        status TEXT NOT NULL,
+        max_tool_rounds INTEGER NOT NULL,
+        tool_rounds INTEGER NOT NULL DEFAULT 0,
+        parent_checkpoint_id TEXT,
+        stop_reason TEXT,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
+        FOREIGN KEY (session_id) REFERENCES sessions(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        parent_checkpoint_id TEXT,
+        cursor TEXT NOT NULL,
+        status TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id),
+        FOREIGN KEY (run_id) REFERENCES execution_runs(id)
+    )
+    """,
 )
 
 
@@ -334,6 +367,18 @@ def initialize_database(db_path: str | Path) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revisions_one_active_per_task
             ON plan_revisions(task_id)
             WHERE status = 'active'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_execution_runs_task_started
+            ON execution_runs(task_id, started_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_task_created
+            ON checkpoints(task_id, created_at DESC)
             """
         )
         connection.commit()

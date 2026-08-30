@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
-from agent_app.types import Message, ToolCall, ToolResult
+from agent_app.types import Message, TaskBudget, ToolCall, ToolResult
 
 
 class SessionServiceTests(unittest.TestCase):
@@ -66,6 +66,46 @@ class SessionServiceTests(unittest.TestCase):
         tool_runs = self.sessions.list_tool_runs(session_id)
 
         self.assertEqual(tool_runs, [tool_result])
+
+    def test_execution_runs_and_checkpoints_survive_restart(self) -> None:
+        session_id = self.sessions.create_session("session-checkpoint")
+        task = self.sessions.create_task(
+            session_id,
+            goal="inspect repository",
+            budget=TaskBudget(),
+        )
+        run = self.sessions.create_execution_run(
+            task_id=task.id,
+            agent_id="agent-1",
+            scope="root",
+            max_tool_rounds=8,
+        )
+        first = self.sessions.create_checkpoint(
+            task_id=task.id,
+            run_id=run.id,
+            cursor="await_model",
+            status="running",
+            state={"tool_rounds": 0, "completed_work": ["task created"]},
+        )
+        second = self.sessions.create_checkpoint(
+            task_id=task.id,
+            run_id=run.id,
+            cursor="paused_by_budget",
+            status="paused_by_budget",
+            state={"tool_rounds": 8, "remaining_work": ["summarize evidence"]},
+        )
+        paused_run = self.sessions.update_execution_run(
+            run.id,
+            status="paused_by_budget",
+            tool_rounds=8,
+            stop_reason="max_tool_rounds_exceeded",
+        )
+
+        restarted = SessionService(self.db_path)
+        self.assertEqual(restarted.get_execution_run(run.id), paused_run)
+        self.assertEqual(restarted.get_latest_checkpoint(task.id), second)
+        self.assertEqual(second.parent_checkpoint_id, first.id)
+        self.assertEqual(restarted.list_checkpoints(task.id), [first, second])
 
     def test_tool_action_lifecycle_is_idempotent_and_persists_result_once(self) -> None:
         session_id = self.sessions.create_session("session-actions")

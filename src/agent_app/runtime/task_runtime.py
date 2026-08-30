@@ -179,6 +179,18 @@ class TaskRuntime:
             event=event,
         )
 
+    def pause_for_budget(self, task_id: str, *, reason: str) -> TaskState:
+        """Pause a still-running task without treating a bounded run as a failure."""
+
+        return self.transition(
+            task_id,
+            target_status="paused",
+            event_type="state_transition",
+            source="runtime",
+            stop_reason=reason,
+            reason=reason,
+        )
+
     def resume(self, task_id: str, *, event: AgentEvent | None = None) -> TaskState:
         return self.transition(
             task_id,
@@ -312,6 +324,34 @@ class TaskRuntime:
             task_id,
             "replan",
             {"reason": reason, "attempt": budget.used_replans, "max_replans": budget.max_replans},
+        )
+        return updated
+
+    def consume_continuation(self, task_id: str, *, reason: str) -> TaskState:
+        """Spend one bounded continuation window for a paused task."""
+
+        task = self.require_task(task_id)
+        self._ensure_mutable(task)
+        if task.budget.used_continuations >= task.budget.max_continuations:
+            raise RuntimeError(
+                f"Task '{task_id}' has exhausted its {task.budget.max_continuations} continuation attempts."
+            )
+        budget = replace(
+            task.budget,
+            used_continuations=task.budget.used_continuations + 1,
+        )
+        updated = self._sessions.apply_task_event(
+            _event(task, event_type="state_transition", source="runtime", payload={"reason": reason}),
+            budget=budget,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "continuation",
+            {
+                "reason": reason,
+                "attempt": budget.used_continuations,
+                "max_continuations": budget.max_continuations,
+            },
         )
         return updated
 

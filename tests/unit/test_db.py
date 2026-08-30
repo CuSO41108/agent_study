@@ -39,6 +39,8 @@ class DatabaseTests(unittest.TestCase):
                           'task_events',
                           'task_traces',
                           'plan_revisions'
+                          , 'execution_runs'
+                          , 'checkpoints'
                       )
                     ORDER BY name
                     """
@@ -51,6 +53,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             [row[0] for row in rows],
             [
+                "checkpoints",
+                "execution_runs",
                 "memory_records",
                 "messages",
                 "plan_revisions",
