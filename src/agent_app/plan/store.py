@@ -23,8 +23,9 @@ PlanRevisionStatus = Literal["active", "completed", "failed", "superseded"]
 
 _NODE_STATUS_TRANSITIONS: dict[PlanNodeStatus, frozenset[PlanNodeStatus]] = {
     "pending": frozenset({"pending", "running", "skipped"}),
-    "running": frozenset({"running", "completed", "failed", "waiting_approval"}),
+    "running": frozenset({"running", "completed", "failed", "waiting_approval", "paused"}),
     "waiting_approval": frozenset({"waiting_approval", "pending", "completed", "failed"}),
+    "paused": frozenset({"paused", "pending", "failed"}),
     "completed": frozenset({"completed"}),
     "failed": frozenset({"failed"}),
     "skipped": frozenset({"skipped"}),
@@ -226,6 +227,16 @@ class PlanStore:
         return updated
 
     def resume_waiting_node(self, revision_id: str, node_id: str, *, expected_version: int | None = None) -> PlanRevision:
+        return self.update_node_status(
+            revision_id,
+            node_id,
+            "pending",
+            expected_version=expected_version,
+        )
+
+    def resume_paused_node(self, revision_id: str, node_id: str, *, expected_version: int | None = None) -> PlanRevision:
+        """Move a budget-paused node back to pending for an explicit continuation."""
+
         return self.update_node_status(
             revision_id,
             node_id,

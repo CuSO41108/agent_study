@@ -112,12 +112,13 @@ class PlanRecoveryService:
 
         running_nodes = [node for node in current.graph.nodes if node.status == "running"]
         waiting_nodes = [node for node in current.graph.nodes if node.status == "waiting_approval"]
-        if len(running_nodes) + len(waiting_nodes) > 1:
+        paused_nodes = [node for node in current.graph.nodes if node.status == "paused"]
+        if len(running_nodes) + len(waiting_nodes) + len(paused_nodes) > 1:
             return self._decision(
                 RecoveryKind.INCONSISTENT,
                 task,
                 current=current,
-                reason="Serial execution allows at most one running or waiting node.",
+                reason="Serial execution allows at most one running, waiting, or paused node.",
             )
 
         waiting_node = waiting_nodes[0] if waiting_nodes else None
@@ -180,6 +181,32 @@ class PlanRecoveryService:
                 task,
                 current=current,
                 reason="Task waiting facts are not associated with a waiting Plan node.",
+            )
+
+        if paused_nodes:
+            paused_node = paused_nodes[0]
+            if task.status != "paused":
+                return self._decision(
+                    RecoveryKind.INCONSISTENT,
+                    task,
+                    current=current,
+                    node_id=paused_node.id,
+                    reason="A paused Plan node requires its Task to be paused.",
+                )
+            if current.execution_lease.is_active(now=self._clock()):
+                return self._decision(
+                    RecoveryKind.INCONSISTENT,
+                    task,
+                    current=current,
+                    node_id=paused_node.id,
+                    reason="Paused Plan node still has an active execution lease.",
+                )
+            return self._decision(
+                RecoveryKind.PAUSED,
+                task,
+                current=current,
+                node_id=paused_node.id,
+                reason=f"Plan node '{paused_node.id}' is paused at an execution-window checkpoint.",
             )
 
         if running_nodes:

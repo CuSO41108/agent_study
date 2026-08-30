@@ -230,7 +230,7 @@ class PlanGraphTests(unittest.TestCase):
         self.assertIn("node 'inspect' declares duplicate resource 'file:src\\A.py'", errors)
 
     def test_all_supported_node_statuses_are_contract_values(self) -> None:
-        for status in ("pending", "running", "waiting_approval", "completed", "failed", "skipped"):
+        for status in ("pending", "running", "waiting_approval", "paused", "completed", "failed", "skipped"):
             payload = _plan_payload()
             payload["nodes"][0]["status"] = status
 

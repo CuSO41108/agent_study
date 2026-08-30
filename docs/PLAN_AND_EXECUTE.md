@@ -123,15 +123,19 @@ The current implementation is accepted when all of the following hold:
    original node's allowed tools before continuing downstream nodes.
 4. An `ask_user` node resumes from a natural-language answer, retains its
    node scope, and can ask a second question without leaving the Plan.
-5. A failed node produces a failure trace; an available budget creates a new
+5. If a node reaches the ReAct window limit, the node is persisted as `paused`
+   and the Plan remains active. `/resume` or `/continue` consumes one Task
+   continuation budget, restores that node checkpoint, and executes only the
+   node before moving to its dependents.
+6. A failed node produces a failure trace; an available budget creates a new
    revision without deleting completed evidence; exhausted budget produces a
    terminal diagnosis.
-6. A failed automatic Replan produces a terminal Task and failed revision,
+7. A failed automatic Replan produces a terminal Task and failed revision,
    rather than leaking an active broken revision.
-7. The targeted Plan, trace, and existing AgentLoop tests pass. Full-suite
+8. The targeted Plan, trace, and existing AgentLoop tests pass. Full-suite
    failures must be reported separately when they are unrelated baseline
    drift.
-8. An interrupted write remains blocked until its ToolAction is resolved;
+9. An interrupted write remains blocked until its ToolAction is resolved;
    all confirmed-absent effects may be retried, all confirmed-present effects
    advance the node without a second tool execution, and mixed effects remain
    blocked rather than selecting the latest resolution.

@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -95,6 +95,8 @@ class AgentLoop:
         self._process_id = str(uuid4())
         self._session_shell_prefixes: dict[str, set[str]] = {}
         self._active_task_id: str | None = None
+        self._active_execution_run_id: str | None = None
+        self._active_provider_messages: list[dict[str, Any]] | None = None
         self._turn_started_at: float | None = None
         self._turn_allowed_tools: tuple[str, ...] = tuple(agent.allowed_tools)
         self._keep_task_open = False
@@ -125,8 +127,12 @@ class AgentLoop:
         transient_context: str | None = None,
         plan_revision_id: str | None = None,
         plan_node_id: str | None = None,
+        _resume_checkpoint_id: str | None = None,
+        _resume_tool_result: ToolResult | None = None,
     ) -> TurnResult:
         self._active_task_id = None
+        self._active_execution_run_id = None
+        self._active_provider_messages = None
         self._turn_started_at = None
         self._turn_allowed_tools = tuple(self._agent.allowed_tools)
         self._keep_task_open = False
@@ -143,11 +149,14 @@ class AgentLoop:
                 transient_context=transient_context,
                 plan_revision_id=plan_revision_id,
                 plan_node_id=plan_node_id,
+                _resume_checkpoint_id=_resume_checkpoint_id,
+                _resume_tool_result=_resume_tool_result,
             )
         except KeyboardInterrupt:
             if self._active_task_id is None:
                 raise
             task = self._tasks.cancel(self._active_task_id)
+            self._close_execution_run_after_interruption(task, stop_reason="cancelled")
             return self._task_result(task, final_text="Cancelled.", stop_reason="cancelled", success=False)
         except TracePersistenceError:
             return self._runtime_failure_result(
@@ -176,6 +185,8 @@ class AgentLoop:
         transient_context: str | None = None,
         plan_revision_id: str | None = None,
         plan_node_id: str | None = None,
+        _resume_checkpoint_id: str | None = None,
+        _resume_tool_result: ToolResult | None = None,
     ) -> TurnResult:
         resolved_allowed_tools = tuple(self._agent.allowed_tools if allowed_tools is None else allowed_tools)
         unknown_tools = sorted(set(resolved_allowed_tools) - set(self._agent.allowed_tools))
@@ -219,6 +230,43 @@ class AgentLoop:
                 )
         self._active_task_id = task.id
         self._turn_started_at = time.monotonic()
+        scope = (
+            f"plan_node:{plan_node_id}"
+            if plan_node_id is not None
+            else ("worker" if self._agent.role == "worker" else "root")
+        )
+        latest_checkpoint = self._session_service.get_latest_checkpoint(task.id)
+        resume_checkpoint = None
+        if _resume_checkpoint_id is not None:
+            resume_checkpoint = self._session_service.get_checkpoint(_resume_checkpoint_id)
+            if resume_checkpoint.task_id != task.id:
+                raise ValueError("Resume checkpoint does not belong to the task.")
+        elif (
+            not _append_user_message
+            and latest_checkpoint is not None
+            and latest_checkpoint.status in {"paused_by_budget", "paused_by_user", "interrupted", "waiting_approval"}
+        ):
+            resume_checkpoint = latest_checkpoint
+        execution_run = self._session_service.create_execution_run(
+            task_id=task.id,
+            agent_id=self._agent.id,
+            scope=scope,
+            max_tool_rounds=self._agent.max_tool_rounds,
+            parent_checkpoint_id=None if latest_checkpoint is None else latest_checkpoint.id,
+        )
+        self._active_execution_run_id = execution_run.id
+        self._persist_execution_checkpoint(
+            cursor="await_model",
+            status="running",
+            state={
+                "scope": scope,
+                "tool_rounds": 0,
+                "allowed_tools": list(resolved_allowed_tools),
+                "plan_revision_id": plan_revision_id,
+                "plan_node_id": plan_node_id,
+                "budget": asdict(task.budget),
+            },
+        )
         self._emit_execution_event("task_started", {"goal": task.goal})
         if explicit_skill_names:
             self._activate_explicit_skills(task_id=task.id, skill_names=explicit_skill_names)
@@ -309,12 +357,51 @@ class AgentLoop:
             skill_index_message=skill_index_message,
             active_skill_messages=active_skill_messages,
         )
-        if transient_context:
+        restored_messages = _restore_checkpoint_messages(resume_checkpoint)
+        if restored_messages is not None:
+            provider_messages = restored_messages
+        if transient_context and not any(
+            message.get("role") == "system" and message.get("content") == transient_context
+            for message in provider_messages
+        ):
             provider_messages.append({
                 "role": "system",
                 "content": transient_context,
             })
+        if _resume_tool_result is not None:
+            if not _provider_messages_contain_tool_call(
+                provider_messages,
+                _resume_tool_result.tool_call_id,
+            ):
+                provider_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": _resume_tool_result.tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": _resume_tool_result.tool_name,
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                )
+            provider_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _resume_tool_result.tool_call_id,
+                    "content": _resume_tool_result.content
+                    if _resume_tool_result.success
+                    else (_resume_tool_result.error or _resume_tool_result.content or "Tool execution failed."),
+                }
+            )
+        self._active_provider_messages = provider_messages
         tool_runs: list[ToolResult] = []
+        if _resume_tool_result is not None:
+            tool_runs.append(_resume_tool_result)
         if _requires_web_research(user_input) and not task.working_memory.get("web_research_preflight_completed"):
             research_call = ToolCall(
                 id=f"web-research-{task.id}",
@@ -533,6 +620,22 @@ class AgentLoop:
 
             tool_rounds += 1
             provider_messages.append(_assistant_tool_message(response))
+            self._session_service.update_execution_run(
+                self._active_execution_run_id,
+                tool_rounds=tool_rounds,
+            )
+            self._persist_execution_checkpoint(
+                cursor="decision_ready",
+                status="running",
+                state={
+                    "tool_rounds": tool_rounds,
+                    "pending_tool_calls": [
+                        {"id": call.id, "name": call.name}
+                        for call in response.tool_calls
+                    ],
+                    "budget": asdict(task.budget),
+                },
+            )
 
             for tool_call in response.tool_calls:
                 evidence_answer = self._answer_from_existing_evidence(
@@ -575,10 +678,33 @@ class AgentLoop:
                         tool_runs=tool_runs,
                         success=False,
                     )
+                self._persist_execution_checkpoint(
+                    cursor="executing_tool",
+                    status="running",
+                    state={
+                        "tool_rounds": tool_rounds,
+                        "tool_call": {"id": tool_call.id, "name": tool_call.name},
+                        "budget": asdict(current_task.budget),
+                    },
+                )
                 tool_result = self._execute_tool_call(tool_call)
                 tool_runs.append(tool_result)
                 current_task = self._tasks.require_task(task.id)
                 if current_task.status == "waiting_user":
+                    self._persist_execution_checkpoint(
+                        cursor="waiting_approval",
+                        status="waiting_approval",
+                        state={
+                            "tool_rounds": tool_rounds,
+                            "tool_call": {"id": tool_call.id, "name": tool_call.name},
+                            "pending_action_id": (
+                                current_task.pending_action.id
+                                if current_task.pending_action is not None
+                                else None
+                            ),
+                            "budget": asdict(current_task.budget),
+                        },
+                    )
                     return self._finalize_turn(
                         session_id=resolved_session_id,
                         user_input=user_input,
@@ -629,6 +755,17 @@ class AgentLoop:
                         "tool_call_id": tool_call.id,
                         "content": tool_result.content if tool_result.success else (tool_result.error or tool_result.content or "Tool execution failed."),
                     }
+                )
+                self._persist_execution_checkpoint(
+                    cursor="observation_ready",
+                    status="running",
+                    state={
+                        "tool_rounds": tool_rounds,
+                        "tool_call": {"id": tool_call.id, "name": tool_call.name},
+                        "success": tool_result.success,
+                        "error": tool_result.error,
+                        "budget": asdict(current_task.budget),
+                    },
                 )
 
                 repair_stop = self._record_repair_attempt_if_needed(
@@ -790,9 +927,31 @@ class AgentLoop:
             return self._task_result(task, final_text=None, stop_reason=task.stop_reason, success=False)
 
         if event.type == "pause_requested":
-            return self._task_result(self._tasks.pause(task.id, event=event), final_text=None, stop_reason="paused", success=False)
+            paused = self._tasks.pause(task.id, event=event)
+            self._persist_external_pause_checkpoint(paused)
+            return self._task_result(paused, final_text=None, stop_reason="paused", success=False)
         if event.type == "resume_requested":
+            budget_paused = (
+                task.status == "paused"
+                and task.stop_reason == "max_tool_rounds_exceeded"
+            )
+            if budget_paused and task.budget.used_continuations >= task.budget.max_continuations:
+                failed = self._tasks.fail(task.id, reason="continuation_budget_exceeded")
+                return self._task_result(
+                    failed,
+                    final_text=(
+                        "This task reached the maximum number of continuation windows. "
+                        "Start a new task or refine the request."
+                    ),
+                    stop_reason="continuation_budget_exceeded",
+                    success=False,
+                )
             task = self._tasks.resume(task.id, event=event)
+            if budget_paused:
+                task = self._tasks.consume_continuation(
+                    task.id,
+                    reason="resume_after_max_tool_rounds",
+                )
             return self.run_turn(
                 user_input="",
                 session_id=task.session_id,
@@ -827,6 +986,7 @@ class AgentLoop:
         else:
             task = self._tasks.reject(task.id, event=event)
 
+        waiting_checkpoint = self._session_service.get_latest_checkpoint(task.id)
         if pending.kind != "tool_approval" or pending.decision is None:
             return self.run_turn(
                 user_input=str(event.payload.get("content", "")),
@@ -905,8 +1065,11 @@ class AgentLoop:
             allowed_tools=resolved_resume_tools,
             keep_task_open=resume_keep_task_open,
             transient_context=resume_transient_context,
+            _resume_checkpoint_id=(
+                None if waiting_checkpoint is None else waiting_checkpoint.id
+            ),
+            _resume_tool_result=tool_result,
         )
-        result.tool_runs.insert(0, tool_result)
         return result
 
     def get_task(self, task_id: str):
@@ -1029,6 +1192,8 @@ class AgentLoop:
                 task = self._tasks.fail(self._active_task_id, reason=stop_reason)
             except Exception:
                 task = self._session_service.get_task(self._active_task_id)
+            if task is not None:
+                self._close_execution_run_after_failure(task, stop_reason=stop_reason)
         resolved_session_id = (
             task.session_id
             if task is not None
@@ -1757,6 +1922,151 @@ class AgentLoop:
             return None
         return response.assistant_text.strip() or None
 
+    def _persist_execution_checkpoint(
+        self,
+        *,
+        cursor: str,
+        status: str,
+        state: dict[str, Any],
+    ) -> None:
+        run_id = self._active_execution_run_id
+        task_id = self._active_task_id
+        if run_id is None or task_id is None:
+            return
+        checkpoint_state = dict(state)
+        if self._active_provider_messages is not None:
+            checkpoint_state["provider_messages"] = _checkpoint_provider_messages(
+                self._active_provider_messages
+            )
+        checkpoint_state.setdefault("allowed_tools", list(self._turn_allowed_tools))
+        checkpoint_state.setdefault("keep_task_open", self._keep_task_open)
+        checkpoint_state.setdefault("plan_revision_id", self._tool_context.turn_state.get("plan_revision_id"))
+        checkpoint_state.setdefault("plan_node_id", self._tool_context.turn_state.get("plan_node_id"))
+        checkpoint = self._session_service.create_checkpoint(
+            task_id=task_id,
+            run_id=run_id,
+            cursor=cursor,
+            status=status,
+            state=checkpoint_state,
+        )
+        self._session_service.append_task_trace(
+            task_id,
+            "checkpoint",
+            {
+                "checkpoint_id": checkpoint.id,
+                "run_id": run_id,
+                "parent_checkpoint_id": checkpoint.parent_checkpoint_id,
+                "cursor": cursor,
+                "status": status,
+            },
+        )
+
+    def _finish_execution_run(
+        self,
+        *,
+        task: Any,
+        stop_reason: str | None,
+        success: bool,
+        tool_rounds: int,
+    ) -> None:
+        run_id = self._active_execution_run_id
+        if run_id is None:
+            return
+        if task.status == "waiting_user":
+            run_status = "waiting_approval"
+            cursor = "waiting_approval"
+        elif stop_reason == "max_tool_rounds_exceeded":
+            run_status = "paused_by_budget"
+            cursor = "paused_by_budget"
+        elif success:
+            run_status = "completed"
+            cursor = "completed"
+        else:
+            run_status = "failed"
+            cursor = "failed"
+        self._session_service.update_execution_run(
+            run_id,
+            status=run_status,
+            tool_rounds=tool_rounds,
+            stop_reason=stop_reason,
+        )
+        self._persist_execution_checkpoint(
+            cursor=cursor,
+            status=run_status,
+            state={
+                "tool_rounds": tool_rounds,
+                "task_status": task.status,
+                "stop_reason": stop_reason,
+                "budget": asdict(task.budget),
+            },
+        )
+
+    def _close_execution_run_after_interruption(self, task: Any, *, stop_reason: str) -> None:
+        run_id = self._active_execution_run_id
+        if run_id is None:
+            return
+        try:
+            self._session_service.update_execution_run(
+                run_id,
+                status="interrupted",
+                stop_reason=stop_reason,
+            )
+            self._persist_execution_checkpoint(
+                cursor="paused_by_user",
+                status="interrupted",
+                state={
+                    "task_status": task.status,
+                    "stop_reason": stop_reason,
+                },
+            )
+        except Exception:
+            # The original interruption has already been handled; do not mask it
+            # with a secondary persistence error.
+            return
+
+    def _persist_external_pause_checkpoint(self, task: Any) -> None:
+        """Close a still-running window when a pause command arrives out of band."""
+
+        runs = self._session_service.list_execution_runs(task.id)
+        active = next((run for run in reversed(runs) if run.status == "running"), None)
+        if active is None:
+            return
+        self._active_task_id = task.id
+        self._active_execution_run_id = active.id
+        try:
+            self._session_service.update_execution_run(
+                active.id,
+                status="paused_by_user",
+                stop_reason="pause_requested",
+            )
+            self._persist_execution_checkpoint(
+                cursor="paused_by_user",
+                status="paused_by_user",
+                state={
+                    "task_status": task.status,
+                    "stop_reason": "pause_requested",
+                },
+            )
+        except Exception:
+            return
+
+    def _close_execution_run_after_failure(self, task: Any, *, stop_reason: str) -> None:
+        run_id = self._active_execution_run_id
+        if run_id is None:
+            return
+        try:
+            run = self._session_service.get_execution_run(run_id)
+            if run.status in {"completed", "failed", "paused_by_budget", "paused_by_user", "interrupted", "waiting_approval"}:
+                return
+            self._finish_execution_run(
+                task=task,
+                stop_reason=stop_reason,
+                success=False,
+                tool_rounds=run.tool_rounds,
+            )
+        except Exception:
+            return
+
     def _finalize_turn(
         self,
         *,
@@ -1852,15 +2162,39 @@ class AgentLoop:
             )
 
         if (
-            not self._keep_task_open
+            (
+                stop_reason == "max_tool_rounds_exceeded"
+                or stop_reason in {
+                    "model_call_budget_exceeded",
+                    "tool_call_budget_exceeded",
+                    "token_budget_exceeded",
+                    "active_time_budget_exceeded",
+                }
+                or not self._keep_task_open
+            )
             and task.status != "waiting_user"
             and task.status not in {"completed", "failed", "cancelled", "expired"}
         ):
             task = (
-                self._tasks.complete(task.id, reason=stop_reason or "completed")
-                if success
-                else self._tasks.fail(task.id, reason=stop_reason or "failed")
+                self._tasks.pause_for_budget(task.id, reason="max_tool_rounds_exceeded")
+                if stop_reason == "max_tool_rounds_exceeded"
+                else (
+                    self._tasks.complete(task.id, reason=stop_reason or "completed")
+                    if success
+                    else self._tasks.fail(task.id, reason=stop_reason or "failed")
+                )
             )
+
+        self._finish_execution_run(
+            task=task,
+            stop_reason=stop_reason,
+            success=success,
+            tool_rounds=(
+                self._session_service.get_execution_run(self._active_execution_run_id).tool_rounds
+                if self._active_execution_run_id is not None
+                else 0
+            ),
+        )
 
         return TurnResult(
             session_id=session_id,
@@ -1999,6 +2333,67 @@ def _message_to_provider_message(message: Message) -> dict[str, Any]:
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
     return payload
+
+
+def _checkpoint_provider_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy the resumable conversation while keeping shell commands redacted."""
+
+    result: list[dict[str, Any]] = []
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message = dict(raw_message)
+        raw_tool_calls = message.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            tool_calls: list[dict[str, Any]] = []
+            for raw_call in raw_tool_calls:
+                if not isinstance(raw_call, dict):
+                    continue
+                call = dict(raw_call)
+                function = call.get("function")
+                if isinstance(function, dict):
+                    function = dict(function)
+                    if function.get("name") == "shell":
+                        raw_arguments = function.get("arguments", "")
+                        try:
+                            arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        command = arguments.get("command") if isinstance(arguments, dict) else ""
+                        function["arguments"] = json.dumps(
+                            {"command_sha256": hashlib.sha256(str(command).encode("utf-8")).hexdigest()},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    call["function"] = function
+                tool_calls.append(call)
+            message["tool_calls"] = tool_calls
+        result.append(message)
+    return result
+
+
+def _restore_checkpoint_messages(checkpoint: Any) -> list[dict[str, Any]] | None:
+    if checkpoint is None or not isinstance(checkpoint.state, dict):
+        return None
+    raw_messages = checkpoint.state.get("provider_messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return None
+    messages = [dict(message) for message in raw_messages if isinstance(message, dict)]
+    return messages or None
+
+
+def _provider_messages_contain_tool_call(
+    messages: list[dict[str, Any]],
+    tool_call_id: str,
+) -> bool:
+    return any(
+        any(
+            isinstance(tool_call, dict) and tool_call.get("id") == tool_call_id
+            for tool_call in message.get("tool_calls", [])
+        )
+        for message in messages
+        if isinstance(message.get("tool_calls"), list)
+    )
 
 
 def _assistant_tool_message(response: ModelResponse) -> dict[str, Any]:

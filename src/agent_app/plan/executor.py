@@ -10,8 +10,8 @@ from agent_app.plan.graph import PlanNode, ready_node_ids, select_non_conflictin
 from agent_app.plan.store import PlanRevision, PlanRevisionLeaseConflict, PlanStore
 
 
-NodeExecutionStatus = Literal["completed", "failed", "waiting_approval"]
-PlanExecutionStatus = Literal["completed", "failed", "waiting_approval", "blocked"]
+NodeExecutionStatus = Literal["completed", "failed", "waiting_approval", "paused"]
+PlanExecutionStatus = Literal["completed", "failed", "waiting_approval", "paused", "blocked"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +149,15 @@ class PlanExecutor:
                         tuple(executed),
                         waiting_node_id=waiting_node.id,
                     )
+                paused_node = _first_node_with_status(plan, "paused")
+                if paused_node is not None:
+                    return PlanExecutionResult(
+                        "paused",
+                        plan,
+                        tuple(executed),
+                        waiting_node_id=paused_node.id,
+                        failure_reason="node_execution_window_exhausted",
+                    )
                 running_node = _first_node_with_status(plan, "running")
                 if running_node is not None:
                     return PlanExecutionResult(
@@ -192,6 +201,7 @@ class PlanExecutor:
                     plan = self._store.get_revision_by_id(running_plan.id)
                     failed_nodes: list[tuple[str, NodeExecutionResult]] = []
                     waiting_nodes: list[str] = []
+                    paused_nodes: list[tuple[str, NodeExecutionResult]] = []
                     for node_id in batch:
                         outcome = outcomes[node_id]
                         plan = self._store.heartbeat_execution_lease(
@@ -211,6 +221,8 @@ class PlanExecutor:
                             failed_nodes.append((node_id, outcome))
                         elif outcome.status == "waiting_approval":
                             waiting_nodes.append(node_id)
+                        elif outcome.status == "paused":
+                            paused_nodes.append((node_id, outcome))
                     if failed_nodes:
                         for failed_node_id, _outcome in failed_nodes:
                             plan = self._skip_dependents(plan, failed_node_id=failed_node_id)
@@ -227,6 +239,17 @@ class PlanExecutor:
                             plan,
                             tuple(executed),
                             waiting_node_id=waiting_nodes[0],
+                        )
+                    if paused_nodes:
+                        node_id, outcome = paused_nodes[0]
+                        return PlanExecutionResult(
+                            "paused",
+                            plan,
+                            tuple(executed),
+                            waiting_node_id=node_id,
+                            failure_reason=(
+                                outcome.error or "node_execution_window_exhausted"
+                            ),
                         )
                     continue
 
@@ -289,6 +312,27 @@ class PlanExecutor:
         if node.status != "waiting_approval":
             raise RuntimeError(f"Node '{node_id}' is not waiting for approval.")
         return self._store.resume_waiting_node(
+            plan.id,
+            node_id,
+            expected_version=plan.version,
+        )
+
+    def resume_paused_node(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        revision: int | None = None,
+    ) -> PlanRevision:
+        plan = self._load_plan(task_id, revision)
+        if plan.status != "active":
+            raise RuntimeError(f"Plan revision '{plan.graph.revision}' is not active.")
+        node = plan.graph.node_map().get(node_id)
+        if node is None:
+            raise KeyError(node_id)
+        if node.status != "paused":
+            raise RuntimeError(f"Node '{node_id}' is not paused.")
+        return self._store.resume_paused_node(
             plan.id,
             node_id,
             expected_version=plan.version,

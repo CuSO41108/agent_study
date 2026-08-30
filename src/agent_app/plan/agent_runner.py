@@ -40,11 +40,21 @@ class PlanAgentNodeRunner:
                     "kind": None if pending is None else pending.kind,
                 },
             )
+        if result.stop_reason == "max_tool_rounds_exceeded" or result.task_status == "paused":
+            return NodeExecutionResult(
+                status="paused",
+                error="Node execution window exhausted; explicit continuation is required.",
+                metadata={
+                    "stop_reason": result.stop_reason,
+                },
+            )
         if result.success:
             return NodeExecutionResult(
                 status="completed",
                 output=result.final_text,
-                metadata={"stop_reason": result.stop_reason},
+                metadata={
+                    "stop_reason": result.stop_reason,
+                },
             )
         return NodeExecutionResult(
             status="failed",

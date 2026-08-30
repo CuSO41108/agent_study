@@ -237,6 +237,34 @@ class PlanExecutionTests(unittest.TestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(calls, ["inspect", "edit", "edit", "verify"])
 
+    def test_paused_node_can_be_resumed_without_restarting_completed_nodes(self) -> None:
+        self.store.create_revision(self.task.id, _graph())
+        calls: list[str] = []
+
+        def runner(context):
+            calls.append(context.node.id)
+            if context.node.id == "edit" and calls.count("edit") == 1:
+                return NodeExecutionResult(
+                    "paused",
+                    error="execution window exhausted",
+                )
+            return NodeExecutionResult("completed", output=f"done:{context.node.id}")
+
+        executor = PlanExecutor(self.store, runner)
+        paused = executor.execute(task_id=self.task.id)
+
+        self.assertEqual(paused.status, "paused")
+        self.assertEqual(paused.waiting_node_id, "edit")
+        self.assertEqual(paused.revision.graph.node_map()["edit"].status, "paused")
+        self.assertEqual(calls, ["inspect", "edit"])
+
+        pending = executor.resume_paused_node(task_id=self.task.id, node_id="edit")
+        self.assertEqual(pending.graph.node_map()["edit"].status, "pending")
+        completed = executor.execute(task_id=self.task.id)
+
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(calls, ["inspect", "edit", "edit", "verify"])
+
     def test_replan_supersedes_old_revision_and_preserves_completed_evidence(self) -> None:
         first = self.store.create_revision(self.task.id, _graph())
         running = self.store.update_node_status(first.id, "inspect", "running", expected_version=first.version)

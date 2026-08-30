@@ -99,6 +99,38 @@ class _AlwaysFailLoop(_AgentLoop):
         )
 
 
+class _PauseThenSuccessLoop(_AgentLoop):
+    def __init__(self, runtime: TaskRuntime) -> None:
+        super().__init__()
+        self.runtime = runtime
+        self.attempt = 0
+
+    def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        self.attempt += 1
+        task_id = kwargs["_task_id"]
+        if self.attempt == 1:
+            self.runtime.pause_for_budget(task_id, reason="max_tool_rounds_exceeded")
+            return TurnResult(
+                session_id=kwargs["session_id"],
+                final_text=None,
+                stop_reason="max_tool_rounds_exceeded",
+                tool_runs=[],
+                success=False,
+                task_id=task_id,
+                task_status="paused",
+            )
+        return TurnResult(
+            session_id=kwargs["session_id"],
+            final_text="continued node done",
+            stop_reason="final_response",
+            tool_runs=[],
+            success=True,
+            task_id=task_id,
+            task_status="running",
+        )
+
+
 class _ReplanPlannerModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -343,6 +375,35 @@ class PlanTaskServiceTests(unittest.TestCase):
         failures = [trace for trace in traces if trace.trace_type == "plan_failure"]
         self.assertEqual(len(failures), 1 + result.task.budget.max_replans)
         self.assertEqual(failures[-1].payload["failure_reason"], "node_failed")
+
+    def test_paused_plan_node_resumes_from_checkpoint_without_replan(self) -> None:
+        loop = _PauseThenSuccessLoop(TaskRuntime(self.sessions))
+        store = PlanStore(self.db_path)
+        service = PlanTaskService(
+            planner=PlanPlanner(_PlannerModel()),
+            plan_store=store,
+            session_service=self.sessions,
+            agent_loop=loop,
+        )
+
+        first = service.start(session_id=self.session_id, goal="Inspect in bounded node windows")
+
+        self.assertEqual(first.execution.status, "paused")
+        self.assertEqual(first.task.status, "paused")
+        self.assertEqual(first.revision.graph.node_map()["inspect"].status, "paused")
+        self.assertEqual(first.task.budget.used_replans, 0)
+        self.assertEqual(len(loop.calls), 1)
+
+        second = service.resume(task_id=first.task.id)
+
+        self.assertEqual(second.execution.status, "completed")
+        self.assertEqual(second.task.status, "completed")
+        self.assertEqual(second.revision.graph.node_map()["inspect"].status, "completed")
+        self.assertEqual(second.task.budget.used_continuations, 1)
+        self.assertEqual(len(loop.calls), 3)
+        self.assertEqual(loop.calls[1]["_task_id"], first.task.id)
+        self.assertEqual(loop.calls[2]["_task_id"], first.task.id)
+        self.assertEqual(second.task.budget.used_replans, 0)
 
     def test_auto_replan_failure_closes_task_and_revision(self) -> None:
         planner_model = _BadReplanModel()

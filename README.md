@@ -38,7 +38,7 @@ agent-app --configure
 
 ## 核心亮点
 
-**持久化 TaskState 状态机** — 每个目标都有独立生命周期（`created → running → waiting_user → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
+**持久化 TaskState 与 checkpoint** — 每个目标都有独立生命周期（`created → running → waiting_user/paused → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。一个 Task 下维护多个有边界的 `ExecutionRun`，每个执行窗口在模型决策、工具执行、观察和暂停边界写入 SQLite checkpoint；达到单窗口轮数上限时暂停并可用 `/continue` 从原 Task 的最新游标继续。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
 
 **CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。Compact 模式持续追加人类可读的工具摘要、耗时和结果统计，默认缓存 stdout/stderr，完整过程可通过 `/trace` 回放；`--verbose` 或 `/verbose` 可切换到详细实时输出。空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
 
@@ -54,7 +54,7 @@ agent-app --configure
 
 **结构化观察、预算与 Trace** — 超时、冲突、拒绝、权限错误等统一为 `Observation`。模型调用、工具调用、token、活跃时间、重试和重复决策均受预算限制；`/trace`、`--task-trace` 和 `--watch-trace` 让一次任务的决策和执行过程可回放。
 
-**只读审计与 Dry Replay** — `--task-replay TASK_ID --replay-mode audit` 检查事件顺序、工具调用和副作用 `ToolAction` 是否一致；`--replay-mode dry` 只按持久化事件生成“会跳过哪些执行”的报告，不调用模型、不执行工具、不改变 SQLite。Live rerun 不属于默认回放能力，恢复必须走显式 `/resume`、人工副作用收敛和重新审批路径。
+**只读审计与 Dry Replay** — `--task-replay TASK_ID --replay-mode audit` 检查事件顺序、工具调用和副作用 `ToolAction` 是否一致；`--replay-mode dry` 只按持久化事件生成“会跳过哪些执行”的报告，不调用模型、不执行工具、不改变 SQLite。Live rerun 不属于默认回放能力，恢复必须走显式 `/resume`（或 `/continue`）、人工副作用收敛和重新审批路径。
 
 **受控子代理与外部研究** — Root agent 只在边界清晰时通过 `delegate_task` 创建 worker Session，并限制深度与每回合数量。用户明确要求查阅公开资料时会触发 `web_search` 预研，来源 URL 随结果进入上下文。
 
@@ -83,7 +83,7 @@ agent-app --configure
                               SessionService / TaskRuntime
                                            │
                          .agent_app/agent.db (SQLite)
-                         sessions · tasks · events · traces · actions · memory_records · Skill activations · drafts
+                         sessions · tasks · execution_runs · checkpoints · events · traces · actions · memory_records · Skill activations · drafts
 ```
 
 主要目录：
@@ -128,7 +128,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/trace [task-id前缀]` | 查看任务执行时间线 |
 | `/approve` / `/reject` | 批准或拒绝等待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态任务 |
-| `/pause` / `/resume` | 暂停或恢复任务 |
+| `/pause` / `/resume` / `/continue` | 暂停或从最新 checkpoint 恢复任务 |
 | `/resolve-action [--all]` | 列出或用人工证据收敛中断节点的不确定副作用；`--all` 跨 Session 搜索，全部动作决议后再执行 `/resume` |
 | `/handoff [task-id前缀]` | 从安全 checkpoint 创建新 Session 接力任务 |
 | `/skills` | 列出有效的项目与用户全局 Skill |
@@ -146,6 +146,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 
 ```powershell
 agent-app --task-status TASK_ID       # 查看 task 状态
+agent-app --continue-task TASK_ID     # 从最新 checkpoint 继续任务
 agent-app --task-trace TASK_ID        # 渲染时间线
 agent-app --task-trace-json TASK_ID   # 导出结构化 Trace
 agent-app --watch-trace               # 跟随当前活跃/最新任务

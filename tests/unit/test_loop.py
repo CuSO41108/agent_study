@@ -16,7 +16,7 @@ from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.file_write import FileWriteTool, inspect_file_write_request
 from agent_app.tools.registry import build_default_registry, build_root_registry
-from agent_app.types import AgentEvent, ModelResponse, PendingAction, ToolCall, ToolResult
+from agent_app.types import AgentEvent, ModelResponse, PendingAction, TaskBudget, ToolCall, ToolResult
 
 
 class _FakeModelClient:
@@ -439,6 +439,10 @@ class AgentLoopTests(unittest.TestCase):
 
         waiting = first_loop.run_turn(user_input="check status")
         task = self.sessions.get_task(waiting.task_id)
+        checkpoint = self.sessions.get_latest_checkpoint(task.id)
+        self.assertIsNotNone(checkpoint)
+        self.assertNotIn("git status --short", json.dumps(checkpoint.state, ensure_ascii=False))
+        self.assertIn("command_sha256", json.dumps(checkpoint.state, ensure_ascii=False))
         restarted_loop = self._build_loop(_FakeModelClient([]))
         result = restarted_loop.handle_event(
             AgentEvent(
@@ -729,6 +733,69 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.stop_reason, "max_tool_rounds_exceeded")
         self.assertEqual(len(result.tool_runs), 8)
+        self.assertEqual(result.task_status, "paused")
+        self.assertEqual(self.sessions.get_task(result.task_id).status, "paused")
+        checkpoints = self.sessions.list_checkpoints(result.task_id)
+        self.assertEqual(checkpoints[-1].cursor, "paused_by_budget")
+        self.assertEqual(checkpoints[-1].status, "paused_by_budget")
+
+    def test_global_budget_exhaustion_remains_terminal_failure(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([ToolCall(id="budget-call", name="file_read", arguments={"path": "README.md"})]),
+            _text_response("must not be called"),
+        ])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(
+            user_input="consume the model budget",
+            budget=TaskBudget(max_model_calls=1),
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "model_call_budget_exceeded")
+        self.assertEqual(result.task_status, "failed")
+        self.assertEqual(self.sessions.list_execution_runs(result.task_id)[-1].status, "failed")
+        self.assertEqual(self.sessions.get_latest_checkpoint(result.task_id).cursor, "failed")
+
+    def test_budget_paused_task_continues_from_same_task_and_budget(self) -> None:
+        model = _FakeModelClient(
+            [_tool_call_response([ToolCall(id=f"call-{index}", name="file_read", arguments={"path": "README.md"})]) for index in range(1, 10)]
+            + [_text_response("continued")]
+        )
+        loop = self._build_loop(model)
+
+        first = loop.run_turn(user_input="inspect in bounded windows")
+        task = self.sessions.get_task(first.task_id)
+        paused_checkpoint = self.sessions.get_latest_checkpoint(task.id)
+        self.assertIsNotNone(paused_checkpoint)
+        event = AgentEvent(
+            id="continue-budget-paused",
+            task_id=task.id,
+            session_id=task.session_id,
+            type="resume_requested",
+            source="test",
+            expected_version=task.version,
+        )
+
+        second = loop.handle_event(event)
+
+        self.assertFalse(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(first.task_id, second.task_id)
+        self.assertEqual(second.final_text, "continued")
+        continued_task = self.sessions.get_task(second.task_id)
+        self.assertEqual(continued_task.status, "completed")
+        self.assertEqual(continued_task.budget.used_continuations, 1)
+        runs = self.sessions.list_execution_runs(second.task_id)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0].status, "paused_by_budget")
+        self.assertEqual(runs[1].status, "completed")
+        self.assertEqual(runs[1].parent_checkpoint_id, paused_checkpoint.id)
+        resumed_call = model.calls[9]
+        self.assertTrue(any(message.get("role") == "tool" for message in resumed_call["messages"]))
+        self.assertTrue(any(message.get("role") == "assistant" and message.get("tool_calls") for message in resumed_call["messages"]))
+        checkpoint_state = paused_checkpoint.state
+        self.assertIn("provider_messages", checkpoint_state)
 
     def test_repeated_failed_tool_stops_after_second_failure(self) -> None:
         model = _FakeModelClient([

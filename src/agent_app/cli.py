@@ -74,6 +74,8 @@ _REPL_HELP = """Commands:
               Pause a running task before handing it off.
   /resume [task-id-prefix]
               Resume a paused task.
+  /continue [task-id-prefix]
+              Continue a paused task from its latest checkpoint.
   /resolve-action [--all] [action-id-prefix succeeded|failed "reason" -- evidence]
               List or resolve interrupted side effects; --all searches every Session.
   /handoff [task-id-prefix]
@@ -122,6 +124,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/cancel", "Cancel a non-terminal task."),
     CommandSpec("/pause", "Pause a running task."),
     CommandSpec("/resume", "Resume a paused task."),
+    CommandSpec("/continue", "Continue a paused task from its latest checkpoint."),
     CommandSpec("/resolve-action", "Resolve an interrupted side effect with human evidence."),
     CommandSpec("/handoff", "Move a task into a new session."),
     CommandSpec("/sessions", "Show recent sessions and their progress."),
@@ -462,6 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
     controls.add_argument("--pause-task", metavar="TASK_ID", help="Pause a running task.")
     controls.add_argument("--resume-task", metavar="TASK_ID", help="Resume or recover a persisted task.")
+    controls.add_argument("--continue-task", metavar="TASK_ID", help="Continue a persisted task from its latest checkpoint.")
     controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
     controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
     controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
@@ -676,7 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         if isinstance(result, PlanTaskResult):
             print(json.dumps(result, default=_serialize, ensure_ascii=False))
-            return 0 if result.execution.status in {"completed", "waiting_approval"} else 1
+            return 0 if result.execution.status in {"completed", "waiting_approval", "paused"} else 1
         print(json.dumps(result, default=_serialize, ensure_ascii=False))
         return 0 if result.success or result.task_status in {"paused", "cancelled", "waiting_user"} else 1
     if interactive:
@@ -706,7 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             planned = plan_service.start(session_id=plan_session_id, goal=decision.goal)
             _print_plan_task_result(planned)
             _persist_current_session(session_state_path, planned.task.session_id)
-            return 0 if planned.execution.status in {"completed", "waiting_approval"} else 1
+            return 0 if planned.execution.status in {"completed", "waiting_approval", "paused"} else 1
         plan_continuation = _try_resume_plan_user_message(
             plan_service=plan_service,
             session_service=sessions,
@@ -717,7 +721,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if plan_continuation is not None:
             _print_plan_task_result(plan_continuation)
             _persist_current_session(session_state_path, plan_continuation.task.session_id)
-            return 0 if plan_continuation.execution.status in {"completed", "waiting_approval"} else 1
+            return 0 if plan_continuation.execution.status in {"completed", "waiting_approval", "paused"} else 1
         result = loop.run_turn(user_input=decision.goal, session_id=resolved_session_id)
     except ActiveTaskConflict as exc:
         print(f"Task error: {exc}", file=sys.stderr)
@@ -915,6 +919,7 @@ def _selected_task_control(args) -> tuple[str, str] | None:
         ("status", "task_status"),
         ("pause", "pause_task"),
         ("resume", "resume_task"),
+        ("resume", "continue_task"),
         ("cancel", "cancel_task"),
         ("approve", "approve_task"),
         ("reject", "reject_task"),
@@ -1087,13 +1092,14 @@ def _run_interactive_loop(
             if task is not None:
                 print(render_task_timeline(export_task_trace(session_service, task.id)))
             continue
-        if command in {"/approve", "/reject", "/cancel", "/pause", "/resume"}:
+        if command in {"/approve", "/reject", "/cancel", "/pause", "/resume", "/continue"}:
+            control_command = "/resume" if command == "/continue" else command
             result = _run_repl_task_control(
                 loop=loop,
                 plan_service=plan_service,
                 session_service=session_service,
                 session_id=current_session_id,
-                command=command,
+                command=control_command,
                 task_prefix=raw_target.strip() or None,
             )
             if result is not None:
@@ -1779,6 +1785,8 @@ def _run_repl_task_control(
     command: str,
     task_prefix: str | None = None,
 ) -> TurnResult | PlanTaskResult | None:
+    if command == "/continue":
+        command = "/resume"
     tasks = session_service.list_tasks(session_id)
     if command in {"/approve", "/reject"}:
         candidates = [
@@ -1813,7 +1821,7 @@ def _run_repl_task_control(
                 print("No running task exists in this session.")
             return None
         event_type = "pause_requested"
-    elif command == "/resume":
+    elif command in {"/resume", "/continue"}:
         candidates = [
             item
             for item in reversed(tasks)

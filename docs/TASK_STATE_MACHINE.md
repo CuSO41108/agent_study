@@ -66,6 +66,8 @@ SQLite 使用三组任务表：
 - `tasks`：当前 Task 快照
 - `task_events`：append-only 事件日志
 - `task_traces`：模型、决策、审批、工具、预算和状态迁移记录
+- `execution_runs`：每个 ReAct/Plan 节点执行窗口的边界、轮数和结束原因
+- `checkpoints`：窗口内可恢复的游标及其状态快照；Shell 命令在快照中仅保留哈希
 
 ## 运行入口
 
@@ -78,7 +80,15 @@ SQLite 使用三组任务表：
 - `task_status`
 - `pending_action`
 
-CLI 支持 `--task-status`、`--pause-task`、`--resume-task`、`--cancel-task`、
+一个 Task 可以拥有多个有边界的 `ExecutionRun`。每次 `run_turn()` 都创建一个
+新的执行窗口；窗口结束时写入最终 checkpoint。`max_tool_rounds` 只限制当前窗口，
+而模型调用、工具调用、token、时间和 continuation 上限属于整个 Task。
+
+达到单窗口轮数上限时，普通 Task 和 Plan 节点都会进入 `paused`，不会立即变成
+`failed`。CLI 的 `/resume` 与 `/continue` 会复用原 Task 和最新 checkpoint，并
+跳过已有明确结果的 ToolAction；全局 TaskBudget 耗尽仍然进入 `failed`。
+
+CLI 支持 `--task-status`、`--pause-task`、`--resume-task`、`--continue-task`、`--cancel-task`、
 `--approve-task`、`--reject-task` 和 `--resolve-tool-action`。ToolAction 的
 人工 resolution 是动作事实，不会为 Task 或 PlanNode 增加恢复状态；只有证据
 明确后，显式 resume 才能重试未生效动作或接受已生效动作而不重放。恢复判定

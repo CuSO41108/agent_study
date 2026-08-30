@@ -85,6 +85,8 @@ class PlanTaskService:
         if revision is None:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
         decision = self._recovery.inspect(task.id)
+        if decision.kind == RecoveryKind.PAUSED:
+            return self.resume(task_id=task_id, decision=decision)
         if decision.kind in {
             RecoveryKind.LEASE_ACTIVE,
             RecoveryKind.INTERRUPTED,
@@ -201,21 +203,67 @@ class PlanTaskService:
 
         task = self._require_task(task_id)
         if fresh.kind == RecoveryKind.PAUSED:
-            task = self._tasks.resume(
-                task.id,
-                event=AgentEvent(
-                    id=str(uuid4()),
-                    task_id=task.id,
-                    session_id=task.session_id,
-                    type="resume_requested",
-                    source="plan_recovery",
-                    correlation_id=task.id,
-                    expected_version=task.version,
-                ),
-            )
+            if task.stop_reason == "max_tool_rounds_exceeded":
+                if task.budget.used_continuations >= task.budget.max_continuations:
+                    failed = self._tasks.fail(task.id, reason="continuation_budget_exceeded")
+                    return self._finalize_failed_execution(
+                        task_id,
+                        PlanExecutionResult(
+                            "failed",
+                            self._plan_store.get_revision_by_id(fresh.revision_id or ""),
+                            failure_reason="continuation_budget_exceeded",
+                        ),
+                    )
+                task = self._tasks.resume(
+                    task.id,
+                    event=AgentEvent(
+                        id=str(uuid4()),
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        type="resume_requested",
+                        source="plan_recovery",
+                        correlation_id=task.id,
+                        expected_version=task.version,
+                    ),
+                )
+                task = self._tasks.consume_continuation(
+                    task.id,
+                    reason="resume_after_max_tool_rounds",
+                )
+            else:
+                task = self._tasks.resume(
+                    task.id,
+                    event=AgentEvent(
+                        id=str(uuid4()),
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        type="resume_requested",
+                        source="plan_recovery",
+                        correlation_id=task.id,
+                        expected_version=task.version,
+                    ),
+                )
         revision = self._plan_store.get_active_revision(task_id)
         if revision is None:
             raise PlanRecoveryError(fresh)
+        if fresh.kind == RecoveryKind.PAUSED and fresh.node_id is not None:
+            revision = self._plan_store.resume_paused_node(
+                revision.id,
+                fresh.node_id,
+                expected_version=revision.version,
+            )
+            self._sessions.append_task_trace(
+                task_id,
+                "plan_recovery_resume_checkpoint",
+                {
+                    "plan_id": revision.graph.id,
+                    "revision": revision.graph.revision,
+                    "node_id": fresh.node_id,
+                    "from": "paused",
+                    "to": "pending",
+                    "reason": fresh.reason,
+                },
+            )
         if fresh.kind == RecoveryKind.INTERRUPTED:
             assessment = self._recovery.assess_side_effects(fresh)
             if assessment.kind in {
@@ -563,6 +611,12 @@ class PlanTaskService:
                         execution,
                         replan_error=exc,
                     )
+        if execution.status == "paused":
+            return PlanTaskResult(
+                task=task,
+                revision=self._plan_store.get_revision_by_id(execution.revision.id),
+                execution=execution,
+            )
         if execution.status == "failed":
             return self._finalize_failed_execution(task_id, execution)
         if execution.status == "completed" and task.status not in {"completed", "failed", "cancelled", "expired"}:
