@@ -142,6 +142,8 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/help` | 显示命令帮助 |
 | `exit` / `quit` | 退出 REPL |
 
+交互式 TTY 会自动启用语义化 CLI 渲染：用户输入、Agent 规划、工具计划、工具执行、审批、成功和失败使用不同颜色，并配合图标、缩进和标签区分。最终回答会单独显示为 `Result` 区块，下面另行显示 `Execution` 状态；当前普通 CLI 尚未接入独立目标验证，因此成功回答会标记为 `Result · unverified`。可用 `--color` 强制启用颜色，或用 `--no-color` 关闭颜色；重定向到管道或测试捕获时默认保留纯文本行式输出，不向 JSON 或脚本输出混入 ANSI 控制序列。
+
 ### 跨进程任务控制
 
 ```powershell

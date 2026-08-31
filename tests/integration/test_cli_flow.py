@@ -23,7 +23,7 @@ from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
 from agent_app.tools.registry import build_default_registry
-from agent_app.types import AgentEvent, ExecutionEvent, ModelResponse, PendingAction, ToolCall, ToolResult
+from agent_app.types import AgentEvent, ExecutionEvent, ModelResponse, PendingAction, ToolCall, ToolResult, TurnResult
 
 
 class _FakeModelClient:
@@ -944,6 +944,49 @@ class CliIntegrationTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Shell · List project structure", output)
         self.assertNotIn(command, output)
+
+    @patch("agent_app.cli._terminal_layout_enabled", return_value=True)
+    def test_terminal_result_layout_separates_outcome_from_execution_status(self, _layout_enabled) -> None:
+        result = TurnResult(
+            session_id="session-1",
+            final_text="The requested analysis is complete.",
+            stop_reason="final_response",
+            tool_runs=[],
+            success=True,
+            task_id="task-1",
+            task_status="completed",
+        )
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            cli._print_turn_result(result)
+
+        output = stdout.getvalue()
+        self.assertIn("Result · unverified", output)
+        self.assertIn("The requested analysis is complete.", output)
+        self.assertIn("Execution: completed · final_response", output)
+        self.assertIn("[task: task-1 | completed]", output)
+
+    def test_live_renderer_color_override_emits_ansi_for_terminal_preview(self) -> None:
+        renderer = cli._LiveExecutionRenderer(color=True)
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            renderer(
+                ExecutionEvent(
+                    type="action_planned",
+                    task_id="task-1",
+                    session_id="session-1",
+                    payload={
+                        "tool": "code_search",
+                        "tool_call_id": "search-1",
+                        "arguments": {"pattern": "subprocess"},
+                    },
+                )
+            )
+
+        self.assertIn("\x1b[", stdout.getvalue())
+        self.assertIn("Search code · subprocess", stdout.getvalue())
 
     @patch("builtins.input", side_effect=["/verbose", "/verbose", "quit"])
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")

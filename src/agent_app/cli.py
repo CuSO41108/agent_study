@@ -155,8 +155,9 @@ _COMMAND_MENU_STYLE = Style.from_dict(
 class _LiveExecutionRenderer:
     """Append agent execution events to the REPL as they arrive."""
 
-    def __init__(self, *, verbose: bool = False) -> None:
+    def __init__(self, *, verbose: bool = False, color: bool | None = None) -> None:
         self._verbose = verbose
+        self._color = color
         self._model_text = ""
         self._model_line_open = False
         self._streamed_final = False
@@ -164,9 +165,33 @@ class _LiveExecutionRenderer:
         self._active_tool_call_id: str | None = None
         self._output_stats: dict[str, dict[str, object]] = {}
 
+    @staticmethod
+    def _console(color: bool | None = None) -> Console:
+        """Create a console against the current stdout stream.
+
+        The console is intentionally created at render time rather than at
+        renderer construction time. This keeps redirected stdout usable in
+        tests and in callers that replace stdout after creating the renderer.
+        Rich automatically enables colors only when the destination supports
+        them.
+        """
+
+        return _make_cli_console(color=color)
+
+    def _print(self, value: str | Text, *, end: str = "\n", flush: bool = False, style: str | None = None) -> None:
+        rendered = value if isinstance(value, Text) else Text(value, style=style)
+        console = self._console(color=self._color)
+        console.print(rendered, end=end)
+        if flush:
+            console.file.flush()
+
     @property
     def verbose(self) -> bool:
         return self._verbose
+
+    @property
+    def color(self) -> bool | None:
+        return self._color
 
     def set_verbose(self, verbose: bool) -> None:
         self._verbose = verbose
@@ -177,7 +202,7 @@ class _LiveExecutionRenderer:
 
     def reset(self) -> None:
         if self._model_line_open:
-            print()
+            self._print("")
         self._model_text = ""
         self._model_line_open = False
         self._streamed_final = False
@@ -188,23 +213,28 @@ class _LiveExecutionRenderer:
     def __call__(self, event: ExecutionEvent) -> None:
         if event.type == "task_started":
             if self._verbose:
-                print(f"[task] Started: {event.payload.get('goal', '')}")
+                self._print(
+                    Text.assemble(
+                        ("[task] ", "bold cyan"),
+                        (f"Started: {event.payload.get('goal', '')}", "white"),
+                    )
+                )
             else:
-                print("You")
-                print(f"  {event.payload.get('goal', '')}")
+                self._print(Text("You", style="bold cyan"))
+                self._print(Text(f"  {event.payload.get('goal', '')}", style="white"))
         elif event.type == "model_started":
             self._close_model_line()
             self._model_text = ""
             if self._verbose:
-                print("[agent] Planning next step…")
+                self._print(Text("[agent] Planning next step…", style="bold magenta"))
         elif event.type == "model_text_delta":
             text = str(event.payload.get("text", ""))
             self._model_text += text
             if self._verbose:
                 if not self._model_line_open:
-                    print("[agent] ", end="", flush=True)
+                    self._print(Text("[agent] ", style="bold magenta"), end="", flush=True)
                     self._model_line_open = True
-                print(text, end="", flush=True)
+                self._print(Text(text, style="bright_white"), end="", flush=True)
         elif event.type == "action_planned":
             self._close_model_line()
             tool = event.payload.get("tool", "tool")
@@ -218,15 +248,25 @@ class _LiveExecutionRenderer:
                 self._planned_actions[call_id] = summary
                 self._output_stats[call_id] = {"lines": 0, "bytes": 0, "preview": []}
             if self._verbose:
-                print(summary)
+                self._print(Text(summary, style="yellow"))
             else:
-                print(f"● {summary}")
+                self._print(
+                    Text.assemble(
+                        ("● ", "bold yellow"),
+                        (summary, "yellow"),
+                    )
+                )
         elif event.type == "tool_started":
             self._close_model_line()
             call_id = str(event.payload.get("tool_call_id", ""))
             self._active_tool_call_id = call_id or self._active_tool_call_id
             if self._verbose:
-                print(f"[tool] Running {event.payload.get('tool', 'tool')}…")
+                self._print(
+                    Text(
+                        f"[tool] Running {event.payload.get('tool', 'tool')}…",
+                        style="bold blue",
+                    )
+                )
         elif event.type == "tool_output":
             line = str(event.payload.get("line", ""))
             call_id = str(event.payload.get("tool_call_id", "")) or self._active_tool_call_id
@@ -242,7 +282,12 @@ class _LiveExecutionRenderer:
                     if isinstance(preview, list) and len(preview) < 5:
                         preview.append((str(event.payload.get("stream", "output")), line))
             if self._verbose and line:
-                print(f"  [{event.payload.get('tool', 'tool')}/{event.payload.get('stream', 'output')}] {line}")
+                self._print(
+                    Text(
+                        f"  [{event.payload.get('tool', 'tool')}/{event.payload.get('stream', 'output')}] {line}",
+                        style="dim white",
+                    )
+                )
         elif event.type == "tool_finished":
             call_id = str(event.payload.get("tool_call_id", ""))
             tool = event.payload.get("tool", "tool")
@@ -251,7 +296,12 @@ class _LiveExecutionRenderer:
             if self._verbose:
                 status = "completed" if event.payload.get("success") else "failed"
                 detail = event.payload.get("error")
-                print(f"[tool] {tool} {status}" + (f": {detail}" if detail else ""))
+                self._print(
+                    Text(
+                        f"[tool] {tool} {status}" + (f": {detail}" if detail else ""),
+                        style="bold green" if event.payload.get("success") else "bold red",
+                    )
+                )
             else:
                 marker = "✓" if event.payload.get("success") else "✗"
                 duration_ms = _as_int(event.payload.get("duration_ms"), default=0)
@@ -266,7 +316,12 @@ class _LiveExecutionRenderer:
                     error=event.payload.get("error"),
                     preview=event.payload.get("output_preview") or stats["preview"],
                 )
-                print(detail)
+                self._print(
+                    Text(
+                        detail,
+                        style="green" if event.payload.get("success") else "red",
+                    )
+                )
             self._active_tool_call_id = None
         elif event.type == "turn_finishing":
             final_text = event.payload.get("final_text")
@@ -282,7 +337,7 @@ class _LiveExecutionRenderer:
 
     def _close_model_line(self) -> None:
         if self._model_line_open:
-            print()
+            self._print("")
             self._model_line_open = False
 
 
@@ -456,6 +511,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show detailed live tool output in interactive mode.",
     )
+    color_group = parser.add_mutually_exclusive_group()
+    color_group.add_argument(
+        "--color",
+        dest="color",
+        action="store_true",
+        help="Force colored interactive output, including when stdout is redirected.",
+    )
+    color_group.add_argument(
+        "--no-color",
+        dest="color",
+        action="store_false",
+        help="Disable colored interactive output.",
+    )
+    parser.set_defaults(color=None)
     parser.add_argument(
         "--configure",
         action="store_true",
@@ -532,7 +601,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_state_path=session_state_path,
     )
     model_client = OpenAICompatibleModelClient.from_config(config)
-    live_renderer = _LiveExecutionRenderer(verbose=args.verbose) if interactive else None
+    live_renderer = _LiveExecutionRenderer(verbose=args.verbose, color=args.color) if interactive else None
+    confirmation_handler = lambda tool_call, context: prompt_for_tool_confirmation(
+        tool_call,
+        context,
+        color=args.color,
+    )
     skill_registry = SkillRegistry(config.workspace_root)
     subagent_runner = SubagentRunner(
         model_client=model_client,
@@ -541,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tool_timeout=config.tool_timeout,
         context_token_budget=config.context_token_budget,
         summary_trigger_tokens=config.summary_trigger_tokens,
-        confirmation_handler=prompt_for_tool_confirmation,
+        confirmation_handler=confirmation_handler,
         worker_registry=build_worker_registry(skill_registry=skill_registry),
         skill_registry=skill_registry,
     )
@@ -563,7 +637,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tool_timeout=config.tool_timeout,
         context_token_budget=config.context_token_budget,
         summary_trigger_tokens=config.summary_trigger_tokens,
-        confirmation_handler=prompt_for_tool_confirmation,
+        confirmation_handler=confirmation_handler,
         skill_registry=skill_registry,
         execution_event_handler=live_renderer,
     )
@@ -735,9 +809,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 
-def prompt_for_tool_confirmation(tool_call: ToolCall, context: ToolExecutionContext) -> bool | str:
+def prompt_for_tool_confirmation(
+    tool_call: ToolCall,
+    context: ToolExecutionContext,
+    *,
+    color: bool | None = None,
+) -> bool | str:
     prompt_text = _build_confirmation_prompt(tool_call, context)
-    print(prompt_text)
+    if _terminal_layout_enabled(color=color):
+        _make_cli_console(color=color).print(
+            Panel(
+                Text(prompt_text),
+                title="Approval required",
+                border_style="yellow",
+                padding=(0, 1),
+            )
+        )
+    else:
+        print(prompt_text)
     try:
         if tool_call.name == "shell":
             command = str(tool_call.arguments.get("command", ""))
@@ -1187,6 +1276,7 @@ def _run_interactive_loop(
         _print_turn_result(
             result,
             suppress_final_text=live_renderer.consume_streamed_final() if live_renderer is not None else False,
+            color=live_renderer.color if live_renderer is not None else None,
         )
 
 
@@ -1980,7 +2070,77 @@ def _print_task_summary(task: TaskState) -> None:
         print(f"  stop_reason: {task.stop_reason}")
 
 
-def _print_turn_result(result: TurnResult, *, suppress_final_text: bool = False) -> None:
+def _terminal_layout_enabled(*, color: bool | None = None) -> bool:
+    """Use visual result blocks only for an actual interactive terminal."""
+
+    return color is True or bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _make_cli_console(*, color: bool | None = None) -> Console:
+    """Create a Rich console with deterministic TTY color behavior."""
+
+    layout_enabled = _terminal_layout_enabled(color=color)
+    colors_disabled = (color is False) or (
+        color is None and bool(os.environ.get("NO_COLOR"))
+    ) or not layout_enabled
+    return Console(
+        file=sys.stdout,
+        force_terminal=layout_enabled,
+        color_system="standard" if layout_enabled and not colors_disabled else None,
+        no_color=colors_disabled,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
+def _result_style(*, success: bool, task_status: str | None) -> str:
+    if success:
+        return "green"
+    if task_status in {"paused", "waiting_user", "waiting_tool"}:
+        return "yellow"
+    return "red"
+
+
+def _print_turn_result(
+    result: TurnResult,
+    *,
+    suppress_final_text: bool = False,
+    color: bool | None = None,
+) -> None:
+    if _terminal_layout_enabled(color=color):
+        style = _result_style(success=result.success, task_status=result.task_status)
+        console = _make_cli_console(color=color)
+        if result.final_text:
+            console.print(
+                Text(
+                    "Result · unverified" if result.success else "Result · incomplete",
+                    style=f"bold {style}",
+                )
+            )
+            if not suppress_final_text:
+                console.print(
+                    Panel(
+                        Text(result.final_text),
+                        border_style=style,
+                        padding=(0, 1),
+                    )
+                )
+        elif not result.success:
+            console.print(
+                Text(
+                    f"Result · {result.stop_reason or 'unknown_error'}",
+                    style=f"bold {style}",
+                )
+            )
+        if result.task_id is not None:
+            status = result.task_status or "unknown"
+            execution_detail = f"Execution: {status}"
+            if result.stop_reason:
+                execution_detail += f" · {result.stop_reason}"
+            console.print(Text(execution_detail, style=f"bold {style}"))
+            console.print(Text(f"[task: {result.task_id} | {status}]", style="dim white"))
+        return
+
     if result.final_text and not suppress_final_text:
         print(result.final_text)
     elif not result.success:
