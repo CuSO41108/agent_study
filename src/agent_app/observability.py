@@ -229,6 +229,13 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
         return f"{attributes.get('from', '∅')} → {attributes.get('to', '?')}"
     if event_type == "model_call":
         return f"{attributes.get('phase', 'model')} / {attributes.get('model', 'unknown')} / {attributes.get('total_tokens', 0)} tokens / {attributes.get('duration_ms', 0)} ms"
+    if event_type == "checkpoint" and attributes.get("phase") == "planning":
+        detail = (
+            f"planning / {attributes.get('request_status', '?')} / "
+            f"attempt {attributes.get('attempt', '?')}/{attributes.get('max_attempts', '?')}"
+        )
+        error_detail = attributes.get("error_detail")
+        return f"{detail} / {error_detail}" if error_detail else detail
     if event_type == "decision":
         return f"tool calls: {len(attributes.get('tool_calls', []))}"
     if event_type == "approval":

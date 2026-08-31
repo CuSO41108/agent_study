@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
 from agent_app.plan.executor import PlanExecutionResult, PlanExecutor, PlanNodeContext
-from agent_app.plan.graph import resource_claims_for_node
-from agent_app.plan.planner import PlanPlanner
+from agent_app.plan.graph import PlanGraph, resource_claims_for_node
+from agent_app.plan.planner import PlanPlanner, PlannerAttemptHook
 from agent_app.plan.recovery import (
     PlanRecoveryError,
     PlanRecoveryService,
@@ -67,7 +68,7 @@ class PlanTaskService:
         task = self._tasks.start_for_user_message(session_id=session_id, user_input=goal)
         self._sessions.append_message(session_id, Message(role="user", content=goal))
         try:
-            graph = self._planner.create_plan(goal)
+            graph = self._create_plan_with_checkpoint(task.id, goal)
             revision = self._plan_store.create_revision(task.id, graph)
         except Exception:
             task = self._tasks.fail(task.id, reason="planner_failed")
@@ -377,7 +378,7 @@ class PlanTaskService:
         if current is None:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
         self._tasks.consume_replan(task.id, reason=reason)
-        candidate = self._planner.create_replan(current=current, reason=reason)
+        candidate = self._create_replan_with_checkpoint(task.id, current=current, reason=reason)
         revision = self._plan_store.create_replan(
             task.id,
             candidate,
@@ -400,6 +401,171 @@ class PlanTaskService:
             },
         )
         return self._execute_and_reconcile(task.id, revision, auto_replan=automatic)
+
+    def _create_plan_with_checkpoint(self, task_id: str, goal: str) -> PlanGraph:
+        return self._run_planner_with_checkpoint(
+            task_id=task_id,
+            operation="initial_plan",
+            invoke=lambda on_attempt: self._planner.create_plan(goal, on_attempt=on_attempt),
+        )
+
+    def _create_replan_with_checkpoint(
+        self,
+        task_id: str,
+        *,
+        current: PlanRevision,
+        reason: str,
+    ) -> PlanGraph:
+        return self._run_planner_with_checkpoint(
+            task_id=task_id,
+            operation="replan",
+            invoke=lambda on_attempt: self._planner.create_replan(
+                current=current,
+                reason=reason,
+                on_attempt=on_attempt,
+            ),
+        )
+
+    def _run_planner_with_checkpoint(
+        self,
+        *,
+        task_id: str,
+        operation: str,
+        invoke: Callable[[PlannerAttemptHook], PlanGraph],
+    ) -> PlanGraph:
+        task = self._require_task(task_id)
+        latest = self._sessions.get_latest_checkpoint(task_id)
+        run = self._sessions.create_execution_run(
+            task_id=task_id,
+            agent_id="planner",
+            scope=f"planner:{operation}",
+            max_tool_rounds=1,
+            parent_checkpoint_id=None if latest is None else latest.id,
+        )
+        max_attempts = self._planner.max_request_attempts
+        self._persist_planner_checkpoint(
+            task_id=task_id,
+            run_id=run.id,
+            operation=operation,
+            request_status="requesting",
+            attempt=0,
+            max_attempts=max_attempts,
+        )
+        last_request_status = "requesting"
+
+        def on_attempt(info: dict[str, Any]) -> None:
+            nonlocal last_request_status
+            last_request_status = str(info.get("request_status", "failed"))
+            self._persist_planner_checkpoint(
+                task_id=task_id,
+                run_id=run.id,
+                operation=operation,
+                request_status=last_request_status,
+                attempt=int(info.get("attempt", 0)),
+                max_attempts=int(info.get("max_attempts", max_attempts)),
+                error_type=info.get("error_type"),
+                error_detail=info.get("error_detail"),
+                retryable=bool(info.get("retryable", False)),
+                retry_delay_seconds=float(info.get("retry_delay_seconds", 0.0)),
+            )
+
+        try:
+            graph = invoke(on_attempt)
+        except Exception as exc:
+            error_type = getattr(exc, "error_type", None) or type(exc).__name__
+            error_detail = getattr(exc, "detail", None) or str(exc)
+            attempts = int(getattr(exc, "attempts", 0) or 1)
+            if last_request_status != "failed":
+                self._persist_planner_checkpoint(
+                    task_id=task_id,
+                    run_id=run.id,
+                    operation=operation,
+                    request_status="failed",
+                    attempt=attempts,
+                    max_attempts=max_attempts,
+                    error_type=str(error_type),
+                    error_detail=str(error_detail),
+                )
+            self._sessions.update_execution_run(
+                run.id,
+                status="failed",
+                stop_reason="planner_failed",
+            )
+            raise
+
+        self._sessions.update_execution_run(
+            run.id,
+            status="completed",
+            stop_reason="plan_created" if operation == "initial_plan" else "replan_created",
+        )
+        self._persist_planner_checkpoint(
+            task_id=task_id,
+            run_id=run.id,
+            operation=operation,
+            request_status="completed",
+            attempt=max_attempts if last_request_status == "retrying" else 1,
+            max_attempts=max_attempts,
+            plan_id=getattr(graph, "id", None),
+            node_count=len(getattr(graph, "nodes", ())),
+        )
+        return graph
+
+    def _persist_planner_checkpoint(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        operation: str,
+        request_status: str,
+        attempt: int,
+        max_attempts: int,
+        error_type: object | None = None,
+        error_detail: object | None = None,
+        retryable: bool = False,
+        retry_delay_seconds: float = 0.0,
+        plan_id: str | None = None,
+        node_count: int | None = None,
+    ) -> None:
+        is_completed = request_status == "completed"
+        is_failed = request_status == "failed"
+        cursor = "completed" if is_completed else "failed" if is_failed else "planning"
+        status = "completed" if is_completed else "failed" if is_failed else "running"
+        state: dict[str, Any] = {
+            "phase": "planning",
+            "operation": operation,
+            "request_status": request_status,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "retryable": retryable,
+            "retry_delay_seconds": retry_delay_seconds,
+        }
+        if error_type is not None:
+            state["error_type"] = str(error_type)
+        if error_detail:
+            state["error_detail"] = str(error_detail)
+        if plan_id is not None:
+            state["plan_id"] = plan_id
+        if node_count is not None:
+            state["node_count"] = node_count
+        checkpoint = self._sessions.create_checkpoint(
+            task_id=task_id,
+            run_id=run_id,
+            cursor=cursor,
+            status=status,
+            state=state,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "checkpoint",
+            {
+                "checkpoint_id": checkpoint.id,
+                "run_id": run_id,
+                "parent_checkpoint_id": checkpoint.parent_checkpoint_id,
+                "cursor": cursor,
+                "status": status,
+                **state,
+            },
+        )
 
     def handle_approval(
         self,

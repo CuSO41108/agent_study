@@ -38,7 +38,7 @@ agent-app --configure
 
 ## 核心亮点
 
-**持久化 TaskState 与 checkpoint** — 每个目标都有独立生命周期（`created → running → waiting_user/paused → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。一个 Task 下维护多个有边界的 `ExecutionRun`，每个执行窗口在模型决策、工具执行、观察和暂停边界写入 SQLite checkpoint；达到单窗口轮数上限时暂停并可用 `/continue` 从原 Task 的最新游标继续。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
+**持久化 TaskState 与 checkpoint** — 每个目标都有独立生命周期（`created → running → waiting_user/paused → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。一个 Task 下维护多个有边界的 `ExecutionRun`，Planner 请求、模型决策、工具执行、观察和暂停边界都会写入 SQLite checkpoint；达到单窗口轮数上限时暂停并可用 `/continue` 从原 Task 的最新游标继续。Planner 的网络 `request_error` 最多重试 2 次，使用 0.5s、1.0s 的指数退避，并记录每次尝试和安全错误详情。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
 
 **CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。Compact 模式持续追加人类可读的工具摘要、耗时和结果统计，默认缓存 stdout/stderr，完整过程可通过 `/trace` 回放；`--verbose` 或 `/verbose` 可切换到详细实时输出。空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
 
@@ -161,6 +161,10 @@ agent-app --cancel-task TASK_ID       # 取消
 agent-app --resolve-tool-action ACTION_ID --resolution failed `
   --resolution-reason "原内容仍存在" --resolution-evidence "src/module.py sha256:before"
 ```
+
+### ReAct 与 Plan-and-Execute
+
+两者是请求入口处互斥的执行模式：路由器会选择 ReAct 或 Plan-and-Execute，不会在 Planner 请求失败时静默切换到另一条分支。Plan-and-Execute 是外层的 DAG 编排；每个计划节点仍通过受限的 `AgentLoop` 执行，因此节点内部使用的是 ReAct 式的“模型决策 → 工具 → Observation”循环。也就是说，Plan-and-Execute 包含多个有边界的 ReAct 节点执行窗口，但不是 Planner 和 ReAct 在同一层互相兜底。
 
 ## Skill 使用方式
 

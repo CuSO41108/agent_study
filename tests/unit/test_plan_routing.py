@@ -16,6 +16,16 @@ class _FakePlannerModel:
         return self.response
 
 
+class _SequencePlannerModel:
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = responses
+        self.calls: list[dict] = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
+
+
 class PlanRoutingTests(unittest.TestCase):
     def test_simple_task_defaults_to_react(self) -> None:
         decision = route_request("read README.md")
@@ -109,6 +119,86 @@ class PlanRoutingTests(unittest.TestCase):
         )
         with self.assertRaises(PlanPlanningError):
             PlanPlanner(tool_model).create_plan("Inspect")
+
+    def test_planner_retries_request_errors_with_exponential_backoff(self) -> None:
+        valid_plan = ModelResponse(
+            assistant_text=(
+                '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                '"objective": "Read the source.", "depends_on": [], '
+                '"allowed_tools": ["file_read"], "acceptance": ["Source read."]}]}'
+            )
+        )
+        model = _SequencePlannerModel(
+            [
+                ModelResponse(
+                    assistant_text=None,
+                    error_type="request_error",
+                    raw_response={"detail": "temporary connection reset"},
+                ),
+                ModelResponse(
+                    assistant_text=None,
+                    error_type="request_error",
+                    raw_response={"detail": "temporary timeout"},
+                ),
+                valid_plan,
+            ]
+        )
+        delays: list[float] = []
+
+        plan = PlanPlanner(
+            model,
+            max_request_retries=2,
+            retry_base_delay=0.25,
+            retry_max_delay=4.0,
+            sleep=delays.append,
+        ).create_plan("Inspect the repository")
+
+        self.assertEqual(plan.nodes[0].id, "inspect")
+        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(delays, [0.25, 0.5])
+
+    def test_planner_reports_sanitized_detail_after_retry_limit(self) -> None:
+        model = _SequencePlannerModel(
+            [
+                ModelResponse(
+                    assistant_text=None,
+                    error_type="request_error",
+                    raw_response={
+                        "detail": "connection refused; Authorization: Bearer super-secret-token"
+                    },
+                )
+            ]
+        )
+        delays: list[float] = []
+
+        with self.assertRaises(PlanPlanningError) as raised:
+            PlanPlanner(model, sleep=delays.append).create_plan("Inspect")
+
+        error = raised.exception
+        self.assertEqual(error.error_type, "request_error")
+        self.assertEqual(error.attempts, 3)
+        self.assertIn("connection refused", str(error))
+        self.assertNotIn("super-secret-token", str(error))
+        self.assertEqual(delays, [0.5, 1.0])
+
+    def test_planner_does_not_retry_non_request_model_errors(self) -> None:
+        model = _SequencePlannerModel(
+            [
+                ModelResponse(
+                    assistant_text=None,
+                    error_type="http_error",
+                    raw_response={"status": 401, "body": "invalid model credentials"},
+                )
+            ]
+        )
+        delays: list[float] = []
+
+        with self.assertRaises(PlanPlanningError) as raised:
+            PlanPlanner(model, sleep=delays.append).create_plan("Inspect")
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(delays, [])
+        self.assertIn("HTTP 401", str(raised.exception))
 
 
 if __name__ == "__main__":

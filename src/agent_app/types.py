@@ -141,6 +141,7 @@ ExecutionRunStatus = Literal[
     "failed",
 ]
 CheckpointCursor = Literal[
+    "planning",
     "await_model",
     "decision_ready",
     "waiting_approval",

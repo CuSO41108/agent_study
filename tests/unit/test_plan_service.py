@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from agent_app.plan import PlanPlanner, PlanStore, PlanTaskService, parse_plan_graph
+from agent_app.plan import PlanPlanner, PlanPlanningError, PlanStore, PlanTaskService, parse_plan_graph
 from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
@@ -24,6 +24,19 @@ class _PlannerModel:
                 '"depends_on":["inspect"],"allowed_tools":["shell"],'
                 '"acceptance":["Verification passes"]}]}'
             )
+        )
+
+
+class _FailingPlannerModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, **_kwargs):
+        self.calls += 1
+        return ModelResponse(
+            assistant_text=None,
+            error_type="request_error",
+            raw_response={"detail": "connection refused; api_key=do-not-leak"},
         )
 
 
@@ -258,6 +271,56 @@ class PlanTaskServiceTests(unittest.TestCase):
             [(item["node_id"], item["from_status"], item["to_status"]) for item in transitions],
             [("inspect", "pending", "completed"), ("verify", "pending", "completed")],
         )
+        checkpoints = self.sessions.list_checkpoints(result.task.id)
+        planning_checkpoints = [
+            checkpoint for checkpoint in checkpoints if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planning_checkpoints],
+            ["requesting", "completed"],
+        )
+        self.assertEqual(planning_checkpoints[0].cursor, "planning")
+        self.assertEqual(planning_checkpoints[-1].cursor, "completed")
+        planner_run = self.sessions.get_execution_run(planning_checkpoints[-1].run_id)
+        self.assertEqual(planner_run.scope, "planner:initial_plan")
+        self.assertEqual(planner_run.status, "completed")
+
+    def test_planner_failure_persists_attempts_and_safe_detail_in_checkpoint(self) -> None:
+        planner_model = _FailingPlannerModel()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=self.loop,
+        )
+
+        with self.assertRaises(PlanPlanningError) as raised:
+            service.start(session_id=self.session_id, goal="Inspect with a transient provider failure")
+
+        task = self.sessions.get_latest_task(self.session_id)
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.status, "failed")
+        error = raised.exception
+        self.assertIn("connection refused", str(error))
+        self.assertNotIn("do-not-leak", str(error))
+        self.assertEqual(planner_model.calls, 3)
+
+        checkpoints = self.sessions.list_checkpoints(task.id)
+        planning_checkpoints = [
+            checkpoint for checkpoint in checkpoints if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planning_checkpoints],
+            ["requesting", "retrying", "retrying", "failed"],
+        )
+        self.assertEqual(planning_checkpoints[-1].status, "failed")
+        self.assertEqual(planning_checkpoints[-1].state["attempt"], 3)
+        self.assertEqual(planning_checkpoints[-1].state["error_type"], "request_error")
+        self.assertIn("connection refused", planning_checkpoints[-1].state["error_detail"])
+        self.assertNotIn("do-not-leak", planning_checkpoints[-1].state["error_detail"])
+        planner_run = self.sessions.get_execution_run(planning_checkpoints[-1].run_id)
+        self.assertEqual(planner_run.status, "failed")
 
     def test_approval_resumes_plan_node_with_its_scope_and_completes_plan(self) -> None:
         runtime = TaskRuntime(self.sessions)
@@ -349,6 +412,19 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual(replan.payload["from_revision"], 1)
         self.assertEqual(replan.payload["to_revision"], 2)
         self.assertEqual(replan.payload["preserved_completed_nodes"], [])
+        planner_checkpoints = [
+            checkpoint
+            for checkpoint in self.sessions.list_checkpoints(result.task.id)
+            if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["operation"] for checkpoint in planner_checkpoints],
+            ["initial_plan", "initial_plan", "replan", "replan"],
+        )
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planner_checkpoints],
+            ["requesting", "completed", "requesting", "completed"],
+        )
 
     def test_replan_budget_exhaustion_returns_diagnosis_and_terminal_trace(self) -> None:
         planner_model = _ReplanPlannerModel()

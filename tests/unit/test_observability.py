@@ -31,6 +31,17 @@ class ObservabilityTests(unittest.TestCase):
         session_id = self.sessions.create_session("trace-session")
         task = self.sessions.create_task(session_id, goal="inspect the project")
         self.sessions.append_task_trace(task.id, "model_call", {"phase": "policy", "model": "test", "total_tokens": 42, "duration_ms": 12})
+        self.sessions.append_task_trace(
+            task.id,
+            "checkpoint",
+            {
+                "phase": "planning",
+                "request_status": "retrying",
+                "attempt": 1,
+                "max_attempts": 3,
+                "error_detail": "temporary connection reset",
+            },
+        )
         self.sessions.append_task_trace(task.id, "approval", {"tool": "shell", "decision": "approve"})
         self.sessions.append_task_trace(task.id, "tool_attempt", {"tool": "shell", "success": True, "duration_ms": 25})
         self.sessions.append_task_trace(task.id, "plan_node_transition", {"node_id": "inspect", "from_status": "pending", "to_status": "completed"})
@@ -47,6 +58,7 @@ class ObservabilityTests(unittest.TestCase):
         self.assertGreaterEqual(len(trace["events"]), 4)
         self.assertIn("Trace:", rendered)
         self.assertIn("model_call", rendered)
+        self.assertIn("planning / retrying / attempt 1/3 / temporary connection reset", rendered)
         self.assertIn("shell / success / 25 ms", rendered)
         self.assertIn("inspect / pending → completed", rendered)
         self.assertIn("revision 1 / completed / nodes: 1", rendered)

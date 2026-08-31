@@ -66,7 +66,7 @@ SQLite 使用三组任务表：
 - `tasks`：当前 Task 快照
 - `task_events`：append-only 事件日志
 - `task_traces`：模型、决策、审批、工具、预算和状态迁移记录
-- `execution_runs`：每个 ReAct/Plan 节点执行窗口的边界、轮数和结束原因
+- `execution_runs`：Planner 请求、每个 ReAct/Plan 节点执行窗口的边界、轮数和结束原因
 - `checkpoints`：窗口内可恢复的游标及其状态快照；Shell 命令在快照中仅保留哈希
 
 ## 运行入口
@@ -146,7 +146,10 @@ runtime_error 和 uncertain_side_effect。
 ## 轻量推理
 
 - Planner：仅在新建多步骤 Task 或已有 Task Plan 需要继续时记录触发，不替代
-  ReAct Policy。
+  ReAct Policy。Planner 请求本身也有 `scope=planner:*` 的 ExecutionRun，并在
+  `planning` checkpoint 中记录 `requesting`、`retrying`、`failed` 或 `completed`。
+  网络 `request_error` 最多重试两次，采用 0.5s、1.0s 的指数退避；其他模型错误
+  不自动重试。
 - Critic：以确定性规则保护副作用动作，并在最终答案阶段记录证据情况。
 - Reflection：重试耗尽、连续失败或重复决策时最多触发一次，并占用重规划预算。
 
@@ -161,6 +164,7 @@ Task Trace 立即记录：
 - Approval：pending/approve/reject、风险和恢复来源
 - Tool：参数、参数哈希、attempt、retry_of、耗时、错误语义和副作用
 - Observation：status、error_type、retryable、evidence 和 duration
+- Checkpoint：cursor/status、Planner 请求阶段、尝试次数、退避时长和脱敏错误详情
 - Budget：完整预算快照
 - State：from/to、event、reason、version 和预算快照
 

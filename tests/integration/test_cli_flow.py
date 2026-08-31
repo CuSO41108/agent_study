@@ -305,6 +305,7 @@ class CliIntegrationTests(unittest.TestCase):
         database_path = self.workspace_root / ".agent_app" / "agent.db"
         sessions = SessionService(database_path)
         trace_types = [trace.trace_type for trace in sessions.list_task_traces(output["task"]["id"])]
+        self.assertIn("checkpoint", trace_types)
         self.assertIn("plan_created", trace_types)
         self.assertIn("plan_node_transition", trace_types)
         self.assertIn("plan_execution", trace_types)
