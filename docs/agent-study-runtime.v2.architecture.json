@@ -2,13 +2,13 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Agent Study · Runtime Architecture",
+    "title": "Agent Study · 运行时架构",
     "locale": "zh-CN",
     "output": "docs/agent-study-runtime.v2.architecture.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/CuSO41108/agent_study.git",
-      "revision": "34587adda6aca679dacfba0faa9de5f8faa502e4"
+      "revision": "82856e43962bce10a0a581f68e93e7092c233a17"
     },
     "viewBox": [1300, 650],
     "views": [
@@ -16,19 +16,25 @@
         "id": "request-loop",
         "label": "主请求链路",
         "focus": ["operator", "cli", "agent_loop", "model_client", "tool_registry", "session_service", "sqlite"],
-        "note": "从 PowerShell 输入开始，经过 ReAct 决策、工具分发，最后提交到 SQLite。"
+        "note": "从 CLI 输入开始，经过 AgentLoop 的上下文、模型和工具循环，最后提交到 SQLite。"
       },
       {
-        "id": "safety-and-recovery",
-        "label": "安全与恢复",
-        "focus": ["agent_loop", "task_runtime", "tool_registry", "approval_shell", "session_service"],
-        "note": "关注 TaskState、预算、Shell 审批和 ToolAction 如何共同约束副作用。"
+        "id": "plan-execute",
+        "label": "计划执行",
+        "focus": ["operator", "cli", "plan_service", "model_client", "agent_loop", "tool_registry", "session_service"],
+        "note": "多步骤目标经 PlanPlanner 校验为静态 DAG，再由 PlanExecutor 以节点作用域复用 AgentLoop。"
       },
       {
-        "id": "extensibility",
-        "label": "扩展能力",
-        "focus": ["agent_loop", "tool_registry", "session_service"],
-        "note": "ToolRegistry 还承载 Skill、搜索、Todo 与 delegate_task 等可扩展能力。"
+        "id": "checkpoint-recovery",
+        "label": "检查点与恢复",
+        "focus": ["agent_loop", "task_runtime", "approval_shell", "checkpoint_recovery", "session_service", "sqlite"],
+        "note": "ExecutionRun 和 checkpoint 记录暂停边界；恢复前还要处理审批与不确定副作用。"
+      },
+      {
+        "id": "extensibility-audit",
+        "label": "扩展与审计",
+        "focus": ["agent_loop", "tool_registry", "session_service", "checkpoint_recovery"],
+        "note": "ToolRegistry 汇聚 Skill、搜索、Todo 和 delegate_task；Trace 与 checkpoint 支撑回放和审计。"
       }
     ]
   },
@@ -38,7 +44,7 @@
       "type": "external",
       "label": "用户 / 脚本",
       "sublabel": "PowerShell",
-      "pos": [30, 260],
+      "pos": [30, 285],
       "size": [130, 68],
       "sources": [
         { "path": "README.md", "line": 5, "label": "CLI-first 边界" }
@@ -49,11 +55,12 @@
       "type": "frontend",
       "label": "CLI / REPL",
       "sublabel": "argparse + prompt_toolkit",
-      "pos": [220, 260],
-      "size": [140, 68],
+      "pos": [220, 285],
+      "size": [150, 68],
       "tag": "agent-app",
       "sources": [
-        { "path": "src/agent_app/cli.py", "line": 27, "end_line": 58, "label": "入口与组件装配" }
+        { "path": "src/agent_app/cli.py", "line": 494, "end_line": 578, "label": "配置与组件装配" },
+        { "path": "src/agent_app/cli.py", "line": 1266, "end_line": 1350, "label": "计划与恢复命令" }
       ]
     },
     {
@@ -61,12 +68,12 @@
       "type": "backend",
       "label": "AgentLoop",
       "sublabel": "ReAct + context_builder",
-      "pos": [420, 260],
-      "size": [160, 72],
+      "pos": [420, 285],
+      "size": [170, 76],
       "tag": "决策中枢",
       "sources": [
-        { "path": "src/agent_app/orchestrator/loop.py", "line": 55, "end_line": 109, "label": "模型与工具编排" },
-        { "path": "src/agent_app/orchestrator/context_builder.py", "line": 13, "end_line": 79, "label": "上下文预算与拼装" },
+        { "path": "src/agent_app/orchestrator/loop.py", "line": 55, "end_line": 159, "label": "运行入口" },
+        { "path": "src/agent_app/orchestrator/loop.py", "line": 1925, "end_line": 2002, "label": "运行窗口与检查点" },
         { "path": "docs/ARCHITECTURE.md", "line": 53, "end_line": 72, "label": "核心运行流程" }
       ]
     },
@@ -76,7 +83,7 @@
       "label": "OpenAI-Compatible Model",
       "sublabel": "/v1/chat/completions",
       "pos": [420, 70],
-      "size": [160, 72],
+      "size": [170, 72],
       "tag": "可替换 Provider",
       "sources": [
         { "path": "src/agent_app/model/openai_compatible.py", "line": 13, "end_line": 59, "label": "请求与工具协议" },
@@ -84,12 +91,26 @@
       ]
     },
     {
+      "id": "plan_service",
+      "type": "backend",
+      "label": "PlanTaskService",
+      "sublabel": "Planner · Executor · Recovery",
+      "pos": [210, 70],
+      "size": [175, 76],
+      "tag": "多步骤任务",
+      "sources": [
+        { "path": "src/agent_app/plan/service.py", "line": 43, "end_line": 82, "label": "计划创建与编排" },
+        { "path": "src/agent_app/plan/service.py", "line": 177, "end_line": 257, "label": "checkpoint 恢复" },
+        { "path": "src/agent_app/plan/executor.py", "line": 60, "end_line": 87, "label": "节点执行入口" }
+      ]
+    },
+    {
       "id": "tool_registry",
       "type": "backend",
       "label": "ToolRegistry",
       "sublabel": "文件 · Shell · Skill",
-      "pos": [640, 260],
-      "size": [160, 72],
+      "pos": [640, 285],
+      "size": [165, 76],
       "tag": "能力路由",
       "sources": [
         { "path": "src/agent_app/tools/registry.py", "line": 17, "end_line": 58, "label": "Root / Worker 工具集" },
@@ -101,12 +122,13 @@
       "type": "security",
       "label": "TaskRuntime",
       "sublabel": "TaskState · budget",
-      "pos": [420, 500],
-      "size": [160, 72],
+      "pos": [420, 515],
+      "size": [170, 76],
       "tag": "状态护栏",
       "sources": [
         { "path": "src/agent_app/runtime/task_runtime.py", "line": 34, "end_line": 71, "label": "任务生命周期" },
-        { "path": "src/agent_app/runtime/task_runtime.py", "line": 318, "end_line": 357, "label": "预算停止条件" }
+        { "path": "src/agent_app/runtime/task_runtime.py", "line": 330, "end_line": 357, "label": "continuation 预算" },
+        { "path": "docs/TASK_STATE_MACHINE.md", "line": 83, "end_line": 94, "label": "执行窗口边界" }
       ]
     },
     {
@@ -114,13 +136,27 @@
       "type": "security",
       "label": "Shell Approval",
       "sublabel": "PowerShell + ToolAction",
-      "pos": [640, 500],
-      "size": [160, 72],
+      "pos": [640, 515],
+      "size": [180, 76],
       "tag": "默认逐条审批",
       "sources": [
-        { "path": "src/agent_app/tools/approval.py", "line": 37, "end_line": 60, "label": "命令分类与硬拒绝" },
-        { "path": "src/agent_app/tools/shell.py", "line": 13, "end_line": 104, "label": "受控执行" },
-        { "path": "src/agent_app/runtime/shell_runtime.py", "line": 24, "end_line": 104, "label": "超时与进程树" }
+        { "path": "src/agent_app/tools/approval.py", "line": 37, "end_line": 57, "label": "命令分类与硬拒绝" },
+        { "path": "src/agent_app/tools/shell.py", "line": 13, "end_line": 30, "label": "Shell 风险契约" },
+        { "path": "src/agent_app/runtime/shell_runtime.py", "line": 90, "end_line": 142, "label": "进程与超时" }
+      ]
+    },
+    {
+      "id": "checkpoint_recovery",
+      "type": "security",
+      "label": "Checkpoint / Recovery",
+      "sublabel": "ExecutionRun · resume",
+      "pos": [870, 515],
+      "size": [190, 76],
+      "tag": "显式恢复",
+      "sources": [
+        { "path": "src/agent_app/orchestrator/loop.py", "line": 1925, "end_line": 2002, "label": "快照与结束状态" },
+        { "path": "src/agent_app/plan/recovery.py", "line": 65, "end_line": 79, "label": "恢复判定" },
+        { "path": "docs/TASK_STATE_MACHINE.md", "line": 69, "end_line": 96, "label": "持久化恢复契约" }
       ]
     },
     {
@@ -128,11 +164,12 @@
       "type": "backend",
       "label": "SessionService",
       "sublabel": "Session / Task / Trace / Memory",
-      "pos": [860, 260],
-      "size": [170, 72],
+      "pos": [860, 285],
+      "size": [180, 76],
       "tag": "事务持久化",
       "sources": [
-        { "path": "src/agent_app/state/session_service.py", "line": 66, "end_line": 163, "label": "状态与任务存取" },
+        { "path": "src/agent_app/state/session_service.py", "line": 531, "end_line": 690, "label": "ExecutionRun / checkpoint" },
+        { "path": "src/agent_app/state/session_service.py", "line": 1224, "end_line": 1483, "label": "ToolAction 生命周期" },
         { "path": "docs/ARCHITECTURE.md", "line": 30, "end_line": 38, "label": "状态层职责" }
       ]
     },
@@ -141,51 +178,57 @@
       "type": "database",
       "label": "SQLite",
       "sublabel": ".agent_app/agent.db",
-      "pos": [1090, 260],
-      "size": [150, 72],
+      "pos": [1100, 285],
+      "size": [150, 76],
       "tag": "单文件状态源",
       "sources": [
-        { "path": "src/agent_app/state/db.py", "line": 265, "end_line": 333, "label": "Schema 初始化与索引" },
+        { "path": "src/agent_app/state/db.py", "line": 263, "end_line": 293, "label": "ExecutionRun / checkpoint 表" },
+        { "path": "src/agent_app/state/db.py", "line": 298, "end_line": 384, "label": "Schema 与索引" },
         { "path": "README.md", "line": 83, "end_line": 86, "label": "持久化对象" }
       ]
     }
   ],
   "connections": [
-    { "id": "input-to-cli", "from": "operator", "to": "cli", "variant": "emphasis" },
+    { "id": "input-to-cli", "from": "operator", "to": "cli", "label": "prompt / command", "variant": "emphasis", "labelDy": 58 },
     { "id": "cli-to-loop", "from": "cli", "to": "agent_loop", "label": "run_turn", "variant": "emphasis" },
-    { "id": "loop-to-model", "from": "agent_loop", "to": "model_client", "label": "messages ⇄ ToolCall", "variant": "emphasis", "route": "straight", "fromSide": "top", "toSide": "bottom" },
-    { "id": "loop-to-tools", "from": "agent_loop", "to": "tool_registry", "label": "dispatch", "variant": "emphasis" },
-    { "id": "loop-to-runtime", "from": "agent_loop", "to": "task_runtime", "label": "状态 / 预算", "variant": "security", "labelDy": 24 },
-    { "id": "tools-to-approval", "from": "tool_registry", "to": "approval_shell", "label": "shell", "variant": "security", "labelDy": 24 },
-    { "id": "tools-to-session", "from": "tool_registry", "to": "session_service", "label": "tool result / trace", "variant": "dashed", "labelDy": 60 },
-    { "id": "session-to-sqlite", "from": "session_service", "to": "sqlite", "label": "commit", "variant": "emphasis" }
+    { "id": "cli-to-plan", "from": "cli", "to": "plan_service", "label": "/plan-execute", "variant": "security", "fromSide": "top", "toSide": "bottom" },
+    { "id": "plan-to-model", "from": "plan_service", "to": "model_client", "label": "PlanGraph 请求", "variant": "emphasis", "labelDy": 58 },
+    { "id": "plan-to-loop", "from": "plan_service", "to": "agent_loop", "label": "节点作用域", "variant": "emphasis", "fromSide": "bottom", "toSide": "top" },
+    { "id": "loop-to-model", "from": "agent_loop", "to": "model_client", "label": "messages ⇄ ToolCall", "variant": "emphasis", "route": "straight", "fromSide": "top", "toSide": "bottom", "labelDx": 55 },
+    { "id": "loop-to-tools", "from": "agent_loop", "to": "tool_registry", "label": "dispatch", "variant": "emphasis", "labelDx": -40, "labelDy": -32 },
+    { "id": "loop-to-runtime", "from": "agent_loop", "to": "task_runtime", "label": "状态 / 预算", "variant": "security", "labelDy": 26, "labelDx": -50 },
+    { "id": "tools-to-approval", "from": "tool_registry", "to": "approval_shell", "label": "shell", "variant": "security", "fromSide": "bottom", "toSide": "top", "labelDy": 26 },
+    { "id": "loop-to-checkpoint", "from": "agent_loop", "to": "checkpoint_recovery", "label": "pause / snapshot", "variant": "security", "fromSide": "right", "toSide": "top", "via": [[620, 323], [620, 240], [840, 240], [840, 480], [965, 480]] },
+    { "id": "checkpoint-to-session", "from": "checkpoint_recovery", "to": "session_service", "label": "restore / persist", "variant": "dashed", "fromSide": "top", "toSide": "bottom", "labelDx": 80 },
+    { "id": "loop-to-session", "from": "agent_loop", "to": "session_service", "label": "tool result / trace", "variant": "dashed", "fromSide": "top", "toSide": "top", "via": [[505, 210], [950, 210]] },
+    { "id": "session-to-sqlite", "from": "session_service", "to": "sqlite", "label": "事务提交", "variant": "emphasis" }
   ],
   "cards": [
     {
       "dot": "cyan",
       "title": "面试主线",
       "items": [
-        "CLI 负责交互与装配，AgentLoop 是模型—工具 ReAct 编排中心。",
-        "context_builder 按预算组装 summary、todo、evidence 和 Memory。",
-        "模型返回文本或 ToolCall，ToolRegistry 分发后把结果送回下一轮。"
-      ]
-    },
-    {
-      "dot": "rose",
-      "title": "安全追问",
-      "items": [
-        "Shell 默认逐条审批，递归/批量删除硬拒绝；当前 Session 可授权明确前缀。",
-        "文件写入和受控 Shell 先持久化 ToolAction，副作用不确定时不自动重试。",
-        "TaskRuntime 用状态迁移、乐观锁和预算停止条件约束执行。"
+        "CLI 装配 AgentLoop、PlanTaskService 与 SessionService；目标按复杂度进入两条路径。",
+        "AgentLoop 组装上下文，调用模型并循环处理 ToolCall。",
+        "结果、事件、Trace 与 Memory 经 SessionService 写入 SQLite。"
       ]
     },
     {
       "dot": "emerald",
-      "title": "扩展与可靠性",
+      "title": "计划执行",
       "items": [
-        "SkillRegistry 先暴露元数据，匹配后按需加载并固定来源哈希。",
-        "SubagentRunner 通过 delegate_task 创建受限 worker，并对结果做 review。",
-        "SessionService 将 Session、Task、Trace、Action、Memory 写入工作区 SQLite。"
+        "PlanPlanner 生成静态 DAG；PlanExecutor 按依赖、ResourceClaim 和 lease 调度。",
+        "节点复用 AgentLoop 作用域；审批或 ask_user 只恢复原节点。",
+        "失败可在 max_replans 内生成 successor revision，保留已完成证据。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "恢复与安全",
+      "items": [
+        "每个 run_turn() 建立 ExecutionRun，并在暂停边界写 checkpoint。",
+        "/resume /continue 从最新游标恢复；Shell 快照只保留命令哈希。",
+        "不确定 ToolAction 先收敛证据，成功才接受效果，失败才重试。"
       ]
     }
   ]
