@@ -38,7 +38,7 @@ agent-app --configure
 
 ## 核心亮点
 
-**持久化 TaskState 与 checkpoint** — 每个目标都有独立生命周期（`created → running → waiting_user/paused → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。一个 Task 下维护多个有边界的 `ExecutionRun`，Planner 请求、模型决策、工具执行、观察和暂停边界都会写入 SQLite checkpoint；达到单窗口轮数上限时暂停并可用 `/continue` 从原 Task 的最新游标继续。Planner 的网络 `request_error` 最多重试 2 次，使用 0.5s、1.0s 的指数退避，并记录每次尝试和安全错误详情。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
+**持久化 TaskState 与 checkpoint** — 每个目标都有独立生命周期（`created → running → waiting_user/paused → completed/failed/cancelled`，以及安全接力后的 `handed_off`）。一个 Task 下维护多个有边界的 `ExecutionRun`，Planner 请求、模型决策、工具执行、观察和暂停边界都会写入 SQLite checkpoint；达到单窗口轮数上限时暂停并可用 `/continue` 从原 Task 的最新游标继续。Planner 的网络 `request_error` 最多重试 2 次，使用 0.5s、1.0s 的指数退避，并记录每次尝试和安全错误详情；重试耗尽或返回非法 Plan 时，Planner run/checkpoint 记为 `failed`，Task 则进入可恢复的 `paused`，用户可显式 `/continue` 在原 Task 上重新规划。恢复沿用 Task 总预算并消耗 continuation，最多 2 次；replan 恢复保留原 active revision 和已完成节点。状态迁移、任务事件和 Trace 均使用 SQLite 事务与乐观锁持久化；文件编辑审批可跨进程恢复，重启后的待审批 Shell 命令会失效而不是被静默执行。
 
 **CLI-first 交互体验** — REPL 启动时显示模型、工作区和 Session。Compact 模式持续追加人类可读的工具摘要、耗时和结果统计，默认缓存 stdout/stderr，完整过程可通过 `/trace` 回放；`--verbose` 或 `/verbose` 可切换到详细实时输出。空提示符输入 `/` 会打开带简短说明的单列命令菜单，支持方向键和 Enter；一次性命令不打印 Banner，避免破坏脚本、评测和自动化。
 
@@ -128,7 +128,7 @@ agent-app --task-trace TASK_ID          # 查看持久化任务时间线
 | `/trace [task-id前缀]` | 查看任务执行时间线 |
 | `/approve` / `/reject` | 批准或拒绝等待审批的工具动作 |
 | `/cancel [task-id前缀]` | 取消非终态任务 |
-| `/pause` / `/resume` / `/continue` | 暂停或从最新 checkpoint 恢复任务 |
+| `/pause` / `/resume` / `/continue` | 暂停或从最新 checkpoint 恢复任务；也可显式重试失败的 Planner checkpoint |
 | `/resolve-action [--all]` | 列出或用人工证据收敛中断节点的不确定副作用；`--all` 跨 Session 搜索，全部动作决议后再执行 `/resume` |
 | `/handoff [task-id前缀]` | 从安全 checkpoint 创建新 Session 接力任务 |
 | `/skills` | 列出有效的项目与用户全局 Skill |

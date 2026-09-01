@@ -21,11 +21,13 @@ class PlanPlanningError(ValueError):
         error_type: str | None = None,
         detail: str | None = None,
         attempts: int | None = None,
+        recovery_task_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.detail = detail
         self.attempts = attempts
+        self.recovery_task_id = recovery_task_id
 
 
 PlannerAttemptHook = Callable[[dict[str, Any]], None]

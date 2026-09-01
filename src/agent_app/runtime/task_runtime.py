@@ -191,6 +191,18 @@ class TaskRuntime:
             reason=reason,
         )
 
+    def pause_for_recovery(self, task_id: str, *, reason: str) -> TaskState:
+        """Pause a failed execution phase whose durable checkpoint can be retried."""
+
+        return self.transition(
+            task_id,
+            target_status="paused",
+            event_type="state_transition",
+            source="runtime",
+            stop_reason=reason,
+            reason=reason,
+        )
+
     def resume(self, task_id: str, *, event: AgentEvent | None = None) -> TaskState:
         return self.transition(
             task_id,

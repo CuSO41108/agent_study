@@ -55,6 +55,21 @@ class _RetryThenSuccessPlannerModel:
         return _PlannerModel().generate()
 
 
+class _FailThenRecoverPlannerModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, **_kwargs):
+        self.calls += 1
+        if self.calls <= 3:
+            return ModelResponse(
+                assistant_text=None,
+                error_type="request_error",
+                raw_response={"detail": "temporary planner outage"},
+            )
+        return _PlannerModel().generate()
+
+
 class _AgentLoop:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -127,6 +142,29 @@ class _AlwaysFailLoop(_AgentLoop):
         )
 
 
+class _CompleteThenFailThenSuccessLoop(_AgentLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.verify_attempts = 0
+
+    def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        task_id = kwargs["_task_id"]
+        node_id = kwargs["plan_node_id"]
+        if node_id == "verify":
+            self.verify_attempts += 1
+        success = node_id == "inspect" or self.verify_attempts > 1
+        return TurnResult(
+            session_id=kwargs["session_id"],
+            final_text=f"done:{node_id}" if success else None,
+            stop_reason="final_response" if success else "node_failed",
+            tool_runs=[],
+            success=success,
+            task_id=task_id,
+            task_status="running",
+        )
+
+
 class _PauseThenSuccessLoop(_AgentLoop):
     def __init__(self, runtime: TaskRuntime) -> None:
         super().__init__()
@@ -180,7 +218,7 @@ class _ReplanPlannerModel:
         return ModelResponse(assistant_text=content)
 
 
-class _BadReplanModel:
+class _RecoverableReplanModel:
     def __init__(self) -> None:
         self.calls = 0
 
@@ -188,12 +226,22 @@ class _BadReplanModel:
         self.calls += 1
         if self.calls == 1:
             content = (
-                '{"id":"bad-replan","revision":1,"nodes":['
+                '{"id":"recoverable-replan","revision":1,"nodes":['
                 '{"id":"inspect","kind":"inspect","objective":"Inspect source.",'
-                '"depends_on":[],"allowed_tools":["file_read"],"acceptance":["Inspected"]}]}'
+                '"depends_on":[],"allowed_tools":["file_read"],"acceptance":["Inspected"]},'
+                '{"id":"verify","kind":"verify","objective":"Verify source.",'
+                '"depends_on":["inspect"],"allowed_tools":["file_read"],"acceptance":["Verified"]}]}'
             )
-        else:
+        elif self.calls == 2:
             content = "not a JSON plan"
+        else:
+            content = (
+                '{"id":"ignored","revision":99,"nodes":['
+                '{"id":"inspect","kind":"inspect","objective":"Inspect source.",'
+                '"depends_on":[],"allowed_tools":["file_read"],"acceptance":["Inspected"]},'
+                '{"id":"verify","kind":"verify","objective":"Retry verification.",'
+                '"depends_on":["inspect"],"allowed_tools":["file_read"],"acceptance":["Verified"]}]}'
+            )
         return ModelResponse(assistant_text=content)
 
 
@@ -342,11 +390,14 @@ class PlanTaskServiceTests(unittest.TestCase):
         task = self.sessions.get_latest_task(self.session_id)
         self.assertIsNotNone(task)
         assert task is not None
-        self.assertEqual(task.status, "failed")
+        self.assertEqual(task.status, "paused")
+        self.assertEqual(task.stop_reason, "planner_failed")
         error = raised.exception
         self.assertIn("connection refused", str(error))
         self.assertNotIn("do-not-leak", str(error))
         self.assertEqual(planner_model.calls, 3)
+        self.assertEqual(error.recovery_task_id, task.id)
+        self.assertTrue(service.has_recoverable_planner_failure(task_id=task.id))
 
         checkpoints = self.sessions.list_checkpoints(task.id)
         planning_checkpoints = [
@@ -363,6 +414,81 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertNotIn("do-not-leak", planning_checkpoints[-1].state["error_detail"])
         planner_run = self.sessions.get_execution_run(planning_checkpoints[-1].run_id)
         self.assertEqual(planner_run.status, "failed")
+
+    def test_continue_retries_initial_planner_on_same_task_and_checkpoint_chain(self) -> None:
+        planner_model = _FailThenRecoverPlannerModel()
+        store = PlanStore(self.db_path)
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
+            plan_store=store,
+            session_service=self.sessions,
+            agent_loop=self.loop,
+        )
+
+        with self.assertRaises(PlanPlanningError):
+            service.start(session_id=self.session_id, goal="Inspect after Planner recovery")
+
+        paused = self.sessions.get_latest_task(self.session_id)
+        self.assertIsNotNone(paused)
+        assert paused is not None
+        failed_checkpoint = self.sessions.get_latest_checkpoint(paused.id)
+        self.assertIsNotNone(failed_checkpoint)
+        assert failed_checkpoint is not None
+
+        result = service.continue_task(task_id=paused.id)
+
+        self.assertEqual(result.task.id, paused.id)
+        self.assertEqual(result.task.status, "completed")
+        self.assertEqual(result.task.budget.used_continuations, 1)
+        self.assertEqual(planner_model.calls, 4)
+        self.assertEqual(len(store.list_revisions(paused.id)), 1)
+        self.assertEqual(len(self.sessions.list_messages(self.session_id)), 1)
+        planner_runs = [
+            run
+            for run in self.sessions.list_execution_runs(paused.id)
+            if run.scope == "planner:initial_plan"
+        ]
+        self.assertEqual(len(planner_runs), 2)
+        self.assertEqual(planner_runs[1].parent_checkpoint_id, failed_checkpoint.id)
+        planning_checkpoints = [
+            checkpoint
+            for checkpoint in self.sessions.list_checkpoints(paused.id)
+            if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planning_checkpoints],
+            ["requesting", "retrying", "retrying", "failed", "requesting", "completed"],
+        )
+        self.assertFalse(service.has_recoverable_planner_failure(task_id=paused.id))
+
+    def test_repeated_initial_planner_continuations_cannot_bypass_budget(self) -> None:
+        planner_model = _FailingPlannerModel()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=self.loop,
+        )
+
+        with self.assertRaises(PlanPlanningError):
+            service.start(session_id=self.session_id, goal="Keep failing Planner requests bounded")
+        task = self.sessions.get_latest_task(self.session_id)
+        self.assertIsNotNone(task)
+        assert task is not None
+        for _ in range(task.budget.max_continuations):
+            with self.assertRaises(PlanPlanningError):
+                service.continue_task(task_id=task.id)
+
+        with self.assertRaisesRegex(RuntimeError, "continuation attempts"):
+            service.continue_task(task_id=task.id)
+
+        terminal = self.sessions.get_task(task.id)
+        self.assertIsNotNone(terminal)
+        assert terminal is not None
+        self.assertEqual(terminal.status, "failed")
+        self.assertEqual(terminal.stop_reason, "planner_continuation_budget_exceeded")
+        self.assertEqual(terminal.budget.used_continuations, terminal.budget.max_continuations)
+        self.assertEqual(planner_model.calls, 3 * (1 + terminal.budget.max_continuations))
 
     def test_approval_resumes_plan_node_with_its_scope_and_completes_plan(self) -> None:
         runtime = TaskRuntime(self.sessions)
@@ -523,30 +649,55 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual(loop.calls[2]["_task_id"], first.task.id)
         self.assertEqual(second.task.budget.used_replans, 0)
 
-    def test_auto_replan_failure_closes_task_and_revision(self) -> None:
-        planner_model = _BadReplanModel()
-        loop = _AlwaysFailLoop()
+    def test_auto_replan_failure_pauses_and_continue_preserves_completed_nodes(self) -> None:
+        planner_model = _RecoverableReplanModel()
+        loop = _CompleteThenFailThenSuccessLoop()
         store = PlanStore(self.db_path)
         service = PlanTaskService(
-            planner=PlanPlanner(planner_model),
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
             plan_store=store,
             session_service=self.sessions,
             agent_loop=loop,
         )
 
-        result = service.start(session_id=self.session_id, goal="Inspect with invalid fallback")
+        first = service.start(session_id=self.session_id, goal="Inspect and verify with recovery")
 
-        self.assertEqual(result.task.status, "failed")
-        self.assertEqual(result.revision.status, "failed")
-        self.assertIsNone(store.get_active_revision(result.task.id))
-        self.assertEqual(result.task.budget.used_replans, 1)
-        self.assertIn("auto_replan_failed", result.execution.failure_reason or "")
+        self.assertEqual(first.task.status, "paused")
+        self.assertEqual(first.task.stop_reason, "replanner_failed")
+        self.assertEqual(first.execution.status, "paused")
+        self.assertEqual(first.revision.status, "active")
+        self.assertEqual(first.revision.graph.node_map()["inspect"].status, "completed")
+        self.assertEqual(first.revision.graph.node_map()["verify"].status, "failed")
+        self.assertEqual(first.task.budget.used_replans, 1)
+        self.assertTrue(service.has_recoverable_planner_failure(task_id=first.task.id))
+        failed_checkpoint = self.sessions.get_latest_checkpoint(first.task.id)
+        self.assertIsNotNone(failed_checkpoint)
+        assert failed_checkpoint is not None
+        self.assertEqual(failed_checkpoint.state["source_revision_id"], first.revision.id)
+        self.assertTrue(failed_checkpoint.state["automatic"])
+
+        second = service.continue_task(task_id=first.task.id)
+
+        self.assertEqual(second.task.id, first.task.id)
+        self.assertEqual(second.task.status, "completed")
+        self.assertEqual(second.revision.graph.revision, 2)
+        self.assertEqual(second.revision.graph.node_map()["inspect"].status, "completed")
+        self.assertEqual(second.revision.graph.node_map()["verify"].status, "completed")
+        self.assertEqual(second.task.budget.used_replans, 1)
+        self.assertEqual(second.task.budget.used_continuations, 1)
+        self.assertEqual([call["plan_node_id"] for call in loop.calls], ["inspect", "verify", "verify"])
         trace = next(
             item
-            for item in self.sessions.list_task_traces(result.task.id)
+            for item in self.sessions.list_task_traces(first.task.id)
             if item.trace_type == "plan_replan_failed"
         )
-        self.assertEqual(trace.payload["error_type"], "PlanPlanningError")
+        self.assertEqual(trace.payload["error_type"], "invalid_plan")
+        recovered = next(
+            item
+            for item in self.sessions.list_task_traces(first.task.id)
+            if item.trace_type == "planner_recovery_completed"
+        )
+        self.assertEqual(recovered.payload["checkpoint_id"], failed_checkpoint.id)
 
     def _create_waiting_ask_user_plan(self, *, loop):
         runtime = TaskRuntime(self.sessions)

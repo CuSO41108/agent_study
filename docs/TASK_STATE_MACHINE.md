@@ -88,6 +88,15 @@ SQLite 使用三组任务表：
 `failed`。CLI 的 `/resume` 与 `/continue` 会复用原 Task 和最新 checkpoint，并
 跳过已有明确结果的 ToolAction；全局 TaskBudget 耗尽仍然进入 `failed`。
 
+Planner 请求自身失败也遵循“执行事实与任务可恢复性分离”的语义：对应的
+ExecutionRun 和 planning checkpoint 保持 `failed`，但 Task 进入 `paused`，并以
+`planner_failed` 或 `replanner_failed` 标记恢复原因。用户显式 `/continue` 后，
+系统在同一 Task 上消耗一次 continuation，创建新的 Planner ExecutionRun，并把它
+挂到失败 checkpoint 之后。初始规划成功后只创建一个 PlanRevision；replan 恢复会
+校验 source revision，沿用原 reason/automatic 标记，并由 PlanStore 保留已完成节点。
+重复失败不能通过无限 `/continue` 绕过预算，continuation 耗尽后 Task 才进入终态
+`failed`。已经处于旧版 `failed` 终态的 Task 不会被重新打开。
+
 CLI 支持 `--task-status`、`--pause-task`、`--resume-task`、`--continue-task`、`--cancel-task`、
 `--approve-task`、`--reject-task` 和 `--resolve-tool-action`。ToolAction 的
 人工 resolution 是动作事实，不会为 Task 或 PlanNode 增加恢复状态；只有证据
@@ -138,6 +147,7 @@ runtime_error 和 uncertain_side_effect。
 | 安全动作自动重试 | 2 次 |
 | 相同决策连续出现 | 3 次 |
 | Reflection 后重规划 | 1 次 |
+| 显式 continuation | 2 次 |
 
 任务终止原因以结构化字符串持久化，包括正常完成、主动放弃、取消、等待过期、
 模型错误、预算耗尽、重复决策、连续失败、无效响应、不确定副作用、Trace
@@ -149,7 +159,8 @@ runtime_error 和 uncertain_side_effect。
   ReAct Policy。Planner 请求本身也有 `scope=planner:*` 的 ExecutionRun，并在
   `planning` checkpoint 中记录 `requesting`、`retrying`、`failed` 或 `completed`。
   网络 `request_error` 最多重试两次，采用 0.5s、1.0s 的指数退避；其他模型错误
-  不自动重试。
+  不自动重试。最终失败时 Task 暂停并等待显式 `/continue`；replan checkpoint 还会
+  保存 source revision、replan reason 和 automatic 标记，避免恢复时改变原执行语义。
 - Critic：以确定性规则保护副作用动作，并在最终答案阶段记录证据情况。
 - Reflection：重试耗尽、连续失败或重复决策时最多触发一次，并占用重规划预算。
 

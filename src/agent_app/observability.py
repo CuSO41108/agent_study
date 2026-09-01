@@ -280,6 +280,26 @@ def _event_summary(event_type: str, attributes: dict[str, Any]) -> str:
             f"{attributes.get('error_type', 'error')} / "
             f"{attributes.get('error', 'automatic replan failed')}"
         )
+    if event_type == "planner_recovery_available":
+        return (
+            f"{attributes.get('operation', 'planning')} / paused / "
+            f"{attributes.get('error_type', 'error')} / explicit /continue required"
+        )
+    if event_type == "planner_recovery_started":
+        return (
+            f"{attributes.get('operation', 'planning')} / continuation "
+            f"{attributes.get('continuation', '?')}/{attributes.get('max_continuations', '?')}"
+        )
+    if event_type == "planner_recovery_completed":
+        return (
+            f"{attributes.get('operation', 'planning')} / recovered / revision "
+            f"{attributes.get('revision', '?')}"
+        )
+    if event_type == "planner_recovery_exhausted":
+        return (
+            f"{attributes.get('operation', 'planning')} / exhausted / continuations "
+            f"{attributes.get('used_continuations', '?')}/{attributes.get('max_continuations', '?')}"
+        )
     if event_type == "tool_attempt":
         outcome = "success" if attributes.get("success") else attributes.get("error_type", "failed")
         return f"{attributes.get('tool', 'tool')} / {outcome} / {attributes.get('duration_ms', 0)} ms"

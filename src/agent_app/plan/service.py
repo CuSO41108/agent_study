@@ -8,7 +8,7 @@ from uuid import uuid4
 from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
 from agent_app.plan.executor import PlanExecutionResult, PlanExecutor, PlanNodeContext
 from agent_app.plan.graph import PlanGraph, resource_claims_for_node
-from agent_app.plan.planner import PlanPlanner, PlannerAttemptHook
+from agent_app.plan.planner import PlanPlanner, PlanPlanningError, PlannerAttemptHook
 from agent_app.plan.recovery import (
     PlanRecoveryError,
     PlanRecoveryService,
@@ -21,6 +21,7 @@ from agent_app.runtime.task_runtime import ReplanBudgetExceeded, TaskRuntime
 from agent_app.state.session_service import SessionService
 from agent_app.types import (
     AgentEvent,
+    Checkpoint,
     Message,
     TaskState,
     ToolAction,
@@ -70,6 +71,13 @@ class PlanTaskService:
         try:
             graph = self._create_plan_with_checkpoint(task.id, goal)
             revision = self._plan_store.create_revision(task.id, graph)
+        except PlanPlanningError as exc:
+            self._pause_for_planner_recovery(
+                task.id,
+                operation="initial_plan",
+                error=exc,
+            )
+            raise
         except Exception:
             task = self._tasks.fail(task.id, reason="planner_failed")
             raise
@@ -82,6 +90,9 @@ class PlanTaskService:
 
     def continue_task(self, *, task_id: str) -> PlanTaskResult:
         task = self._require_task(task_id)
+        planner_checkpoint = self._recoverable_planner_checkpoint(task.id)
+        if planner_checkpoint is not None:
+            return self._continue_planner(task, planner_checkpoint)
         revision = self._plan_store.get_active_revision(task.id)
         if revision is None:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
@@ -98,6 +109,269 @@ class PlanTaskService:
 
     def has_plan(self, *, task_id: str) -> bool:
         return bool(self._plan_store.list_revisions(task_id))
+
+    def has_recoverable_planner_failure(self, *, task_id: str) -> bool:
+        return self._recoverable_planner_checkpoint(task_id) is not None
+
+    def _recoverable_planner_checkpoint(self, task_id: str) -> Checkpoint | None:
+        task = self._require_task(task_id)
+        if task.status != "paused":
+            return None
+        checkpoint = self._sessions.get_latest_checkpoint(task.id)
+        if checkpoint is None or checkpoint.status != "failed":
+            return None
+        state = checkpoint.state
+        if state.get("phase") != "planning" or state.get("request_status") != "failed":
+            return None
+        operation = state.get("operation")
+        expected_reason = {
+            "initial_plan": "planner_failed",
+            "replan": "replanner_failed",
+        }.get(operation)
+        if expected_reason is None or task.stop_reason != expected_reason:
+            return None
+        if operation == "initial_plan" and self._plan_store.list_revisions(task.id):
+            return None
+        if operation == "replan" and self._plan_store.get_active_revision(task.id) is None:
+            return None
+        return checkpoint
+
+    def _continue_planner(self, task: TaskState, checkpoint: Checkpoint) -> PlanTaskResult:
+        operation = str(checkpoint.state["operation"])
+        if task.budget.used_continuations >= task.budget.max_continuations:
+            active_revision = self._plan_store.get_active_revision(task.id)
+            if active_revision is not None:
+                self._plan_store.update_revision_status(
+                    active_revision.id,
+                    "failed",
+                    expected_version=active_revision.version,
+                )
+            self._tasks.fail(task.id, reason="planner_continuation_budget_exceeded")
+            self._sessions.append_task_trace(
+                task.id,
+                "planner_recovery_exhausted",
+                {
+                    "operation": operation,
+                    "checkpoint_id": checkpoint.id,
+                    "used_continuations": task.budget.used_continuations,
+                    "max_continuations": task.budget.max_continuations,
+                },
+            )
+            raise RuntimeError(
+                f"Task '{task.id}' has exhausted its "
+                f"{task.budget.max_continuations} Planner continuation attempts."
+            )
+
+        resumed = self._tasks.consume_continuation(
+            task.id,
+            reason=f"resume_after_{operation}_failure",
+        )
+        self._sessions.append_task_trace(
+            task.id,
+            "planner_recovery_started",
+            {
+                "operation": operation,
+                "checkpoint_id": checkpoint.id,
+                "continuation": resumed.budget.used_continuations,
+                "max_continuations": resumed.budget.max_continuations,
+            },
+        )
+
+        try:
+            if operation == "initial_plan":
+                graph = self._create_plan_with_checkpoint(task.id, task.goal)
+                revision = self._plan_store.create_revision(task.id, graph)
+                self._sessions.append_task_trace(
+                    task.id,
+                    "plan_created",
+                    {
+                        **_plan_revision_payload(revision),
+                        "recovered_from_checkpoint_id": checkpoint.id,
+                    },
+                )
+                self._record_planner_recovery_completed(
+                    task.id,
+                    checkpoint=checkpoint,
+                    revision=revision,
+                )
+                self._resume_after_planner_recovery(task.id)
+                return self._execute_and_reconcile(
+                    task.id,
+                    revision,
+                    auto_replan=True,
+                )
+
+            current = self._plan_store.get_active_revision(task.id)
+            if current is None:
+                raise RuntimeError(
+                    f"Task '{task.id}' no longer has the Plan revision required by its Planner checkpoint."
+                )
+            source_revision_id = checkpoint.state.get("source_revision_id")
+            if source_revision_id is not None and source_revision_id != current.id:
+                raise RuntimeError(
+                    "The active Plan revision changed after the Planner checkpoint was saved."
+                )
+            reason = str(
+                checkpoint.state.get("replan_reason")
+                or self._latest_replan_reason(task.id)
+                or "Continue the previously failed replan request."
+            )
+            automatic = checkpoint.state.get("automatic") is True
+            candidate = self._create_replan_with_checkpoint(
+                task.id,
+                current=current,
+                reason=reason,
+                automatic=automatic,
+            )
+            revision = self._plan_store.create_replan(
+                task.id,
+                candidate,
+                reason=reason,
+                expected_revision=current.graph.revision,
+            )
+            self._sessions.append_task_trace(
+                task.id,
+                "plan_replan",
+                {
+                    "plan_id": revision.graph.id,
+                    "from_revision": current.graph.revision,
+                    "to_revision": revision.graph.revision,
+                    "reason": reason,
+                    "preserved_completed_nodes": [
+                        node.id
+                        for node in revision.graph.nodes
+                        if node.status == "completed"
+                    ],
+                    "recovered_from_checkpoint_id": checkpoint.id,
+                },
+            )
+            self._record_planner_recovery_completed(
+                task.id,
+                checkpoint=checkpoint,
+                revision=revision,
+            )
+            self._resume_after_planner_recovery(task.id)
+            return self._execute_and_reconcile(
+                task.id,
+                revision,
+                auto_replan=automatic,
+            )
+        except PlanPlanningError as exc:
+            self._pause_for_planner_recovery(
+                task.id,
+                operation=operation,
+                error=exc,
+            )
+            raise
+        except Exception:
+            current_task = self._require_task(task.id)
+            if current_task.status not in {"completed", "failed", "cancelled", "expired"}:
+                active_revision = self._plan_store.get_active_revision(task.id)
+                if active_revision is not None:
+                    self._plan_store.update_revision_status(
+                        active_revision.id,
+                        "failed",
+                        expected_version=active_revision.version,
+                    )
+                self._tasks.fail(task.id, reason="planner_recovery_failed")
+            raise
+
+    def _pause_for_planner_recovery(
+        self,
+        task_id: str,
+        *,
+        operation: str,
+        error: PlanPlanningError,
+    ) -> TaskState:
+        task = self._require_task(task_id)
+        stop_reason = "planner_failed" if operation == "initial_plan" else "replanner_failed"
+        if task.status == "running":
+            task = self._tasks.pause_for_recovery(task.id, reason=stop_reason)
+        elif task.status != "paused":
+            raise RuntimeError(
+                f"Task '{task.id}' cannot preserve a Planner recovery checkpoint while {task.status}."
+            )
+        error.recovery_task_id = task.id
+        checkpoint = self._sessions.get_latest_checkpoint(task.id)
+        payload = {
+            "operation": operation,
+            "checkpoint_id": None if checkpoint is None else checkpoint.id,
+            "error_type": error.error_type or type(error).__name__,
+            "error": str(error),
+            "attempts": error.attempts,
+            "recoverable": True,
+        }
+        self._sessions.append_task_trace(
+            task.id,
+            "planner_recovery_available",
+            payload,
+        )
+        if operation == "replan":
+            state = {} if checkpoint is None else checkpoint.state
+            active_revision = self._plan_store.get_active_revision(task.id)
+            self._sessions.append_task_trace(
+                task.id,
+                "plan_replan_failed",
+                {
+                    "plan_id": None if active_revision is None else active_revision.graph.id,
+                    "revision": (
+                        state.get("source_revision")
+                        if active_revision is None
+                        else active_revision.graph.revision
+                    ),
+                    "original_failure_reason": state.get("replan_reason"),
+                    "error_type": error.error_type or type(error).__name__,
+                    "error": str(error),
+                    "recoverable": True,
+                    "checkpoint_id": None if checkpoint is None else checkpoint.id,
+                },
+            )
+        return task
+
+    def _record_planner_recovery_completed(
+        self,
+        task_id: str,
+        *,
+        checkpoint: Checkpoint,
+        revision: PlanRevision,
+    ) -> None:
+        self._sessions.append_task_trace(
+            task_id,
+            "planner_recovery_completed",
+            {
+                "operation": checkpoint.state.get("operation"),
+                "checkpoint_id": checkpoint.id,
+                "plan_id": revision.graph.id,
+                "revision": revision.graph.revision,
+            },
+        )
+
+    def _resume_after_planner_recovery(self, task_id: str) -> TaskState:
+        task = self._require_task(task_id)
+        if task.status == "running":
+            return task
+        if task.status != "paused":
+            raise RuntimeError(
+                f"Task '{task.id}' cannot resume after Planner recovery while {task.status}."
+            )
+        return self._tasks.resume(
+            task.id,
+            event=AgentEvent(
+                id=str(uuid4()),
+                task_id=task.id,
+                session_id=task.session_id,
+                type="resume_requested",
+                source="planner_recovery",
+                correlation_id=task.id,
+                expected_version=task.version,
+            ),
+        )
+
+    def _latest_replan_reason(self, task_id: str) -> str | None:
+        for trace in reversed(self._sessions.list_task_traces(task_id)):
+            if trace.trace_type == "replan" and trace.payload.get("reason"):
+                return str(trace.payload["reason"])
+        return None
 
     def inspect_recovery(self, *, task_id: str) -> RecoveryDecision:
         return self._recovery.inspect(task_id)
@@ -378,7 +652,20 @@ class PlanTaskService:
         if current is None:
             raise KeyError(f"No active plan revision for task '{task_id}'.")
         self._tasks.consume_replan(task.id, reason=reason)
-        candidate = self._create_replan_with_checkpoint(task.id, current=current, reason=reason)
+        try:
+            candidate = self._create_replan_with_checkpoint(
+                task.id,
+                current=current,
+                reason=reason,
+                automatic=automatic,
+            )
+        except PlanPlanningError as exc:
+            self._pause_for_planner_recovery(
+                task.id,
+                operation="replan",
+                error=exc,
+            )
+            raise
         revision = self._plan_store.create_replan(
             task.id,
             candidate,
@@ -415,10 +702,17 @@ class PlanTaskService:
         *,
         current: PlanRevision,
         reason: str,
+        automatic: bool,
     ) -> PlanGraph:
         return self._run_planner_with_checkpoint(
             task_id=task_id,
             operation="replan",
+            checkpoint_state={
+                "source_revision_id": current.id,
+                "source_revision": current.graph.revision,
+                "replan_reason": reason,
+                "automatic": automatic,
+            },
             invoke=lambda on_attempt: self._planner.create_replan(
                 current=current,
                 reason=reason,
@@ -432,6 +726,7 @@ class PlanTaskService:
         task_id: str,
         operation: str,
         invoke: Callable[[PlannerAttemptHook], PlanGraph],
+        checkpoint_state: dict[str, Any] | None = None,
     ) -> PlanGraph:
         task = self._require_task(task_id)
         latest = self._sessions.get_latest_checkpoint(task_id)
@@ -450,6 +745,7 @@ class PlanTaskService:
             request_status="requesting",
             attempt=0,
             max_attempts=max_attempts,
+            extra_state=checkpoint_state,
         )
         last_request_status = "requesting"
         last_attempt = 0
@@ -471,6 +767,7 @@ class PlanTaskService:
                 error_detail=info.get("error_detail"),
                 retryable=bool(info.get("retryable", False)),
                 retry_delay_seconds=float(info.get("retry_delay_seconds", 0.0)),
+                extra_state=checkpoint_state,
             )
 
         try:
@@ -489,6 +786,7 @@ class PlanTaskService:
                     max_attempts=max_attempts,
                     error_type=str(error_type),
                     error_detail=str(error_detail),
+                    extra_state=checkpoint_state,
                 )
             self._sessions.update_execution_run(
                 run.id,
@@ -511,6 +809,7 @@ class PlanTaskService:
             max_attempts=max_attempts,
             plan_id=getattr(graph, "id", None),
             node_count=len(getattr(graph, "nodes", ())),
+            extra_state=checkpoint_state,
         )
         return graph
 
@@ -529,6 +828,7 @@ class PlanTaskService:
         retry_delay_seconds: float = 0.0,
         plan_id: str | None = None,
         node_count: int | None = None,
+        extra_state: dict[str, Any] | None = None,
     ) -> None:
         is_completed = request_status == "completed"
         is_failed = request_status == "failed"
@@ -551,6 +851,14 @@ class PlanTaskService:
             state["plan_id"] = plan_id
         if node_count is not None:
             state["node_count"] = node_count
+        if extra_state:
+            reserved = set(state).intersection(extra_state)
+            if reserved:
+                raise ValueError(
+                    "Planner checkpoint state cannot replace reserved fields: "
+                    + ", ".join(sorted(reserved))
+                )
+            state.update(extra_state)
         checkpoint = self._sessions.create_checkpoint(
             task_id=task_id,
             run_id=run_id,
@@ -775,6 +1083,24 @@ class PlanTaskService:
                     )
                 except ReplanBudgetExceeded:
                     pass
+                except PlanPlanningError as exc:
+                    paused_revision = self._plan_store.get_active_revision(task_id)
+                    if paused_revision is None:
+                        raise RuntimeError(
+                            "Recoverable replan failure lost its active Plan revision."
+                        ) from exc
+                    paused_execution = PlanExecutionResult(
+                        "paused",
+                        paused_revision,
+                        execution.executed_node_ids,
+                        execution.waiting_node_id,
+                        f"replanner_failed: {exc}",
+                    )
+                    return PlanTaskResult(
+                        task=self._require_task(task_id),
+                        revision=paused_revision,
+                        execution=paused_execution,
+                    )
                 except Exception as exc:  # noqa: BLE001 - auto recovery must close the task.
                     return self._finalize_failed_execution(
                         task_id,

@@ -75,7 +75,7 @@ _REPL_HELP = """Commands:
   /resume [task-id-prefix]
               Resume a paused task.
   /continue [task-id-prefix]
-              Continue a paused task from its latest checkpoint.
+              Continue a paused task or retry a failed Planner checkpoint.
   /resolve-action [--all] [action-id-prefix succeeded|failed "reason" -- evidence]
               List or resolve interrupted side effects; --all searches every Session.
   /handoff [task-id-prefix]
@@ -124,7 +124,7 @@ _REPL_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("/cancel", "Cancel a non-terminal task."),
     CommandSpec("/pause", "Pause a running task."),
     CommandSpec("/resume", "Resume a paused task."),
-    CommandSpec("/continue", "Continue a paused task from its latest checkpoint."),
+    CommandSpec("/continue", "Continue a paused task or retry a failed Planner checkpoint."),
     CommandSpec("/resolve-action", "Resolve an interrupted side effect with human evidence."),
     CommandSpec("/handoff", "Move a task into a new session."),
     CommandSpec("/sessions", "Show recent sessions and their progress."),
@@ -534,7 +534,11 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--task-status", metavar="TASK_ID", help="Show the persisted task state.")
     controls.add_argument("--pause-task", metavar="TASK_ID", help="Pause a running task.")
     controls.add_argument("--resume-task", metavar="TASK_ID", help="Resume or recover a persisted task.")
-    controls.add_argument("--continue-task", metavar="TASK_ID", help="Continue a persisted task from its latest checkpoint.")
+    controls.add_argument(
+        "--continue-task",
+        metavar="TASK_ID",
+        help="Continue a persisted task or retry its failed Planner checkpoint.",
+    )
     controls.add_argument("--cancel-task", metavar="TASK_ID", help="Cancel a non-terminal task.")
     controls.add_argument("--approve-task", metavar="TASK_ID", help="Approve a persisted pending action.")
     controls.add_argument("--reject-task", metavar="TASK_ID", help="Reject a persisted pending action.")
@@ -723,8 +727,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reject": "user_rejected",
         }[action]
         try:
-            if action == "resume" and plan_service.has_plan(task_id=task.id):
-                result = plan_service.resume(task_id=task.id)
+            if action == "resume" and (
+                plan_service.has_plan(task_id=task.id)
+                or plan_service.has_recoverable_planner_failure(task_id=task.id)
+            ):
+                result = plan_service.continue_task(task_id=task.id)
             else:
                 event_payload = {}
                 if action in {"approve", "reject"} and task.pending_action is not None:
@@ -751,6 +758,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = plan_result if plan_result is not None else loop.handle_event(event)
         except (PlanRecoveryError, RuntimeError, ValueError) as exc:
             print(f"Task error: {exc}", file=sys.stderr)
+            if isinstance(exc, PlanPlanningError):
+                _print_planner_recovery_hint(exc, stream=sys.stderr)
             return 1
         if isinstance(result, PlanTaskResult):
             print(json.dumps(result, default=_serialize, ensure_ascii=False))
@@ -802,6 +811,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except (PlanPlanningError, ValueError) as exc:
         print(f"Plan error: {exc}", file=sys.stderr)
+        if isinstance(exc, PlanPlanningError):
+            if exc.recovery_task_id:
+                recovery_task = sessions.get_task(exc.recovery_task_id)
+                if recovery_task is not None:
+                    _persist_current_session(session_state_path, recovery_task.session_id)
+            _print_planner_recovery_hint(exc, stream=sys.stderr)
         return 1
     _persist_current_session(session_state_path, result.session_id)
     print(json.dumps(result, default=_serialize, ensure_ascii=False))
@@ -1269,6 +1284,8 @@ def _run_interactive_loop(
             continue
         except (PlanPlanningError, ValueError) as exc:
             print(f"Plan error: {exc}")
+            if isinstance(exc, PlanPlanningError):
+                _print_planner_recovery_hint(exc)
             continue
         pending_skill_names.clear()
         current_session_id = result.session_id
@@ -1365,7 +1382,11 @@ def _handle_plan_execute_command(
         return
     try:
         result = plan_service.start(session_id=session_id, goal=goal)
-    except (ActiveTaskConflict, PlanPlanningError, ValueError, RuntimeError) as exc:
+    except PlanPlanningError as exc:
+        print(f"Plan error: {exc}")
+        _print_planner_recovery_hint(exc)
+        return
+    except (ActiveTaskConflict, ValueError, RuntimeError) as exc:
         print(f"Plan error: {exc}")
         return
     _print_plan_task_result(result)
@@ -1411,7 +1432,11 @@ def _handle_replan_command(
         return
     try:
         result = plan_service.replan(task_id=active.id, reason=reason)
-    except (KeyError, PlanPlanningError, RuntimeError, ValueError) as exc:
+    except PlanPlanningError as exc:
+        print(f"Plan error: {exc}")
+        _print_planner_recovery_hint(exc)
+        return
+    except (KeyError, RuntimeError, ValueError) as exc:
         print(f"Plan error: {exc}")
         return
     _print_plan_task_result(result)
@@ -1516,6 +1541,21 @@ def _print_plan_task_result(result: PlanTaskResult) -> None:
             default=_serialize,
             ensure_ascii=False,
         )
+    )
+
+
+def _print_planner_recovery_hint(
+    error: PlanPlanningError,
+    *,
+    stream=None,
+) -> None:
+    task_id = error.recovery_task_id
+    if not task_id:
+        return
+    print(
+        "Planner checkpoint saved. Continue the same task with "
+        f"/continue {task_id[:8]} or --continue-task {task_id}.",
+        file=stream,
     )
 
 
@@ -1959,8 +1999,11 @@ def _run_repl_task_control(
             correlation_id=task.id,
             expected_version=task.version,
         )
-        if command == "/resume" and plan_service is not None and plan_service.has_plan(task_id=task.id):
-            return plan_service.resume(task_id=task.id)
+        if command == "/resume" and plan_service is not None and (
+            plan_service.has_plan(task_id=task.id)
+            or plan_service.has_recoverable_planner_failure(task_id=task.id)
+        ):
+            return plan_service.continue_task(task_id=task.id)
         plan_result = (
             plan_service.handle_approval(
                 task_id=task.id,
@@ -1973,6 +2016,8 @@ def _run_repl_task_control(
         return plan_result if plan_result is not None else loop.handle_event(event)
     except (RuntimeError, ValueError) as exc:
         print(f"Task error: {exc}")
+        if isinstance(exc, PlanPlanningError):
+            _print_planner_recovery_hint(exc)
         return None
 
 

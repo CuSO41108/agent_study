@@ -49,6 +49,9 @@ class ObservabilityTests(unittest.TestCase):
         self.sessions.append_task_trace(task.id, "plan_replan", {"from_revision": 1, "to_revision": 2, "reason": "new evidence"})
         self.sessions.append_task_trace(task.id, "plan_node_user_message", {"node_id": "inspect", "to_status": "completed"})
         self.sessions.append_task_trace(task.id, "plan_replan_failed", {"error_type": "PlanPlanningError", "error": "invalid plan"})
+        self.sessions.append_task_trace(task.id, "planner_recovery_available", {"operation": "replan", "error_type": "invalid_plan"})
+        self.sessions.append_task_trace(task.id, "planner_recovery_started", {"operation": "replan", "continuation": 1, "max_continuations": 2})
+        self.sessions.append_task_trace(task.id, "planner_recovery_completed", {"operation": "replan", "revision": 2})
 
         trace = export_task_trace(self.sessions, task.id)
         rendered = render_task_timeline(trace)
@@ -65,6 +68,9 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("revision 1 → 2 / new evidence", rendered)
         self.assertIn("inspect / user answer / completed", rendered)
         self.assertIn("PlanPlanningError / invalid plan", rendered)
+        self.assertIn("replan / paused / invalid_plan / explicit /continue required", rendered)
+        self.assertIn("replan / continuation 1/2", rendered)
+        self.assertIn("replan / recovered / revision 2", rendered)
 
     def test_export_rejects_unknown_task(self) -> None:
         with self.assertRaises(KeyError):

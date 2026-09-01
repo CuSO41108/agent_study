@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -309,6 +309,121 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("plan_created", trace_types)
         self.assertIn("plan_node_transition", trace_types)
         self.assertIn("plan_execution", trace_types)
+
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_cli_continue_recovers_initial_planner_failure_on_same_task(self, mock_from_config) -> None:
+        request_error = ModelResponse(
+            assistant_text=None,
+            error_type="request_error",
+            raw_response={"detail": "temporary planner outage"},
+        )
+        failed_model = _FakeModelClient([request_error, request_error, request_error])
+        plan = (
+            '{"id":"continued-cli-plan","revision":1,"nodes":['
+            '{"id":"inspect","kind":"inspect","objective":"Read README.md.",'
+            '"depends_on":[],"allowed_tools":["file_read"],'
+            '"acceptance":["README is understood"]}]}'
+        )
+        recovered_model = _FakeModelClient(
+            [
+                _text_response(plan),
+                _text_response("README inspected after Planner recovery"),
+            ]
+        )
+        mock_from_config.side_effect = [failed_model, recovered_model]
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            first_exit_code = cli.main(
+                [
+                    "/plan-and-execute inspect README.md after recovery",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        sessions = SessionService(database_path)
+        tasks = sessions.list_all_tasks()
+        self.assertEqual(first_exit_code, 1)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].status, "paused")
+        self.assertIn("Planner checkpoint saved", stderr.getvalue())
+        self.assertIn(tasks[0].id, stderr.getvalue())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            second_exit_code = cli.main(
+                [
+                    "--continue-task",
+                    "latest",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(second_exit_code, 0)
+        self.assertEqual(output["task"]["id"], tasks[0].id)
+        self.assertEqual(output["task"]["status"], "completed")
+        self.assertEqual(output["task"]["budget"]["used_continuations"], 1)
+        self.assertEqual(output["revision"]["graph"]["revision"], 1)
+        self.assertEqual(len(sessions.list_all_tasks()), 1)
+
+    @patch(
+        "builtins.input",
+        side_effect=[
+            "/plan-and-execute inspect README.md after recovery",
+            "/continue",
+            "quit",
+        ],
+    )
+    @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
+    def test_interactive_continue_recovers_failed_planner_checkpoint(
+        self,
+        mock_from_config,
+        _mock_input,
+    ) -> None:
+        request_error = ModelResponse(
+            assistant_text=None,
+            error_type="request_error",
+            raw_response={"detail": "temporary planner outage"},
+        )
+        plan = (
+            '{"id":"interactive-continued-plan","revision":1,"nodes":['
+            '{"id":"inspect","kind":"inspect","objective":"Read README.md.",'
+            '"depends_on":[],"allowed_tools":["file_read"],'
+            '"acceptance":["README is understood"]}]}'
+        )
+        mock_from_config.return_value = _FakeModelClient(
+            [
+                request_error,
+                request_error,
+                request_error,
+                _text_response(plan),
+                _text_response("README inspected after interactive recovery"),
+            ]
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli.main(
+                [
+                    "--interactive",
+                    "--workspace-root",
+                    str(self.workspace_root),
+                ]
+            )
+
+        database_path = self.workspace_root / ".agent_app" / "agent.db"
+        tasks = SessionService(database_path).list_all_tasks()
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].status, "completed")
+        self.assertEqual(tasks[0].budget.used_continuations, 1)
+        self.assertIn("Planner checkpoint saved", output)
+        self.assertIn("README inspected after interactive recovery", output)
 
     @patch("agent_app.cli.OpenAICompatibleModelClient.from_config")
     def test_cli_resumes_plan_ask_user_with_natural_language_answer(self, mock_from_config) -> None:
