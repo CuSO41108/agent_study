@@ -9,7 +9,29 @@ from agent_app.plan import PlanPlanner, PlanPlanningError, PlanStore, PlanTaskSe
 from agent_app.runtime.task_runtime import TaskRuntime
 from agent_app.state.db import initialize_database
 from agent_app.state.session_service import SessionService
-from agent_app.types import AgentEvent, ModelResponse, PendingAction, TurnResult
+from agent_app.types import AgentEvent, ModelResponse, PendingAction, ToolResult, TurnResult
+
+
+def _successful_node_evidence(kwargs: dict, *, call_id: str = "node-evidence") -> list[ToolResult]:
+    allowed_tools = tuple(kwargs.get("allowed_tools", ()))
+    if "shell" in allowed_tools:
+        tool_name = "shell"
+    elif "replace_in_file" in allowed_tools:
+        tool_name = "replace_in_file"
+    elif "file_write" in allowed_tools:
+        tool_name = "file_write"
+    elif "code_search" in allowed_tools:
+        tool_name = "code_search"
+    else:
+        tool_name = "file_read"
+    return [
+        ToolResult(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            success=True,
+            content="substantive node evidence",
+        )
+    ]
 
 
 class _PlannerModel:
@@ -99,7 +121,7 @@ class _AgentLoop:
             session_id=kwargs["session_id"],
             final_text=f"done:{task_id}",
             stop_reason="final_response",
-            tool_runs=[],
+            tool_runs=_successful_node_evidence(kwargs),
             success=True,
             task_id=task_id,
             task_status="running",
@@ -138,7 +160,11 @@ class _FailThenSuccessLoop(_AgentLoop):
             session_id=kwargs["session_id"],
             final_text=None if self.attempt == 1 else "replanned node done",
             stop_reason="node_failed" if self.attempt == 1 else "final_response",
-            tool_runs=[],
+            tool_runs=(
+                _successful_node_evidence(kwargs)
+                if self.attempt > 1
+                else []
+            ),
             success=self.attempt > 1,
             task_id=task_id,
             task_status="running",
@@ -176,7 +202,7 @@ class _CompleteThenFailThenSuccessLoop(_AgentLoop):
             session_id=kwargs["session_id"],
             final_text=f"done:{node_id}" if success else None,
             stop_reason="final_response" if success else "node_failed",
-            tool_runs=[],
+            tool_runs=_successful_node_evidence(kwargs) if success else [],
             success=success,
             task_id=task_id,
             task_status="running",
@@ -208,7 +234,7 @@ class _PauseThenSuccessLoop(_AgentLoop):
             session_id=kwargs["session_id"],
             final_text="continued node done",
             stop_reason="final_response",
-            tool_runs=[],
+            tool_runs=_successful_node_evidence(kwargs),
             success=True,
             task_id=task_id,
             task_status="running",

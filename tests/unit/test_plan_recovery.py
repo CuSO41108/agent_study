@@ -58,7 +58,14 @@ class _ResumeLoop:
             session_id=kwargs["session_id"],
             final_text="node resumed",
             stop_reason="final_response",
-            tool_runs=[],
+            tool_runs=[
+                ToolResult(
+                    tool_call_id="recovery-read",
+                    tool_name="file_read",
+                    success=True,
+                    content="recovered node evidence",
+                )
+            ],
             success=True,
             task_id=kwargs["_task_id"],
             task_status="running",

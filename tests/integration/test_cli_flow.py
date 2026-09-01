@@ -281,6 +281,9 @@ class CliIntegrationTests(unittest.TestCase):
                     ToolCall(id="plan-read", name="file_read", arguments={"path": "README.md"}),
                 ]),
                 _text_response("README inspected"),
+                _tool_call_response([
+                    ToolCall(id="plan-verify-read", name="file_read", arguments={"path": "README.md"}),
+                ]),
                 _text_response("README verified"),
             ]
         )
@@ -327,6 +330,9 @@ class CliIntegrationTests(unittest.TestCase):
         recovered_model = _FakeModelClient(
             [
                 _text_response(plan),
+                _tool_call_response([
+                    ToolCall(id="continued-plan-read", name="file_read", arguments={"path": "README.md"}),
+                ]),
                 _text_response("README inspected after Planner recovery"),
             ]
         )
@@ -401,6 +407,9 @@ class CliIntegrationTests(unittest.TestCase):
                 request_error,
                 request_error,
                 _text_response(plan),
+                _tool_call_response([
+                    ToolCall(id="interactive-plan-read", name="file_read", arguments={"path": "README.md"}),
+                ]),
                 _text_response("README inspected after interactive recovery"),
             ]
         )
