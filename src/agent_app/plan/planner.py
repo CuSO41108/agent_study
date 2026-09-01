@@ -206,6 +206,19 @@ class PlanPlanner:
             response = self._model_client.generate(**request)
             error_type = getattr(response, "error_type", None)
             if not error_type:
+                if on_attempt is not None:
+                    on_attempt(
+                        {
+                            "phase": phase,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "request_status": "succeeded",
+                            "error_type": None,
+                            "error_detail": None,
+                            "retryable": False,
+                            "retry_delay_seconds": 0.0,
+                        }
+                    )
                 return response, attempt
 
             detail = _response_error_detail(response)
@@ -259,8 +272,12 @@ def _decode_json_object(text: str, *, attempts: int | None = None) -> dict[str, 
 
 
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
-    re.compile(r"(?i)((?:api[_-]?key|token|password|secret)\s*[:=]\s*['\"]?)[^'\"\s,;]+"),
+    re.compile(
+        r'''(?i)(["']?authorization["']?\s*[:=]\s*["']?bearer\s+)[^"'\s,;}]+'''
+    ),
+    re.compile(
+        r'''(?i)(["']?(?:api[_-]?key|token|password|secret)["']?\s*[:=]\s*["']?)[^"'\s,;}]+'''
+    ),
     re.compile(r"\bsk-[A-Za-z0-9_-]+\b"),
 )
 

@@ -181,6 +181,33 @@ class PlanRoutingTests(unittest.TestCase):
         self.assertNotIn("super-secret-token", str(error))
         self.assertEqual(delays, [0.5, 1.0])
 
+    def test_planner_sanitizes_quoted_json_secret_keys(self) -> None:
+        detail = (
+            'provider error: {"token": "json-token-value", '
+            '"Authorization": "Bearer json-bearer-value", '
+            '"api_key": "json-api-key-value", "password": "json-password-value"}'
+        )
+        model = _FakePlannerModel(
+            ModelResponse(
+                assistant_text=None,
+                error_type="http_error",
+                raw_response={"status": 400, "body": detail},
+            )
+        )
+
+        with self.assertRaises(PlanPlanningError) as raised:
+            PlanPlanner(model).create_plan("Inspect")
+
+        message = str(raised.exception)
+        for secret in (
+            "json-token-value",
+            "json-bearer-value",
+            "json-api-key-value",
+            "json-password-value",
+        ):
+            self.assertNotIn(secret, message)
+        self.assertGreaterEqual(message.count("[REDACTED]"), 4)
+
     def test_planner_does_not_retry_non_request_model_errors(self) -> None:
         model = _SequencePlannerModel(
             [

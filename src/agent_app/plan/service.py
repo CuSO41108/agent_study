@@ -452,16 +452,20 @@ class PlanTaskService:
             max_attempts=max_attempts,
         )
         last_request_status = "requesting"
+        last_attempt = 0
 
         def on_attempt(info: dict[str, Any]) -> None:
-            nonlocal last_request_status
+            nonlocal last_attempt, last_request_status
             last_request_status = str(info.get("request_status", "failed"))
+            last_attempt = int(info.get("attempt", 0))
+            if last_request_status == "succeeded":
+                return
             self._persist_planner_checkpoint(
                 task_id=task_id,
                 run_id=run.id,
                 operation=operation,
                 request_status=last_request_status,
-                attempt=int(info.get("attempt", 0)),
+                attempt=last_attempt,
                 max_attempts=int(info.get("max_attempts", max_attempts)),
                 error_type=info.get("error_type"),
                 error_detail=info.get("error_detail"),
@@ -503,7 +507,7 @@ class PlanTaskService:
             run_id=run.id,
             operation=operation,
             request_status="completed",
-            attempt=max_attempts if last_request_status == "retrying" else 1,
+            attempt=last_attempt or 1,
             max_attempts=max_attempts,
             plan_id=getattr(graph, "id", None),
             node_count=len(getattr(graph, "nodes", ())),

@@ -40,6 +40,21 @@ class _FailingPlannerModel:
         )
 
 
+class _RetryThenSuccessPlannerModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                assistant_text=None,
+                error_type="request_error",
+                raw_response={"detail": "temporary connection reset"},
+            )
+        return _PlannerModel().generate()
+
+
 class _AgentLoop:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -284,6 +299,33 @@ class PlanTaskServiceTests(unittest.TestCase):
         planner_run = self.sessions.get_execution_run(planning_checkpoints[-1].run_id)
         self.assertEqual(planner_run.scope, "planner:initial_plan")
         self.assertEqual(planner_run.status, "completed")
+
+    def test_planner_success_after_retry_persists_actual_attempt(self) -> None:
+        planner_model = _RetryThenSuccessPlannerModel()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=self.loop,
+        )
+
+        result = service.start(
+            session_id=self.session_id,
+            goal="Inspect and verify after a transient provider failure",
+        )
+
+        planning_checkpoints = [
+            checkpoint
+            for checkpoint in self.sessions.list_checkpoints(result.task.id)
+            if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planning_checkpoints],
+            ["requesting", "retrying", "completed"],
+        )
+        self.assertEqual(planner_model.calls, 2)
+        self.assertEqual(planning_checkpoints[-1].state["attempt"], 2)
+        self.assertEqual(planning_checkpoints[-1].state["max_attempts"], 3)
 
     def test_planner_failure_persists_attempts_and_safe_detail_in_checkpoint(self) -> None:
         planner_model = _FailingPlannerModel()
