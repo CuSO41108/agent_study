@@ -408,6 +408,20 @@ class ToolLayerTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("escapes the workspace root", result.error)
 
+    def test_code_search_missing_path_suggests_existing_src_layout(self) -> None:
+        package_dir = self.workspace_root / "src" / "agent_app"
+        package_dir.mkdir()
+
+        result = CodeSearchTool().execute(
+            tool_call_id="call-missing-path",
+            arguments={"pattern": "AgentLoop", "path": "agent_app"},
+            context=self.context,
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("Search path not found: 'agent_app'", result.error or "")
+        self.assertIn("src/agent_app", result.error or "")
+
     @patch("agent_app.tools.code_search.shutil.which", return_value=None)
     def test_code_search_excludes_single_internal_file_path(self, _mock_which) -> None:
         tool = CodeSearchTool()

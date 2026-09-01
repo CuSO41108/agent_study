@@ -812,6 +812,65 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(result.tool_runs[0].success)
         self.assertFalse(result.tool_runs[1].success)
 
+    def test_repeated_missing_code_search_target_stops_with_deterministic_reason(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([
+                ToolCall(
+                    id="call-1",
+                    name="code_search",
+                    arguments={"pattern": "trace", "path": "agent_app"},
+                )
+            ]),
+            _tool_call_response([
+                ToolCall(
+                    id="call-2",
+                    name="code_search",
+                    arguments={"pattern": "sqlite", "path": "agent_app"},
+                )
+            ]),
+            _text_response("must not be reached"),
+        ])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="inspect the missing package path")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.stop_reason, "repeated_deterministic_tool_failure")
+        self.assertEqual(len(result.tool_runs), 2)
+        self.assertIn("src/agent_app", result.final_text or "")
+        second_call_messages = model.calls[1]["messages"]
+        self.assertIn(
+            "Do not repeat the same failing target",
+            second_call_messages[-1]["content"],
+        )
+
+    def test_missing_code_search_target_can_be_corrected_to_src_layout(self) -> None:
+        model = _FakeModelClient([
+            _tool_call_response([
+                ToolCall(
+                    id="call-1",
+                    name="code_search",
+                    arguments={"pattern": "print", "path": "module.py"},
+                )
+            ]),
+            _tool_call_response([
+                ToolCall(
+                    id="call-2",
+                    name="code_search",
+                    arguments={"pattern": "print", "path": "src/module.py"},
+                )
+            ]),
+            _text_response("located after correcting the path"),
+        ])
+        loop = self._build_loop(model)
+
+        result = loop.run_turn(user_input="locate module.py")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.stop_reason, "final_response")
+        self.assertFalse(result.tool_runs[0].success)
+        self.assertTrue(result.tool_runs[1].success)
+
     def test_unknown_tool_call_is_rejected_by_agent_policy(self) -> None:
         model = _FakeModelClient([
             _tool_call_response([ToolCall(id="call-1", name="missing_tool", arguments={})]),

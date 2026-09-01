@@ -453,6 +453,7 @@ class AgentLoop:
         tool_rounds = 0
         consecutive_failure_tool: str | None = None
         consecutive_failure_count = 0
+        failed_deterministic_targets: set[str] = set()
 
         while True:
             task = self._tasks.require_task(task.id)
@@ -753,7 +754,7 @@ class AgentLoop:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": tool_result.content if tool_result.success else (tool_result.error or tool_result.content or "Tool execution failed."),
+                        "content": _tool_result_message(tool_result),
                     }
                 )
                 self._persist_execution_checkpoint(
@@ -793,6 +794,46 @@ class AgentLoop:
                     consecutive_failure_tool = None
                     consecutive_failure_count = 0
                 else:
+                    deterministic_target = _deterministic_failure_target(
+                        tool_call,
+                        tool_result,
+                    )
+                    if (
+                        deterministic_target is not None
+                        and deterministic_target in failed_deterministic_targets
+                    ):
+                        self._session_service.append_task_trace(
+                            task.id,
+                            "tool_recovery_blocked",
+                            {
+                                "tool_call_id": tool_call.id,
+                                "tool": tool_call.name,
+                                "error_type": (
+                                    None
+                                    if tool_result.observation is None
+                                    else tool_result.observation.error_type
+                                ),
+                                "reason": "repeated_deterministic_target",
+                                "target_hash": hashlib.sha256(
+                                    deterministic_target.encode("utf-8")
+                                ).hexdigest(),
+                            },
+                        )
+                        return self._finalize_turn(
+                            session_id=resolved_session_id,
+                            user_input=user_input,
+                            context_message_count=base_context_message_count,
+                            context_token_estimate=base_context_token_estimate,
+                            used_summary=used_summary,
+                            used_todo=used_todo,
+                            used_evidence=used_evidence,
+                            final_text=tool_result.error,
+                            stop_reason="repeated_deterministic_tool_failure",
+                            tool_runs=tool_runs,
+                            success=False,
+                        )
+                    if deterministic_target is not None:
+                        failed_deterministic_targets.add(deterministic_target)
                     if consecutive_failure_tool == tool_result.tool_name:
                         consecutive_failure_count += 1
                     else:
@@ -2333,6 +2374,54 @@ def _message_to_provider_message(message: Message) -> dict[str, Any]:
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
     return payload
+
+
+def _tool_result_message(tool_result: ToolResult) -> str:
+    if tool_result.success:
+        return tool_result.content
+    detail = tool_result.error or tool_result.content or "Tool execution failed."
+    observation = tool_result.observation
+    if observation is None or observation.retryable:
+        return detail
+    return (
+        detail
+        + "\n\nRuntime guidance: this failure is non-retryable with the current target or "
+        "parameters. Correct them using the error detail, or ask the user for missing "
+        "information. Do not repeat the same failing target."
+    )
+
+
+def _deterministic_failure_target(
+    tool_call: ToolCall,
+    tool_result: ToolResult,
+) -> str | None:
+    observation = tool_result.observation
+    if (
+        tool_result.success
+        or observation is None
+        or observation.retryable
+        or observation.error_type
+        not in {
+            "invalid_arguments",
+            "not_found",
+            "permission_denied",
+            "conflict",
+            "unsafe_action",
+        }
+    ):
+        return None
+    if tool_call.name not in {
+        "code_search",
+        "file_read",
+        "file_write",
+        "replace_in_file",
+    }:
+        return None
+    path = tool_call.arguments.get("path", "." if tool_call.name == "code_search" else None)
+    if not isinstance(path, str):
+        return None
+    normalized_path = path.strip().replace("\\", "/").casefold()
+    return f"{tool_call.name}:{observation.error_type}:path:{normalized_path}"
 
 
 def _checkpoint_provider_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

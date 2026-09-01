@@ -47,6 +47,18 @@ class CodeSearchTool(Tool):
             search_root = resolve_workspace_path(context.workspace_root, raw_path)
         except PathSafetyError as exc:
             return ToolResult(tool_call_id=tool_call_id, tool_name=self.name, success=False, content="", error=str(exc))
+        if not search_root.exists():
+            suggestion = _src_layout_suggestion(context.workspace_root, raw_path)
+            detail = f"Search path not found: '{raw_path}'."
+            if suggestion is not None:
+                detail += f" A similarly named path exists at '{suggestion}'; retry with that path."
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                success=False,
+                content="",
+                error=detail,
+            )
 
         ripgrep = shutil.which("rg")
         if ripgrep:
@@ -193,3 +205,13 @@ def _deadline_exceeded(deadline: float) -> bool:
 
 def _join_process_output(stdout: str | None, stderr: str | None) -> str:
     return "\n".join(part for part in ((stdout or "").rstrip("\r\n"), (stderr or "").rstrip("\r\n")) if part)
+
+
+def _src_layout_suggestion(workspace_root: Path, raw_path: str) -> str | None:
+    requested = Path(raw_path)
+    if requested.is_absolute():
+        return None
+    candidate = workspace_root / "src" / requested
+    if not candidate.exists():
+        return None
+    return candidate.relative_to(workspace_root).as_posix()
