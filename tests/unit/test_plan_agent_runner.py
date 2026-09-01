@@ -102,7 +102,7 @@ class PlanAgentRunnerTests(unittest.TestCase):
 
         outcome = PlanAgentNodeRunner(loop)(_context())
 
-        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.status, "paused")
         self.assertIn("acceptance_evidence_missing", outcome.error or "")
         self.assertEqual(outcome.metadata["failure_category"], "acceptance_not_met")
 
@@ -123,7 +123,7 @@ class PlanAgentRunnerTests(unittest.TestCase):
             _context(allowed_tools=["code_search"])
         )
 
-        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.status, "paused")
         self.assertEqual(outcome.evidence_refs, ())
 
     def test_runner_requires_task_uuid_to_appear_in_tool_evidence(self) -> None:
@@ -146,7 +146,7 @@ class PlanAgentRunnerTests(unittest.TestCase):
             _context(objective=f"Locate Trace for Task {task_uuid}.")
         )
 
-        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.status, "paused")
         self.assertEqual(
             outcome.metadata["acceptance_validation"]["missing_anchors"],
             [task_uuid],
@@ -195,8 +195,30 @@ class PlanAgentRunnerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.status, "paused")
         self.assertIn("replace_in_file", outcome.error or "")
+
+    def test_runner_pauses_repeated_deterministic_tool_failure(self) -> None:
+        loop = _FakeLoop(
+            TurnResult(
+                session_id="session-1",
+                final_text="Search path not found: 'agent_app'.",
+                stop_reason="repeated_deterministic_tool_failure",
+                tool_runs=[],
+                success=False,
+                task_id="task-1",
+                task_status="running",
+            )
+        )
+
+        outcome = PlanAgentNodeRunner(loop)(_context())
+
+        self.assertEqual(outcome.status, "paused")
+        self.assertEqual(
+            outcome.metadata["failure_category"],
+            "deterministic_tool_failure",
+        )
+        self.assertIn("Search path not found", outcome.error or "")
 
     def test_runner_turns_pending_user_action_into_waiting_approval(self) -> None:
         loop = _FakeLoop(

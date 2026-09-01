@@ -140,7 +140,9 @@ class _ApprovalLoop:
             session_id=task.session_id,
             final_text="approved node completed",
             stop_reason="final_response",
-            tool_runs=[],
+            tool_runs=[
+                ToolResult("approved-write", "file_write", True, "write completed")
+            ],
             success=True,
             task_id=task.id,
             task_status=task.status,
@@ -179,6 +181,36 @@ class _AlwaysFailLoop(_AgentLoop):
             session_id=kwargs["session_id"],
             final_text=None,
             stop_reason="node_failed",
+            tool_runs=[],
+            success=False,
+            task_id=task_id,
+            task_status="running",
+        )
+
+
+class _EvidenceMissingLoop(_AgentLoop):
+    def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        task_id = kwargs["_task_id"]
+        return TurnResult(
+            session_id=kwargs["session_id"],
+            final_text="claimed completion without tool evidence",
+            stop_reason="final_response",
+            tool_runs=[],
+            success=True,
+            task_id=task_id,
+            task_status="running",
+        )
+
+
+class _DeterministicBlockedLoop(_AgentLoop):
+    def run_turn(self, **kwargs):
+        self.calls.append(kwargs)
+        task_id = kwargs["_task_id"]
+        return TurnResult(
+            session_id=kwargs["session_id"],
+            final_text="Search path not found: 'agent_app'.",
+            stop_reason="repeated_deterministic_tool_failure",
             tool_runs=[],
             success=False,
             task_id=task_id,
@@ -305,7 +337,9 @@ class _AskUserAnswerLoop:
             session_id=task.session_id,
             final_text="user answer applied",
             stop_reason="final_response",
-            tool_runs=[],
+            tool_runs=[
+                ToolResult("answer-read", "file_read", True, "selected file evidence")
+            ],
             success=True,
             task_id=task.id,
             task_status=task.status,
@@ -668,6 +702,72 @@ class PlanTaskServiceTests(unittest.TestCase):
         self.assertEqual(
             [checkpoint.state["request_status"] for checkpoint in planner_checkpoints],
             ["requesting", "completed", "requesting", "completed"],
+        )
+
+    def test_missing_acceptance_evidence_pauses_without_automatic_replan(self) -> None:
+        planner_model = _ReplanPlannerModel()
+        loop = _EvidenceMissingLoop()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=loop,
+        )
+
+        first = service.start(
+            session_id=self.session_id,
+            goal="Inspect only when evidence is available",
+        )
+
+        self.assertEqual(first.execution.status, "paused")
+        self.assertEqual(first.task.status, "paused")
+        self.assertEqual(first.task.stop_reason, "acceptance_evidence_missing")
+        self.assertEqual(first.task.budget.used_replans, 0)
+        self.assertEqual(first.revision.graph.node_map()["inspect"].status, "paused")
+        self.assertEqual(planner_model.calls, 1)
+        checkpoint = self.sessions.get_latest_checkpoint(first.task.id)
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint.state["phase"], "plan_node_recovery")
+        self.assertEqual(checkpoint.state["failure_category"], "acceptance_not_met")
+        self.assertTrue(checkpoint.state["recoverable"])
+
+        second = service.continue_task(task_id=first.task.id)
+
+        self.assertEqual(second.execution.status, "paused")
+        self.assertEqual(second.task.budget.used_continuations, 1)
+        self.assertEqual(second.task.budget.used_replans, 0)
+        self.assertEqual(planner_model.calls, 1)
+
+    def test_deterministic_tool_block_pauses_without_automatic_replan(self) -> None:
+        planner_model = _ReplanPlannerModel()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=_DeterministicBlockedLoop(),
+        )
+
+        result = service.start(
+            session_id=self.session_id,
+            goal="Inspect a source path without repeating invalid targets",
+        )
+
+        self.assertEqual(result.execution.status, "paused")
+        self.assertEqual(result.task.status, "paused")
+        self.assertEqual(result.task.stop_reason, "repeated_deterministic_tool_failure")
+        self.assertEqual(result.task.budget.used_replans, 0)
+        self.assertEqual(result.revision.graph.node_map()["inspect"].status, "paused")
+        self.assertEqual(planner_model.calls, 1)
+        recovery_traces = [
+            trace
+            for trace in self.sessions.list_task_traces(result.task.id)
+            if trace.trace_type == "plan_node_recovery_available"
+        ]
+        self.assertEqual(len(recovery_traces), 1)
+        self.assertEqual(
+            recovery_traces[0].payload["failure_category"],
+            "deterministic_tool_failure",
         )
 
     def test_replan_budget_exhaustion_returns_diagnosis_and_terminal_trace(self) -> None:

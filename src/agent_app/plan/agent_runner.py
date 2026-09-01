@@ -54,50 +54,71 @@ class PlanAgentNodeRunner:
             plan_revision_id=context.revision.id,
             plan_node_id=context.node.id,
         )
-        if result.pending_action is not None or result.task_status == "waiting_user":
-            pending = result.pending_action
-            return NodeExecutionResult(
-                status="waiting_approval",
-                metadata={
-                    "pending_action_id": None if pending is None else pending.id,
-                    "kind": None if pending is None else pending.kind,
-                },
-            )
-        if result.stop_reason == "max_tool_rounds_exceeded" or result.task_status == "paused":
+        return node_execution_result_from_turn(context, result)
+
+
+def node_execution_result_from_turn(
+    context: PlanNodeContext,
+    result: Any,
+) -> NodeExecutionResult:
+    """Apply the same durable node outcome policy to new and resumed turns."""
+
+    if result.pending_action is not None or result.task_status == "waiting_user":
+        pending = result.pending_action
+        return NodeExecutionResult(
+            status="waiting_approval",
+            metadata={
+                "pending_action_id": None if pending is None else pending.id,
+                "kind": None if pending is None else pending.kind,
+            },
+        )
+    if result.stop_reason == "max_tool_rounds_exceeded" or result.task_status == "paused":
+        return NodeExecutionResult(
+            status="paused",
+            error="Node execution window exhausted; explicit continuation is required.",
+            metadata={
+                "stop_reason": result.stop_reason,
+            },
+        )
+    if result.stop_reason == "repeated_deterministic_tool_failure":
+        return NodeExecutionResult(
+            status="paused",
+            error=(
+                "repeated_deterministic_tool_failure: "
+                + (result.final_text or "The same non-retryable tool target failed again.")
+            ),
+            metadata={
+                "stop_reason": result.stop_reason,
+                "failure_category": "deterministic_tool_failure",
+            },
+        )
+    if result.success:
+        validation = _validate_acceptance_evidence(context, result.tool_runs)
+        if validation["status"] != "passed":
             return NodeExecutionResult(
                 status="paused",
-                error="Node execution window exhausted; explicit continuation is required.",
-                metadata={
-                    "stop_reason": result.stop_reason,
-                },
-            )
-        if result.success:
-            validation = _validate_acceptance_evidence(context, result.tool_runs)
-            if validation["status"] != "passed":
-                return NodeExecutionResult(
-                    status="failed",
-                    error=_acceptance_failure_message(context, validation),
-                    evidence_refs=tuple(validation["evidence_refs"]),
-                    metadata={
-                        "stop_reason": "acceptance_evidence_missing",
-                        "failure_category": "acceptance_not_met",
-                        "acceptance_validation": validation,
-                    },
-                )
-            return NodeExecutionResult(
-                status="completed",
-                output=result.final_text,
+                error=_acceptance_failure_message(context, validation),
                 evidence_refs=tuple(validation["evidence_refs"]),
                 metadata={
-                    "stop_reason": result.stop_reason,
+                    "stop_reason": "acceptance_evidence_missing",
+                    "failure_category": "acceptance_not_met",
                     "acceptance_validation": validation,
                 },
             )
         return NodeExecutionResult(
-            status="failed",
-            error=result.final_text or result.stop_reason or "AgentLoop node execution failed.",
-            metadata={"stop_reason": result.stop_reason},
+            status="completed",
+            output=result.final_text,
+            evidence_refs=tuple(validation["evidence_refs"]),
+            metadata={
+                "stop_reason": result.stop_reason,
+                "acceptance_validation": validation,
+            },
         )
+    return NodeExecutionResult(
+        status="failed",
+        error=result.final_text or result.stop_reason or "AgentLoop node execution failed.",
+        metadata={"stop_reason": result.stop_reason},
+    )
 
 
 def build_node_prompt(context: PlanNodeContext) -> str:

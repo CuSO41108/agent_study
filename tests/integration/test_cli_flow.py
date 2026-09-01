@@ -454,7 +454,12 @@ class CliIntegrationTests(unittest.TestCase):
                 ]),
             ]
         )
-        second_model = _FakeModelClient([_text_response("README inspected")])
+        second_model = _FakeModelClient([
+            _tool_call_response([
+                ToolCall(id="ask-read", name="file_read", arguments={"path": "README.md"}),
+            ]),
+            _text_response("README inspected"),
+        ])
         mock_from_config.side_effect = [first_model, second_model]
 
         first_stdout = io.StringIO()

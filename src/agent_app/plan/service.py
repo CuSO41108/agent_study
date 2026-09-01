@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from agent_app.plan.agent_runner import PlanAgentNodeRunner, build_node_prompt
+from agent_app.plan.agent_runner import (
+    PlanAgentNodeRunner,
+    build_node_prompt,
+    node_execution_result_from_turn,
+)
 from agent_app.plan.executor import PlanExecutionResult, PlanExecutor, PlanNodeContext
 from agent_app.plan.graph import PlanGraph, resource_claims_for_node
 from agent_app.plan.planner import PlanPlanner, PlanPlanningError, PlannerAttemptHook
@@ -40,6 +44,13 @@ class PlanTaskResult:
 class ToolActionResolutionResult:
     action: ToolAction
     decision: RecoveryDecision
+
+
+_CONTINUATION_BUDGET_PAUSE_REASONS = {
+    "max_tool_rounds_exceeded",
+    "acceptance_evidence_missing",
+    "repeated_deterministic_tool_failure",
+}
 
 
 class PlanTaskService:
@@ -478,7 +489,7 @@ class PlanTaskService:
 
         task = self._require_task(task_id)
         if fresh.kind == RecoveryKind.PAUSED:
-            if task.stop_reason == "max_tool_rounds_exceeded":
+            if task.stop_reason in _CONTINUATION_BUDGET_PAUSE_REASONS:
                 if task.budget.used_continuations >= task.budget.max_continuations:
                     failed = self._tasks.fail(task.id, reason="continuation_budget_exceeded")
                     return self._finalize_failed_execution(
@@ -503,7 +514,7 @@ class PlanTaskService:
                 )
                 task = self._tasks.consume_continuation(
                     task.id,
-                    reason="resume_after_max_tool_rounds",
+                    reason=f"resume_after_{task.stop_reason}",
                 )
             else:
                 task = self._tasks.resume(
@@ -932,17 +943,22 @@ class PlanTaskService:
                 ),
             )
 
-        next_status = "completed" if approved and turn_result.success else "failed"
-        result_record = {
-            "status": next_status,
-            "output": turn_result.final_text,
-            "error": None if next_status == "completed" else (
-                turn_result.final_text or turn_result.stop_reason or "approval_rejected"
-            ),
-            "metadata": {
-                "approval": "approved" if approved else "rejected",
-                "stop_reason": turn_result.stop_reason,
-            },
+        if approved:
+            node_outcome = node_execution_result_from_turn(context, turn_result)
+            next_status = node_outcome.status
+            result_record = node_outcome.to_record()
+        else:
+            next_status = "failed"
+            result_record = {
+                "status": next_status,
+                "output": turn_result.final_text,
+                "error": turn_result.final_text or turn_result.stop_reason or "approval_rejected",
+                "evidence_refs": [],
+                "metadata": {"stop_reason": turn_result.stop_reason},
+            }
+        result_record["metadata"] = {
+            **result_record.get("metadata", {}),
+            "approval": "approved" if approved else "rejected",
         }
         revision = self._plan_store.update_node_status(
             revision.id,
@@ -1019,17 +1035,12 @@ class PlanTaskService:
                 ),
             )
 
-        next_status = "completed" if turn_result.success else "failed"
-        result_record = {
-            "status": next_status,
-            "output": turn_result.final_text,
-            "error": None if next_status == "completed" else (
-                turn_result.final_text or turn_result.stop_reason or "user_message_resume_failed"
-            ),
-            "metadata": {
-                "resume_kind": "ask_user",
-                "stop_reason": turn_result.stop_reason,
-            },
+        node_outcome = node_execution_result_from_turn(context, turn_result)
+        next_status = node_outcome.status
+        result_record = node_outcome.to_record()
+        result_record["metadata"] = {
+            **result_record.get("metadata", {}),
+            "resume_kind": "ask_user",
         }
         revision = self._plan_store.update_node_status(
             revision.id,
@@ -1108,6 +1119,12 @@ class PlanTaskService:
                         replan_error=exc,
                     )
         if execution.status == "paused":
+            if task.status == "running":
+                task = self._pause_for_node_recovery(
+                    task.id,
+                    revision=after,
+                    execution=execution,
+                )
             return PlanTaskResult(
                 task=task,
                 revision=self._plan_store.get_revision_by_id(execution.revision.id),
@@ -1119,6 +1136,78 @@ class PlanTaskService:
             task = self._tasks.complete(task.id, reason="plan_completed")
         latest = self._plan_store.get_revision_by_id(execution.revision.id)
         return PlanTaskResult(task=task, revision=latest, execution=execution)
+
+    def _pause_for_node_recovery(
+        self,
+        task_id: str,
+        *,
+        revision: PlanRevision,
+        execution: PlanExecutionResult,
+    ) -> TaskState:
+        node_id = execution.waiting_node_id
+        node_result = revision.node_results.get(node_id or "", {})
+        metadata = node_result.get("metadata", {}) if isinstance(node_result, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        stop_reason = str(metadata.get("stop_reason") or "plan_node_paused")
+        failure_category = str(metadata.get("failure_category") or "node_recovery")
+        task = self._tasks.pause_for_recovery(task_id, reason=stop_reason)
+        latest = self._sessions.get_latest_checkpoint(task_id)
+        run = self._sessions.create_execution_run(
+            task_id=task_id,
+            agent_id="plan_runtime",
+            scope=f"plan_node_recovery:{node_id or 'unknown'}",
+            max_tool_rounds=1,
+            parent_checkpoint_id=None if latest is None else latest.id,
+        )
+        state = {
+            "phase": "plan_node_recovery",
+            "plan_id": revision.graph.id,
+            "revision": revision.graph.revision,
+            "revision_id": revision.id,
+            "node_id": node_id,
+            "stop_reason": stop_reason,
+            "failure_category": failure_category,
+            "failure_detail": execution.failure_reason,
+            "recoverable": True,
+        }
+        checkpoint = self._sessions.create_checkpoint(
+            task_id=task_id,
+            run_id=run.id,
+            cursor="paused_by_user",
+            status="paused_by_user",
+            state=state,
+        )
+        self._sessions.update_execution_run(
+            run.id,
+            status="paused_by_user",
+            stop_reason=stop_reason,
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "checkpoint",
+            {
+                "checkpoint_id": checkpoint.id,
+                "run_id": run.id,
+                "parent_checkpoint_id": checkpoint.parent_checkpoint_id,
+                "cursor": checkpoint.cursor,
+                "status": checkpoint.status,
+                **state,
+            },
+        )
+        self._sessions.append_task_trace(
+            task_id,
+            "plan_node_recovery_available",
+            {
+                "checkpoint_id": checkpoint.id,
+                "node_id": node_id,
+                "stop_reason": stop_reason,
+                "failure_category": failure_category,
+                "recoverable": True,
+                "continuation_command": f"/continue {task_id[:8]}",
+            },
+        )
+        return task
 
     def _finalize_failed_execution(
         self,
