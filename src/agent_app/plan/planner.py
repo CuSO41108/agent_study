@@ -33,6 +33,14 @@ class PlanPlanningError(ValueError):
 PlannerAttemptHook = Callable[[dict[str, Any]], None]
 
 
+_ARRAY_CONTRACT = (
+    "The top-level nodes field must be a non-empty JSON array. For every node, "
+    "depends_on and allowed_tools must be JSON arrays, and acceptance must be a "
+    "non-empty JSON array of non-empty strings even when there is only one condition. "
+    "Never return acceptance as a string. If resources is present, it must be a JSON array. "
+)
+
+
 class PlanPlanner:
     """Turn a user goal into a validated PlanGraph without executing tools."""
 
@@ -41,18 +49,22 @@ class PlanPlanner:
         model_client: Any,
         *,
         max_request_retries: int = 2,
+        max_format_repairs: int = 1,
         retry_base_delay: float = 0.5,
         retry_max_delay: float = 4.0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if max_request_retries < 0:
             raise ValueError("max_request_retries cannot be negative.")
+        if max_format_repairs < 0:
+            raise ValueError("max_format_repairs cannot be negative.")
         if retry_base_delay < 0:
             raise ValueError("retry_base_delay cannot be negative.")
         if retry_max_delay < 0:
             raise ValueError("retry_max_delay cannot be negative.")
         self._model_client = model_client
         self._max_request_retries = max_request_retries
+        self._max_format_repairs = max_format_repairs
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
         self._sleep = sleep
@@ -65,6 +77,12 @@ class PlanPlanner:
     def max_request_attempts(self) -> int:
         return self._max_request_retries + 1
 
+    @property
+    def max_attempts(self) -> int:
+        """Maximum model calls across transient retries and bounded format repair."""
+
+        return self.max_request_attempts + self._max_format_repairs
+
     def create_plan(
         self,
         goal: str,
@@ -73,7 +91,16 @@ class PlanPlanner:
     ) -> PlanGraph:
         if not goal.strip():
             raise ValueError("Plan goal cannot be empty.")
-        response, attempts = self._generate_with_retry(
+        normalized_goal = goal.strip()
+
+        def prepare_payload(payload: dict[str, Any]) -> None:
+            payload.setdefault("id", f"plan-{uuid4().hex}")
+            payload.setdefault("revision", 1)
+            payload["goal"] = normalized_goal
+            _default_pending_node_statuses(payload)
+
+        return self._create_validated_plan(
+            label="Planner",
             phase="initial_plan",
             on_attempt=on_attempt,
             system_prompt=(
@@ -81,7 +108,9 @@ class PlanPlanner:
                 "with no Markdown and no commentary. The object must contain id, revision=1, "
                 "goal, and nodes. Each node must use exactly one kind: inspect, edit, run, "
                 "or verify. Each node must include objective, depends_on, allowed_tools, "
-                "acceptance, and status=pending. It may include resources, an array of "
+                "acceptance, and status=pending. "
+                f"{_ARRAY_CONTRACT}"
+                "It may include resources, an array of "
                 "{key,mode} claims where key is workspace or file:<workspace-relative-path> "
                 "and mode is read, write, or exclusive. Only declare a narrower resource "
                 "when it is known; omitted resources use a conservative kind-based fallback. "
@@ -90,42 +119,9 @@ class PlanPlanner:
                 "skill_load,skill_read_resource; edit=file_read,code_search,replace_in_file,file_write; "
                 "run=shell; verify=file_read,code_search,shell. Keep the plan as small as possible."
             ),
-            messages=[{"role": "user", "content": goal}],
-            tools=[],
+            messages=[{"role": "user", "content": normalized_goal}],
+            prepare_payload=prepare_payload,
         )
-        if getattr(response, "error_type", None):
-            raise _model_failure("Planner", response, attempts=attempts)
-        if getattr(response, "tool_calls", None):
-            raise PlanPlanningError(
-                "Planner must return JSON without tool calls.",
-                error_type="unexpected_tool_calls",
-                attempts=attempts,
-            )
-        text = getattr(response, "assistant_text", None)
-        if not isinstance(text, str) or not text.strip():
-            raise PlanPlanningError(
-                "Planner returned no JSON plan.",
-                error_type="empty_response",
-                attempts=attempts,
-            )
-
-        payload = _decode_json_object(text, attempts=attempts)
-        payload.setdefault("id", f"plan-{uuid4().hex}")
-        payload.setdefault("revision", 1)
-        payload["goal"] = goal.strip()
-        nodes = payload.get("nodes")
-        if isinstance(nodes, list):
-            for node in nodes:
-                if isinstance(node, dict):
-                    node.setdefault("status", "pending")
-        try:
-            return parse_plan_graph(payload)
-        except (TypeError, KeyError, ValueError) as exc:
-            raise PlanPlanningError(
-                str(exc),
-                error_type="invalid_plan",
-                attempts=attempts,
-            ) from exc
 
     def create_replan(
         self,
@@ -136,7 +132,14 @@ class PlanPlanner:
     ) -> PlanGraph:
         """Ask the model for only a successor graph; completed nodes are preserved by PlanStore."""
 
-        response, attempts = self._generate_with_retry(
+        def prepare_payload(payload: dict[str, Any]) -> None:
+            payload["id"] = current.graph.id
+            payload["revision"] = current.graph.revision + 1
+            payload["goal"] = current.graph.goal
+            _default_pending_node_statuses(payload)
+
+        return self._create_validated_plan(
+            label="Replanner",
             phase="replan",
             on_attempt=on_attempt,
             system_prompt=(
@@ -144,6 +147,7 @@ class PlanPlanner:
                 "Keep completed nodes unchanged, repair or replace only unfinished work, "
                 "and use a static acyclic graph with the same plan id and a higher revision. "
                 "Use only node kinds inspect, edit, run, verify and their allowed tool boundaries. "
+                f"{_ARRAY_CONTRACT}"
                 "Preserve or conservatively update optional resource claims using {key,mode}; "
                 "never infer parallel safety for an unknown side effect."
             ),
@@ -161,32 +165,120 @@ class PlanPlanner:
                     ),
                 }
             ],
-            tools=[],
+            prepare_payload=prepare_payload,
         )
-        if getattr(response, "error_type", None):
-            raise _model_failure("Replanner", response, attempts=attempts)
+
+    def _create_validated_plan(
+        self,
+        *,
+        label: str,
+        phase: str,
+        on_attempt: PlannerAttemptHook | None,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        prepare_payload: Callable[[dict[str, Any]], None],
+    ) -> PlanGraph:
+        active_messages = list(messages)
+        attempts = 0
+        request_retries_used = 0
+        format_repairs_used = 0
+
+        while True:
+            response, attempts, request_retries_used = self._generate_with_retry(
+                label=label,
+                phase=phase,
+                on_attempt=on_attempt,
+                attempt_offset=attempts,
+                request_retries_used=request_retries_used,
+                system_prompt=system_prompt,
+                messages=active_messages,
+                tools=[],
+            )
+            text = getattr(response, "assistant_text", None)
+            try:
+                graph = self._parse_plan_response(
+                    label=label,
+                    response=response,
+                    attempts=attempts,
+                    prepare_payload=prepare_payload,
+                )
+            except PlanPlanningError as exc:
+                can_repair = (
+                    exc.error_type == "invalid_plan"
+                    and isinstance(text, str)
+                    and bool(text.strip())
+                    and format_repairs_used < self._max_format_repairs
+                )
+                self._notify_attempt(
+                    on_attempt,
+                    phase=phase,
+                    attempt=attempts,
+                    request_status="repairing" if can_repair else "failed",
+                    error_type=exc.error_type,
+                    error_detail=str(exc),
+                    retryable=can_repair,
+                )
+                if not can_repair:
+                    raise PlanPlanningError(
+                        str(exc),
+                        error_type=exc.error_type,
+                        detail=exc.detail,
+                        attempts=attempts,
+                    ) from exc
+
+                format_repairs_used += 1
+                active_messages.extend(
+                    [
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous PlanGraph JSON failed validation:\n"
+                                f"{exc}\n"
+                                "Return the complete corrected JSON object only. Preserve the goal "
+                                "and intended node semantics. Ensure nodes is an array; depends_on and "
+                                "allowed_tools are arrays; acceptance is a non-empty array of strings, "
+                                "never a string; and resources, when present, is an array."
+                            ),
+                        },
+                    ]
+                )
+                continue
+
+            self._notify_attempt(
+                on_attempt,
+                phase=phase,
+                attempt=attempts,
+                request_status="succeeded",
+                error_type=None,
+                error_detail=None,
+                retryable=False,
+            )
+            return graph
+
+    @staticmethod
+    def _parse_plan_response(
+        *,
+        label: str,
+        response: Any,
+        attempts: int,
+        prepare_payload: Callable[[dict[str, Any]], None],
+    ) -> PlanGraph:
         if getattr(response, "tool_calls", None):
             raise PlanPlanningError(
-                "Replanner must return JSON without tool calls.",
+                f"{label} must return JSON without tool calls.",
                 error_type="unexpected_tool_calls",
                 attempts=attempts,
             )
         text = getattr(response, "assistant_text", None)
         if not isinstance(text, str) or not text.strip():
             raise PlanPlanningError(
-                "Replanner returned no JSON plan.",
+                f"{label} returned no JSON plan.",
                 error_type="empty_response",
                 attempts=attempts,
             )
         payload = _decode_json_object(text, attempts=attempts)
-        payload["id"] = current.graph.id
-        payload["revision"] = current.graph.revision + 1
-        payload["goal"] = current.graph.goal
-        nodes = payload.get("nodes")
-        if isinstance(nodes, list):
-            for node in nodes:
-                if isinstance(node, dict):
-                    node.setdefault("status", "pending")
+        prepare_payload(payload)
         try:
             return parse_plan_graph(payload)
         except (TypeError, KeyError, ValueError) as exc:
@@ -199,56 +291,85 @@ class PlanPlanner:
     def _generate_with_retry(
         self,
         *,
+        label: str,
         phase: str,
         on_attempt: PlannerAttemptHook | None,
+        attempt_offset: int,
+        request_retries_used: int,
         **request: Any,
-    ) -> tuple[Any, int]:
-        max_attempts = self.max_request_attempts
-        for attempt in range(1, max_attempts + 1):
+    ) -> tuple[Any, int, int]:
+        remaining_retries = self._max_request_retries - request_retries_used
+        for local_attempt in range(1, remaining_retries + 2):
+            attempt = attempt_offset + local_attempt
             response = self._model_client.generate(**request)
             error_type = getattr(response, "error_type", None)
             if not error_type:
-                if on_attempt is not None:
-                    on_attempt(
-                        {
-                            "phase": phase,
-                            "attempt": attempt,
-                            "max_attempts": max_attempts,
-                            "request_status": "succeeded",
-                            "error_type": None,
-                            "error_detail": None,
-                            "retryable": False,
-                            "retry_delay_seconds": 0.0,
-                        }
-                    )
-                return response, attempt
+                return response, attempt, request_retries_used
 
             detail = _response_error_detail(response)
-            retryable = error_type == "request_error" and attempt < max_attempts
-            delay = self._retry_delay(attempt) if retryable else 0.0
-            if on_attempt is not None:
-                on_attempt(
-                    {
-                        "phase": phase,
-                        "attempt": attempt,
-                        "max_attempts": max_attempts,
-                        "request_status": "retrying" if retryable else "failed",
-                        "error_type": str(error_type),
-                        "error_detail": detail,
-                        "retryable": retryable,
-                        "retry_delay_seconds": delay,
-                    }
-                )
+            retryable = (
+                error_type == "request_error"
+                and request_retries_used < self._max_request_retries
+            )
+            if retryable:
+                request_retries_used += 1
+            delay = self._retry_delay(request_retries_used) if retryable else 0.0
+            self._notify_attempt(
+                on_attempt,
+                phase=phase,
+                attempt=attempt,
+                request_status="retrying" if retryable else "failed",
+                error_type=str(error_type),
+                error_detail=detail,
+                retryable=retryable,
+                retry_delay_seconds=delay,
+            )
             if not retryable:
-                return response, attempt
+                raise _model_failure(label, response, attempts=attempt)
             self._sleep(delay)
         raise AssertionError("Planner retry loop exhausted without a response.")
+
+    def _notify_attempt(
+        self,
+        on_attempt: PlannerAttemptHook | None,
+        *,
+        phase: str,
+        attempt: int,
+        request_status: str,
+        error_type: str | None,
+        error_detail: str | None,
+        retryable: bool,
+        retry_delay_seconds: float = 0.0,
+    ) -> None:
+        if on_attempt is None:
+            return
+        on_attempt(
+            {
+                "phase": phase,
+                "attempt": attempt,
+                "max_attempts": self.max_attempts,
+                "request_status": request_status,
+                "error_type": error_type,
+                "error_detail": error_detail,
+                "retryable": retryable,
+                "retry_delay_seconds": retry_delay_seconds,
+            }
+        )
 
     def _retry_delay(self, attempt: int) -> float:
         return min(
             self._retry_max_delay,
             self._retry_base_delay * (2 ** (attempt - 1)),
         )
+
+
+def _default_pending_node_statuses(payload: dict[str, Any]) -> None:
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if isinstance(node, dict):
+            node.setdefault("status", "pending")
 
 
 def _decode_json_object(text: str, *, attempts: int | None = None) -> dict[str, Any]:

@@ -737,7 +737,7 @@ class PlanTaskService:
             max_tool_rounds=1,
             parent_checkpoint_id=None if latest is None else latest.id,
         )
-        max_attempts = self._planner.max_request_attempts
+        max_attempts = self._planner.max_attempts
         self._persist_planner_checkpoint(
             task_id=task_id,
             run_id=run.id,

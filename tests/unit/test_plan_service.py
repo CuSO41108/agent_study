@@ -55,6 +55,24 @@ class _RetryThenSuccessPlannerModel:
         return _PlannerModel().generate()
 
 
+class _RepairInvalidShapePlannerModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                assistant_text=(
+                    '{"id":"plan-service","revision":1,"nodes":['
+                    '{"id":"inspect","kind":"inspect","objective":"Read the source.",'
+                    '"depends_on":[],"allowed_tools":["file_read"],'
+                    '"acceptance":"Source is understood"}]}'
+                )
+            )
+        return _PlannerModel().generate()
+
+
 class _FailThenRecoverPlannerModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -232,7 +250,7 @@ class _RecoverableReplanModel:
                 '{"id":"verify","kind":"verify","objective":"Verify source.",'
                 '"depends_on":["inspect"],"allowed_tools":["file_read"],"acceptance":["Verified"]}]}'
             )
-        elif self.calls == 2:
+        elif self.calls in {2, 3}:
             content = "not a JSON plan"
         else:
             content = (
@@ -373,7 +391,39 @@ class PlanTaskServiceTests(unittest.TestCase):
         )
         self.assertEqual(planner_model.calls, 2)
         self.assertEqual(planning_checkpoints[-1].state["attempt"], 2)
-        self.assertEqual(planning_checkpoints[-1].state["max_attempts"], 3)
+        self.assertEqual(planning_checkpoints[-1].state["max_attempts"], 4)
+
+    def test_planner_format_repair_is_checkpointed_and_completes(self) -> None:
+        planner_model = _RepairInvalidShapePlannerModel()
+        service = PlanTaskService(
+            planner=PlanPlanner(planner_model, sleep=lambda _delay: None),
+            plan_store=PlanStore(self.db_path),
+            session_service=self.sessions,
+            agent_loop=self.loop,
+        )
+
+        result = service.start(
+            session_id=self.session_id,
+            goal="Inspect after repairing an invalid PlanGraph shape",
+        )
+
+        self.assertEqual(result.task.status, "completed")
+        self.assertEqual(planner_model.calls, 2)
+        planning_checkpoints = [
+            checkpoint
+            for checkpoint in self.sessions.list_checkpoints(result.task.id)
+            if checkpoint.state.get("phase") == "planning"
+        ]
+        self.assertEqual(
+            [checkpoint.state["request_status"] for checkpoint in planning_checkpoints],
+            ["requesting", "repairing", "completed"],
+        )
+        repair_checkpoint = planning_checkpoints[1]
+        self.assertEqual(repair_checkpoint.state["attempt"], 1)
+        self.assertEqual(repair_checkpoint.state["error_type"], "invalid_plan")
+        self.assertTrue(repair_checkpoint.state["retryable"])
+        self.assertEqual(planning_checkpoints[-1].state["attempt"], 2)
+        self.assertEqual(planning_checkpoints[-1].state["max_attempts"], 4)
 
     def test_planner_failure_persists_attempts_and_safe_detail_in_checkpoint(self) -> None:
         planner_model = _FailingPlannerModel()

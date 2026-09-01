@@ -104,6 +104,115 @@ class PlanRoutingTests(unittest.TestCase):
         self.assertEqual(plan.goal, "Inspect the repository")
         self.assertEqual(plan.nodes[0].status, "pending")
         self.assertEqual(model.calls[0]["tools"], [])
+        self.assertIn(
+            "acceptance must be a non-empty JSON array of non-empty strings",
+            model.calls[0]["system_prompt"],
+        )
+        self.assertIn("Never return acceptance as a string", model.calls[0]["system_prompt"])
+
+    def test_planner_repairs_invalid_acceptance_shape_once(self) -> None:
+        invalid_plan = ModelResponse(
+            assistant_text=(
+                '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                '"objective": "Read the source.", "depends_on": [], '
+                '"allowed_tools": ["file_read"], "acceptance": "Source read."}]}'
+            )
+        )
+        valid_plan = ModelResponse(
+            assistant_text=(
+                '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                '"objective": "Read the source.", "depends_on": [], '
+                '"allowed_tools": ["file_read"], "acceptance": ["Source read."]}]}'
+            )
+        )
+        model = _SequencePlannerModel([invalid_plan, valid_plan])
+        attempts: list[dict] = []
+
+        plan = PlanPlanner(model).create_plan(
+            "Inspect the repository",
+            on_attempt=attempts.append,
+        )
+
+        self.assertEqual(plan.nodes[0].acceptance, ("Source read.",))
+        self.assertEqual(len(model.calls), 2)
+        repair_prompt = model.calls[1]["messages"][-1]["content"]
+        self.assertIn("nodes.0.acceptance", repair_prompt)
+        self.assertIn("acceptance is a non-empty array of strings", repair_prompt)
+        self.assertEqual(
+            [attempt["request_status"] for attempt in attempts],
+            ["repairing", "succeeded"],
+        )
+        self.assertEqual([attempt["attempt"] for attempt in attempts], [1, 2])
+        self.assertTrue(attempts[0]["retryable"])
+        self.assertEqual(attempts[-1]["max_attempts"], 4)
+
+    def test_planner_stops_after_format_repair_limit(self) -> None:
+        model = _FakePlannerModel(
+            ModelResponse(
+                assistant_text=(
+                    '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                    '"objective": "Read the source.", "depends_on": [], '
+                    '"allowed_tools": ["file_read"], "acceptance": "Source read."}]}'
+                )
+            )
+        )
+        attempts: list[dict] = []
+
+        with self.assertRaises(PlanPlanningError) as raised:
+            PlanPlanner(
+                model,
+                max_request_retries=0,
+                max_format_repairs=1,
+            ).create_plan("Inspect", on_attempt=attempts.append)
+
+        self.assertEqual(raised.exception.error_type, "invalid_plan")
+        self.assertEqual(raised.exception.attempts, 2)
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(
+            [attempt["request_status"] for attempt in attempts],
+            ["repairing", "failed"],
+        )
+        self.assertFalse(attempts[-1]["retryable"])
+
+    def test_planner_shares_request_retry_budget_with_format_repair(self) -> None:
+        request_error = ModelResponse(
+            assistant_text=None,
+            error_type="request_error",
+            raw_response={"detail": "temporary timeout"},
+        )
+        invalid_plan = ModelResponse(
+            assistant_text=(
+                '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                '"objective": "Read the source.", "depends_on": [], '
+                '"allowed_tools": ["file_read"], "acceptance": "Source read."}]}'
+            )
+        )
+        valid_plan = ModelResponse(
+            assistant_text=(
+                '{"nodes": [{"id": "inspect", "kind": "inspect", '
+                '"objective": "Read the source.", "depends_on": [], '
+                '"allowed_tools": ["file_read"], "acceptance": ["Source read."]}]}'
+            )
+        )
+        model = _SequencePlannerModel(
+            [request_error, invalid_plan, request_error, valid_plan]
+        )
+        delays: list[float] = []
+        attempts: list[dict] = []
+
+        plan = PlanPlanner(model, sleep=delays.append).create_plan(
+            "Inspect",
+            on_attempt=attempts.append,
+        )
+
+        self.assertEqual(plan.nodes[0].id, "inspect")
+        self.assertEqual(len(model.calls), 4)
+        self.assertEqual(delays, [0.5, 1.0])
+        self.assertEqual(
+            [attempt["request_status"] for attempt in attempts],
+            ["retrying", "repairing", "retrying", "succeeded"],
+        )
+        self.assertTrue(all(attempt["max_attempts"] == 4 for attempt in attempts))
 
     def test_planner_rejects_invalid_or_non_json_output(self) -> None:
         invalid_model = _FakePlannerModel(ModelResponse(assistant_text="not json"))
